@@ -1,0 +1,599 @@
+{
+  "config": {
+    "samples_per_dataset": 100,
+    "bins": 5,
+    "clip_pct": [
+      1.0,
+      99.0
+    ],
+    "min_per_bin": 10,
+    "min_doc_words": 100,
+    "seed": 42,
+    "length_metric": "words",
+    "punct_clean": true,
+    "raw_dir": "/home/tuantb/fast_infer_text_sum_Viet/datasets/raw"
+  },
+  "datasets": {
+    "vietnews": {
+      "pool_records": 22643,
+      "skipped_records": 1,
+      "skipped_reasons": {
+        "chỉ có 2 block (<3)": 1
+      },
+      "pool_split": "test",
+      "source_split": "test",
+      "valid_records": 22631,
+      "degenerate_records": 12,
+      "degenerate_reasons": {
+        "document_duoi_san": 12
+      },
+      "sampling": {
+        "requested_samples": 100,
+        "selected_samples": 100,
+        "clip_pct": [
+          1.0,
+          99.0
+        ],
+        "clip_bounds_words": [
+          146.0,
+          1245.0
+        ],
+        "length_metric": "document_words",
+        "bins": 5,
+        "pool_size": 22631,
+        "inlier_count": 22190,
+        "outlier_count": 441,
+        "pool_length_stats": {
+          "count": 22631,
+          "min": 100.0,
+          "p1": 146.0,
+          "p5": 195.0,
+          "p25": 309.0,
+          "median": 432.0,
+          "mean": 501.48013786399184,
+          "p75": 645.0,
+          "p95": 1015.0,
+          "p99": 1245.0,
+          "max": 2235.0
+        },
+        "inlier_length_stats": {
+          "count": 22190,
+          "min": 146.0,
+          "p1": 164.0,
+          "p5": 202.0,
+          "p25": 311.0,
+          "median": 432.0,
+          "mean": 496.38152320865254,
+          "p75": 639.0,
+          "p95": 985.0,
+          "p99": 1154.0,
+          "max": 1245.0
+        },
+        "per_bin": [
+          {
+            "bin": 0,
+            "range_words": [
+              146.0,
+              288.0
+            ],
+            "population": 4469,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 1,
+            "range_words": [
+              288.0,
+              381.0
+            ],
+            "population": 4439,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 2,
+            "range_words": [
+              381.0,
+              498.0
+            ],
+            "population": 4422,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 3,
+            "range_words": [
+              498.0,
+              701.0
+            ],
+            "population": 4423,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 4,
+            "range_words": [
+              701.0,
+              1245.0
+            ],
+            "population": 4437,
+            "allocated": 20,
+            "picked": 20
+          }
+        ]
+      },
+      "eval_summary": {
+        "document_words": {
+          "count": 100,
+          "min": 146.0,
+          "p1": 163.82,
+          "p5": 203.6,
+          "p25": 311.75,
+          "median": 433.0,
+          "mean": 497.67,
+          "p75": 640.0,
+          "p95": 977.8,
+          "p99": 1152.9300000000005,
+          "max": 1245.0
+        },
+        "reference_words": {
+          "count": 100,
+          "min": 16.0,
+          "p1": 19.96,
+          "p5": 22.950000000000003,
+          "p25": 29.0,
+          "median": 33.5,
+          "mean": 35.64,
+          "p75": 43.0,
+          "p95": 51.099999999999994,
+          "p99": 57.010000000000005,
+          "max": 58.0
+        },
+        "per_bin_counts": {
+          "0": 20,
+          "1": 20,
+          "2": 20,
+          "3": 20,
+          "4": 20
+        }
+      },
+      "eval_file": "datasets/eval_100/vietnews_100.jsonl",
+      "eval_sha256": "1534c715bf8ef2ab5cb1918762974291b1f1aeda893363a185a89c12c7fd3e61",
+      "eval_records": 100
+    },
+    "wikilingua": {
+      "pool_records": 3901,
+      "skipped_records": 1,
+      "skipped_reasons": {
+        "document hoặc reference rỗng": 1
+      },
+      "pool_split": "test",
+      "source_split": "test",
+      "valid_records": 3681,
+      "degenerate_records": 220,
+      "degenerate_reasons": {
+        "document_duoi_san": 208,
+        "reference_khong_ngan_hon_document": 12
+      },
+      "sampling": {
+        "requested_samples": 100,
+        "selected_samples": 100,
+        "clip_pct": [
+          1.0,
+          99.0
+        ],
+        "clip_bounds_words": [
+          115.0,
+          1842.8
+        ],
+        "length_metric": "document_words",
+        "bins": 5,
+        "pool_size": 3681,
+        "inlier_count": 3609,
+        "outlier_count": 72,
+        "pool_length_stats": {
+          "count": 3681,
+          "min": 100.0,
+          "p1": 115.0,
+          "p5": 158.0,
+          "p25": 332.0,
+          "median": 526.0,
+          "mean": 605.0450964411845,
+          "p75": 784.0,
+          "p95": 1309.0,
+          "p99": 1842.7999999999975,
+          "max": 3031.0
+        },
+        "inlier_length_stats": {
+          "count": 3609,
+          "min": 115.0,
+          "p1": 128.07999999999998,
+          "p5": 166.0,
+          "p25": 334.0,
+          "median": 526.0,
+          "mean": 593.6037683568856,
+          "p75": 777.0,
+          "p95": 1256.1999999999998,
+          "p99": 1553.92,
+          "max": 1840.0
+        },
+        "per_bin": [
+          {
+            "bin": 0,
+            "range_words": [
+              115.0,
+              299.0
+            ],
+            "population": 726,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 1,
+            "range_words": [
+              299.0,
+              450.0
+            ],
+            "population": 722,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 2,
+            "range_words": [
+              450.0,
+              611.8
+            ],
+            "population": 717,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 3,
+            "range_words": [
+              611.8,
+              851.0
+            ],
+            "population": 724,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 4,
+            "range_words": [
+              851.0,
+              1842.8
+            ],
+            "population": 720,
+            "allocated": 20,
+            "picked": 20
+          }
+        ]
+      },
+      "eval_summary": {
+        "document_words": {
+          "count": 100,
+          "min": 115.0,
+          "p1": 128.85999999999999,
+          "p5": 168.5,
+          "p25": 336.75,
+          "median": 526.0,
+          "mean": 596.4,
+          "p75": 778.5,
+          "p95": 1253.7499999999998,
+          "p99": 1554.8800000000015,
+          "max": 1840.0
+        },
+        "reference_words": {
+          "count": 100,
+          "min": 6.0,
+          "p1": 6.99,
+          "p5": 18.85,
+          "p25": 33.0,
+          "median": 46.5,
+          "mean": 48.54,
+          "p75": 56.75,
+          "p95": 91.05,
+          "p99": 172.32000000000016,
+          "max": 204.0
+        },
+        "per_bin_counts": {
+          "0": 20,
+          "1": 20,
+          "2": 20,
+          "3": 20,
+          "4": 20
+        }
+      },
+      "eval_file": "datasets/eval_100/wikilingua_100.jsonl",
+      "eval_sha256": "f666ad0fe39c1f3a310145b549e8287ac83570f40735fbf67c0a87871dd786c8",
+      "eval_records": 100
+    },
+    "vims": {
+      "pool_records": 300,
+      "skipped_records": 0,
+      "skipped_reasons": {},
+      "pool_split": "all",
+      "source_split": "all",
+      "valid_records": 300,
+      "degenerate_records": 0,
+      "degenerate_reasons": {},
+      "sampling": {
+        "requested_samples": 100,
+        "selected_samples": 100,
+        "clip_pct": [
+          1.0,
+          99.0
+        ],
+        "clip_bounds_words": [
+          1018.9,
+          7660.2
+        ],
+        "length_metric": "document_words",
+        "bins": 5,
+        "pool_size": 300,
+        "inlier_count": 294,
+        "outlier_count": 6,
+        "pool_length_stats": {
+          "count": 300,
+          "min": 751.0,
+          "p1": 1018.86,
+          "p5": 1249.75,
+          "p25": 1698.25,
+          "median": 2325.0,
+          "mean": 2719.556666666667,
+          "p75": 3196.0,
+          "p95": 6064.200000000003,
+          "p99": 7660.189999999996,
+          "max": 8451.0
+        },
+        "inlier_length_stats": {
+          "count": 294,
+          "min": 1019.0,
+          "p1": 1099.76,
+          "p5": 1271.05,
+          "p25": 1731.25,
+          "median": 2325.0,
+          "mean": 2682.343537414966,
+          "p75": 3161.5,
+          "p95": 5821.949999999992,
+          "p99": 6951.75,
+          "max": 7656.0
+        },
+        "per_bin": [
+          {
+            "bin": 0,
+            "range_words": [
+              1018.9,
+              1604.6
+            ],
+            "population": 59,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 1,
+            "range_words": [
+              1604.6,
+              2079.6
+            ],
+            "population": 59,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 2,
+            "range_words": [
+              2079.6,
+              2601.0
+            ],
+            "population": 58,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 3,
+            "range_words": [
+              2601.0,
+              3564.8
+            ],
+            "population": 59,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 4,
+            "range_words": [
+              3564.8,
+              7660.2
+            ],
+            "population": 59,
+            "allocated": 20,
+            "picked": 20
+          }
+        ]
+      },
+      "eval_summary": {
+        "document_words": {
+          "count": 100,
+          "min": 1019.0,
+          "p1": 1101.17,
+          "p5": 1275.65,
+          "p25": 1724.5,
+          "median": 2322.0,
+          "mean": 2689.99,
+          "p75": 3175.0,
+          "p95": 5754.699999999999,
+          "p99": 6957.060000000004,
+          "max": 7656.0
+        },
+        "reference_words": {
+          "count": 100,
+          "min": 63.0,
+          "p1": 63.99,
+          "p5": 91.0,
+          "p25": 163.5,
+          "median": 216.5,
+          "mean": 222.18,
+          "p75": 276.75,
+          "p95": 394.4,
+          "p99": 444.2100000000001,
+          "max": 465.0
+        },
+        "per_bin_counts": {
+          "0": 20,
+          "1": 20,
+          "2": 20,
+          "3": 20,
+          "4": 20
+        }
+      },
+      "eval_file": "datasets/eval_100/vims_100.jsonl",
+      "eval_sha256": "3d11ce8554c90131f6121860442ddc77871fca1bc5d0561fdb6877b56659fd2e",
+      "eval_records": 100
+    },
+    "vlsp": {
+      "pool_records": 300,
+      "skipped_records": 0,
+      "skipped_reasons": {},
+      "pool_split": "all",
+      "source_split": "all",
+      "valid_records": 300,
+      "degenerate_records": 0,
+      "degenerate_reasons": {},
+      "sampling": {
+        "requested_samples": 100,
+        "selected_samples": 100,
+        "clip_pct": [
+          1.0,
+          99.0
+        ],
+        "clip_bounds_words": [
+          486.5,
+          6527.3
+        ],
+        "length_metric": "document_words",
+        "bins": 5,
+        "pool_size": 300,
+        "inlier_count": 294,
+        "outlier_count": 6,
+        "pool_length_stats": {
+          "count": 300,
+          "min": 351.0,
+          "p1": 486.47,
+          "p5": 704.6,
+          "p25": 1273.5,
+          "median": 1974.0,
+          "mean": 2246.9966666666664,
+          "p75": 2881.0,
+          "p95": 4955.15,
+          "p99": 6527.3099999999995,
+          "max": 6979.0
+        },
+        "inlier_length_stats": {
+          "count": 294,
+          "min": 487.0,
+          "p1": 561.9,
+          "p5": 760.4,
+          "p25": 1277.5,
+          "median": 1974.0,
+          "mean": 2219.265306122449,
+          "p75": 2873.0,
+          "p95": 4590.849999999992,
+          "p99": 5846.61,
+          "max": 6527.0
+        },
+        "per_bin": [
+          {
+            "bin": 0,
+            "range_words": [
+              486.5,
+              1187.2
+            ],
+            "population": 59,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 1,
+            "range_words": [
+              1187.2,
+              1667.4
+            ],
+            "population": 59,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 2,
+            "range_words": [
+              1667.4,
+              2314.8
+            ],
+            "population": 58,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 3,
+            "range_words": [
+              2314.8,
+              3095.6
+            ],
+            "population": 59,
+            "allocated": 20,
+            "picked": 20
+          },
+          {
+            "bin": 4,
+            "range_words": [
+              3095.6,
+              6527.3
+            ],
+            "population": 59,
+            "allocated": 20,
+            "picked": 20
+          }
+        ]
+      },
+      "eval_summary": {
+        "document_words": {
+          "count": 100,
+          "min": 487.0,
+          "p1": 563.23,
+          "p5": 762.95,
+          "p25": 1281.75,
+          "median": 1974.0,
+          "mean": 2223.76,
+          "p75": 2868.25,
+          "p95": 4532.249999999998,
+          "p99": 5851.820000000003,
+          "max": 6527.0
+        },
+        "reference_words": {
+          "count": 100,
+          "min": 85.0,
+          "p1": 88.96,
+          "p5": 107.80000000000001,
+          "p25": 163.75,
+          "median": 195.5,
+          "mean": 194.64,
+          "p75": 226.0,
+          "p95": 266.0,
+          "p99": 356.90000000000043,
+          "max": 446.0
+        },
+        "per_bin_counts": {
+          "0": 20,
+          "1": 20,
+          "2": 20,
+          "3": 20,
+          "4": 20
+        }
+      },
+      "eval_file": "datasets/eval_100/vlsp_100.jsonl",
+      "eval_sha256": "e7ea32dca32c8beaeb863a55799e03efcacd4263d828d06a39fa81d2e3186c59",
+      "eval_records": 100
+    }
+  }
+}

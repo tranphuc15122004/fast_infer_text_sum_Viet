@@ -1,0 +1,29 @@
+# Local tooling
+.serena/
+
+# Heavy media / binary assets.
+# These are large, non-code artifacts (demo GIFs, videos, PDFs). Added after
+# trimming `externals/` from 99MB -> 41MB. If a specific asset genuinely needs
+# to be versioned, bypass with: git add -f <path>
+*.gif
+*.mp4
+*.pdf
+
+# Note: real input assets are intentionally NOT ignored:
+#   - externals/*/eval_datasets/*.jsonl   (DeepSpec eval: DEFAULT_DATASET_ROOT)
+#   - externals/EAGLE/eagle/data/**/*.jsonl (loaded via data/{bench}/question.jsonl)
+#   - referenced doc/logo images (*.png, *.svg, *.ico)
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+datasets/raw/
+# Pool chuẩn hoá 109MB, tái tạo 100% từ datasets/raw/ bằng:
+#   python3 scripts/data/build_eval_100.py --stage normalize
+# Bộ test thật nằm ở datasets/eval_100/ (4.4MB) và VẪN được commit.
+datasets/normalized/
+outputs/finetuning-synthetic/
+outputs/
+checkpoints/

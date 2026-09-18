@@ -1,0 +1,57 @@
+model:
+  target_model_path: /absolute/path/to/Qwen3-4B
+  torch_dtype: bfloat16
+  mask_token_id: 151669
+  num_draft_layers: 5
+  block_size: 16
+  target_layer_ids: null
+  # Optional portable export from a previous Finetuning run; not for --resume-from.
+  draft_init_path: null
+data:
+  # Tạo bằng: python -m Finetuning.capture_features --input teacher_train.jsonl ...
+  train_data_path: null
+  hidden_states_path: /absolute/path/to/features_train
+  eval_data_path: null
+  eval_hidden_states_path: /absolute/path/to/features_eval
+  max_length: 2048
+  max_source_tokens: 1536
+  max_summary_tokens: 384
+  chat_template: qwen3
+  prompt_template: "Hãy tóm tắt văn bản sau bằng tiếng Việt. Chỉ trả lời bằng bản tóm tắt:\n\n{document}"
+  feature_dtype: bfloat16
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+training:
+  strategy: dflash
+  num_epochs: 1
+  max_steps: 1000
+  batch_size: 1
+  accumulation_steps: 1
+  learning_rate: 0.0006
+  weight_decay: 0.0
+  warmup_ratio: 0.04
+  scheduler_type: cosine
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 128
+  attention_backend: sdpa
+  loss_type: dflash
+  dpace_alpha: 0.5
+  save_interval: 100
+  eval_interval: 100
+  log_interval: 10
+  seed: 42
+  shuffle: true
+  # Tune a fixed per-GPU batch with a real CUDA forward/backward preflight.
+  adaptive_batch_size: true
+  target_memory_fraction: 0.90
+  adaptive_min_batch_size: 1
+  adaptive_max_batch_size: 256
+  adaptive_probe_batches: 2
+output_dir: /absolute/path/to/outputs/qwen3_4b_dflash
+run_id: qwen3-4b
+device: auto
+offline: true

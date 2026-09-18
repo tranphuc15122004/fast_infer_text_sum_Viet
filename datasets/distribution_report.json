@@ -1,0 +1,342 @@
+{
+  "datasets": [
+    {
+      "dataset": "vietnews",
+      "pool_split": "test",
+      "source_split": "test",
+      "multi_document": false,
+      "records": 22643,
+      "skipped_records": 1,
+      "skipped_reasons": {
+        "chỉ có 2 block (<3)": 1
+      },
+      "document_words": {
+        "count": 22643,
+        "min": 31.0,
+        "p1": 145.0,
+        "p5": 194.0,
+        "p25": 309.0,
+        "median": 432.0,
+        "mean": 501.25584065715674,
+        "p75": 645.0,
+        "p95": 1015.0,
+        "p99": 1245.0,
+        "max": 2235.0
+      },
+      "document_chars": {
+        "count": 22643,
+        "min": 138.0,
+        "p1": 657.0,
+        "p5": 882.0,
+        "p25": 1398.0,
+        "median": 1955.0,
+        "mean": 2261.1443713288877,
+        "p75": 2898.5,
+        "p95": 4566.0,
+        "p99": 5592.159999999996,
+        "max": 10237.0
+      },
+      "reference_words": {
+        "count": 22643,
+        "min": 11.0,
+        "p1": 19.0,
+        "p5": 23.0,
+        "p25": 28.0,
+        "median": 33.0,
+        "mean": 34.97089608267456,
+        "p75": 41.0,
+        "p95": 52.0,
+        "p99": 65.0,
+        "max": 111.0
+      },
+      "reference_chars": {
+        "count": 22643,
+        "min": 46.0,
+        "p1": 86.0,
+        "p5": 101.0,
+        "p25": 125.0,
+        "median": 148.0,
+        "mean": 156.4224263569315,
+        "p75": 182.0,
+        "p95": 233.0,
+        "p99": 293.0,
+        "max": 493.0
+      },
+      "compression_ratio_words": {
+        "mean": 0.0855,
+        "median": 0.0775,
+        "min": 0.0114,
+        "max": 1.0968
+      },
+      "source_docs_per_record": {
+        "1": 22643
+      },
+      "duplicate_documents": 146,
+      "duplicate_references": 147,
+      "category_distribution": {
+        "(không có)": 22643
+      }
+    },
+    {
+      "dataset": "wikilingua",
+      "pool_split": "test",
+      "source_split": "test",
+      "multi_document": false,
+      "records": 3901,
+      "skipped_records": 1,
+      "skipped_reasons": {
+        "document hoặc reference rỗng": 1
+      },
+      "document_words": {
+        "count": 3901,
+        "min": 6.0,
+        "p1": 24.0,
+        "p5": 96.0,
+        "p25": 299.0,
+        "median": 502.0,
+        "mean": 574.2768520892079,
+        "p75": 764.0,
+        "p95": 1297.0,
+        "p99": 1833.0,
+        "max": 3031.0
+      },
+      "document_chars": {
+        "count": 3901,
+        "min": 22.0,
+        "p1": 100.0,
+        "p5": 399.0,
+        "p25": 1245.0,
+        "median": 2088.0,
+        "mean": 2388.548577287875,
+        "p75": 3165.0,
+        "p95": 5358.0,
+        "p99": 7484.0,
+        "max": 13258.0
+      },
+      "reference_words": {
+        "count": 3901,
+        "min": 3.0,
+        "p1": 7.0,
+        "p5": 17.0,
+        "p25": 31.0,
+        "median": 45.0,
+        "mean": 51.85901051012561,
+        "p75": 63.0,
+        "p95": 113.0,
+        "p99": 174.0,
+        "max": 308.0
+      },
+      "reference_chars": {
+        "count": 3901,
+        "min": 12.0,
+        "p1": 28.0,
+        "p5": 67.0,
+        "p25": 127.0,
+        "median": 183.0,
+        "mean": 220.93847731350937,
+        "p75": 263.0,
+        "p95": 500.0,
+        "p99": 881.0,
+        "max": 1731.0
+      },
+      "compression_ratio_words": {
+        "mean": 0.1751,
+        "median": 0.0847,
+        "min": 0.013,
+        "max": 12.6667
+      },
+      "source_docs_per_record": {
+        "1": 3901
+      },
+      "duplicate_documents": 0,
+      "duplicate_references": 1,
+      "category_distribution": {
+        "(không có)": 3901
+      }
+    },
+    {
+      "dataset": "vims",
+      "pool_split": "all",
+      "source_split": "all",
+      "multi_document": true,
+      "records": 300,
+      "skipped_records": 0,
+      "skipped_reasons": {},
+      "document_words": {
+        "count": 300,
+        "min": 751.0,
+        "p1": 1018.86,
+        "p5": 1249.75,
+        "p25": 1698.25,
+        "median": 2325.0,
+        "mean": 2719.556666666667,
+        "p75": 3196.0,
+        "p95": 6064.200000000003,
+        "p99": 7660.189999999996,
+        "max": 8451.0
+      },
+      "document_chars": {
+        "count": 300,
+        "min": 3594.0,
+        "p1": 4574.24,
+        "p5": 5742.2,
+        "p25": 7910.25,
+        "median": 10545.5,
+        "mean": 12426.923333333334,
+        "p75": 14877.25,
+        "p95": 28600.600000000013,
+        "p99": 34057.10999999997,
+        "max": 38809.0
+      },
+      "reference_words": {
+        "count": 300,
+        "min": 37.0,
+        "p1": 63.99,
+        "p5": 88.0,
+        "p25": 151.75,
+        "median": 210.0,
+        "mean": 212.51333333333332,
+        "p75": 270.5,
+        "p95": 348.20000000000005,
+        "p99": 416.27999999999975,
+        "max": 465.0
+      },
+      "reference_chars": {
+        "count": 300,
+        "min": 167.0,
+        "p1": 278.92999999999995,
+        "p5": 405.95,
+        "p25": 698.0,
+        "median": 966.5,
+        "mean": 972.4566666666667,
+        "p75": 1233.5,
+        "p95": 1556.9,
+        "p99": 1982.2999999999997,
+        "max": 2130.0
+      },
+      "compression_ratio_words": {
+        "mean": 0.0924,
+        "median": 0.0854,
+        "min": 0.0116,
+        "max": 0.2525
+      },
+      "source_docs_per_record": {
+        "5": 111,
+        "6": 75,
+        "7": 43,
+        "10": 30,
+        "8": 25,
+        "9": 15,
+        "4": 1
+      },
+      "duplicate_documents": 0,
+      "duplicate_references": 0,
+      "category_distribution": {
+        "(không có)": 300
+      },
+      "clusters": 300
+    },
+    {
+      "dataset": "vlsp",
+      "pool_split": "all",
+      "source_split": "all",
+      "multi_document": true,
+      "records": 300,
+      "skipped_records": 0,
+      "skipped_reasons": {},
+      "document_words": {
+        "count": 300,
+        "min": 351.0,
+        "p1": 486.47,
+        "p5": 704.6,
+        "p25": 1273.5,
+        "median": 1974.0,
+        "mean": 2246.9966666666664,
+        "p75": 2881.0,
+        "p95": 4955.15,
+        "p99": 6527.3099999999995,
+        "max": 6979.0
+      },
+      "document_chars": {
+        "count": 300,
+        "min": 1608.0,
+        "p1": 2101.17,
+        "p5": 3189.25,
+        "p25": 5784.0,
+        "median": 9007.0,
+        "mean": 10289.333333333334,
+        "p75": 13253.5,
+        "p95": 22468.450000000004,
+        "p99": 29733.129999999994,
+        "max": 31570.0
+      },
+      "reference_words": {
+        "count": 300,
+        "min": 63.0,
+        "p1": 82.96,
+        "p5": 112.0,
+        "p25": 163.75,
+        "median": 198.0,
+        "mean": 199.27666666666667,
+        "p75": 232.0,
+        "p95": 302.05,
+        "p99": 356.1299999999999,
+        "max": 446.0
+      },
+      "reference_chars": {
+        "count": 300,
+        "min": 291.0,
+        "p1": 401.55,
+        "p5": 534.8,
+        "p25": 746.0,
+        "median": 913.0,
+        "mean": 911.1666666666666,
+        "p75": 1063.0,
+        "p95": 1379.5,
+        "p99": 1600.019999999999,
+        "max": 2037.0
+      },
+      "compression_ratio_words": {
+        "mean": 0.112,
+        "median": 0.0991,
+        "min": 0.0229,
+        "max": 0.3232
+      },
+      "source_docs_per_record": {
+        "3": 140,
+        "2": 78,
+        "4": 61,
+        "5": 21
+      },
+      "duplicate_documents": 0,
+      "duplicate_references": 0,
+      "category_distribution": {
+        "Văn hóa - Xã hội": 70,
+        "Kinh tế": 50,
+        "Giải trí - Thể thao": 48,
+        "Pháp luật": 45,
+        "Khoa học - Công nghệ": 30,
+        "Thế giới": 28,
+        "Đời sống": 20,
+        "Giáo dục": 9
+      }
+    }
+  ],
+  "other_splits": {
+    "vietnews": {
+      "train": 105418,
+      "val": 22642,
+      "test": 22644
+    },
+    "wikilingua": {
+      "train": 13999,
+      "val": 1680,
+      "test": 3902
+    }
+  },
+  "config": {
+    "raw_dir": "/home/tuantb/fast_infer_text_sum_Viet/datasets/raw",
+    "punct_clean": true,
+    "length_metric": "words"
+  }
+}
