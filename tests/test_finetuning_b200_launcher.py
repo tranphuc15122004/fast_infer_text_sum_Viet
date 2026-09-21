@@ -158,3 +158,47 @@ def test_dry_run_skips_valid_completed_teacher_stage(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "SKIP generate_train" in result.stdout
+
+
+def test_dry_run_managed_server_generation_uses_cpu_dispatcher(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    output_root = tmp_path / "managed-run"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LAUNCHER),
+            "--config",
+            str(fixture["config"]),
+            "--train-input",
+            str(fixture["train_input"]),
+            "--eval-input",
+            str(fixture["eval_input"]),
+            "--target-model-path",
+            str(fixture["model"]),
+            "--output-root",
+            str(output_root),
+            "--nproc-per-node",
+            "2",
+            "--generation-backend",
+            "sglang",
+            "--generation-launch-servers",
+            "--generation-server-gpu-group",
+            "0",
+            "--generation-server-gpu-group",
+            "1",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    generate_lines = [
+        line for line in result.stdout.splitlines() if "RUN generate_" in line
+    ]
+    assert generate_lines
+    assert all("torch.distributed.run" not in line for line in generate_lines)
+    assert all("--generation-server-url" in line for line in generate_lines)
+    assert "--generation-server-url http://127.0.0.1:30000/v1" in generate_lines[0]

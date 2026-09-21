@@ -12,7 +12,12 @@ from typing import Any
 
 import torch
 
-from .data import DEFAULT_SUMMARY_PROMPT_TEMPLATE, iter_summary_jsonl, render_summary_prompt
+from .data import (
+    DEFAULT_SUMMARY_PROMPT_TEMPLATE,
+    iter_summary_jsonl,
+    render_summary_prompt,
+    render_summary_user_prompt_budgeted,
+)
 from .adaptive_inference import (
     AdaptiveInferenceSettings,
     BackoffResult,
@@ -338,6 +343,133 @@ def generate_teacher_jsonl(
     return stats
 
 
+def generate_teacher_jsonl_server(
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    tokenizer: Any,
+    server_pool: Any,
+    target_model_path: str,
+    generation_backend: str,
+    server_model: str | None,
+    max_length: int,
+    max_source_tokens: int,
+    max_summary_tokens: int,
+    chat_template: str,
+    prompt_template: str = DEFAULT_SUMMARY_PROMPT_TEMPLATE,
+    window_size: int = 0,
+    allow_empty: bool = False,
+) -> dict[str, int]:
+    """Generate teacher summaries through a SGLang/vLLM server pool.
+
+    The local tokenizer is still used for the source budget and cache prompt
+    contract; model weights stay inside the server pool, so one launcher rank
+    does not replicate a target model on every GPU.
+    """
+
+    if generation_backend not in {"sglang", "vllm"}:
+        raise ValueError("server generation backend must be sglang or vllm")
+    destination = Path(output_path)
+    if destination.exists():
+        raise FileExistsError(f"teacher trajectory output already exists: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    window_limit = window_size or max(1, int(getattr(server_pool, "max_in_flight", 1)) * 2)
+    if window_limit <= 0:
+        raise ValueError("window_size must be positive")
+    written = 0
+    rejected = 0
+    requests_sent = 0
+    started = time.perf_counter()
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            window: list[tuple[int, Any, str]] = []
+
+            def flush_window(items: list[tuple[int, Any, str]]) -> None:
+                nonlocal written, rejected, requests_sent
+                if not items:
+                    return
+                requests = [
+                    {
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_summary_tokens,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "stream": False,
+                    }
+                    for _source_index, _record, prompt in items
+                ]
+                requests_sent += len(requests)
+                summaries = server_pool.generate_many(requests)
+                if len(summaries) != len(items):
+                    raise ValueError(
+                        "generation server pool returned a different number of summaries"
+                    )
+                for (_source_index, record, _prompt), summary in zip(
+                    items, summaries, strict=True
+                ):
+                    cleaned = str(summary).strip()
+                    if not cleaned:
+                        rejected += 1
+                        continue
+                    payload = {
+                        "id": record.id,
+                        "document": record.document,
+                        "summary": cleaned,
+                        "reference_summary": record.summary,
+                        **dict(record.metadata),
+                        "teacher": {
+                            "target_model_path": str(target_model_path),
+                            "generation_backend": generation_backend,
+                            "server_model": server_model,
+                            "chat_template": chat_template,
+                            "prompt_template": prompt_template,
+                            "do_sample": False,
+                            "max_length": max_length,
+                            "max_source_tokens": max_source_tokens,
+                            "max_summary_tokens": max_summary_tokens,
+                        },
+                    }
+                    handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+                    written += 1
+
+            for source_index, record in enumerate(iter_summary_jsonl(input_path)):
+                try:
+                    prompt = render_summary_user_prompt_budgeted(
+                        record,
+                        tokenizer,
+                        max_length,
+                        max_source_tokens=max_source_tokens,
+                        max_summary_tokens=max_summary_tokens,
+                        chat_template=chat_template,
+                        prompt_template=prompt_template,
+                    )
+                except (TypeError, ValueError):
+                    rejected += 1
+                    continue
+                window.append((source_index, record, prompt))
+                if len(window) >= window_limit:
+                    flush_window(window)
+                    window = []
+            flush_window(window)
+        if written == 0 and not allow_empty:
+            raise ValueError("target server generation produced no usable summaries")
+        os.replace(temporary_name, destination)
+    except Exception:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+    elapsed = max(time.perf_counter() - started, 1e-9)
+    return {
+        "written": written,
+        "rejected": rejected,
+        "requests": requests_sent,
+        "elapsed_ms": int(elapsed * 1000),
+        "samples_per_sec_x1000": int(written / elapsed * 1000),
+    }
+
+
 def _dtype(name: str) -> torch.dtype:
     value = getattr(torch, name, None)
     if not isinstance(value, torch.dtype):
@@ -358,12 +490,75 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--generation-backend",
+        choices=("hf", "sglang", "vllm"),
+        default="hf",
+        help="local HF generation or an OpenAI-compatible SGLang/vLLM pool",
+    )
+    parser.add_argument(
+        "--generation-server-url",
+        action="append",
+        default=[],
+        help="repeat once per SGLang/vLLM endpoint (each endpoint may serve one GPU)",
+    )
+    parser.add_argument("--generation-model")
+    parser.add_argument("--generation-concurrency-per-server", type=int, default=8)
+    parser.add_argument("--generation-timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--generation-retries", type=int, default=2)
+    parser.add_argument("--generation-backoff-seconds", type=float, default=0.25)
+    parser.add_argument("--generation-window-size", type=int, default=0)
     add_adaptive_cli_args(parser)
     args = parser.parse_args(argv)
     if args.max_source_tokens < 0 or args.max_summary_tokens < 1:
         raise ValueError("source budget must be non-negative and summary budget positive")
     if args.max_source_tokens + args.max_summary_tokens > args.max_length:
         raise ValueError("source and summary token budgets exceed --max-length")
+    if args.generation_backend != "hf":
+        if not args.generation_server_url:
+            raise ValueError("remote generation requires at least one --generation-server-url")
+        if args.generation_concurrency_per_server <= 0:
+            raise ValueError("--generation-concurrency-per-server must be positive")
+        if args.generation_timeout_seconds <= 0 or args.generation_retries < 0:
+            raise ValueError("generation server retry/timeout settings are invalid")
+        if args.generation_backoff_seconds < 0 or args.generation_window_size < 0:
+            raise ValueError("generation server backoff/window settings are invalid")
+    if args.generation_backend != "hf":
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.target_model_path,
+            trust_remote_code=args.trust_remote_code,
+            local_files_only=True,
+        )
+        from .server_pool import OpenAICompatibleServerPool
+
+        server_model = args.generation_model or args.target_model_path
+        server_pool = OpenAICompatibleServerPool(
+            args.generation_server_url,
+            model=server_model,
+            concurrency_per_server=args.generation_concurrency_per_server,
+            timeout_seconds=args.generation_timeout_seconds,
+            max_retries=args.generation_retries,
+            retry_backoff_seconds=args.generation_backoff_seconds,
+        )
+        stats = generate_teacher_jsonl_server(
+            args.input,
+            args.output,
+            tokenizer=tokenizer,
+            server_pool=server_pool,
+            target_model_path=args.target_model_path,
+            generation_backend=args.generation_backend,
+            server_model=server_model,
+            max_length=args.max_length,
+            max_source_tokens=args.max_source_tokens,
+            max_summary_tokens=args.max_summary_tokens,
+            chat_template=args.chat_template,
+            prompt_template=args.prompt_template,
+            window_size=args.generation_window_size,
+        )
+        print(json.dumps(stats, ensure_ascii=False, sort_keys=True))
+        return
     context = initialize_distributed(args.device)
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -456,4 +651,4 @@ if __name__ == "__main__":
     main()
 
 
-__all__ = ["generate_teacher_jsonl", "main"]
+__all__ = ["generate_teacher_jsonl", "generate_teacher_jsonl_server", "main"]

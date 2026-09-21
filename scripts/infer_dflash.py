@@ -49,6 +49,37 @@ def round_optional(value: float | None, digits: int = 3) -> float | None:
     return round(value, digits) if value is not None else None
 
 
+def summarize_acceptance(
+    acceptance_lengths: list[int], *, block_size: int
+) -> dict[str, float | None]:
+    """Normalize DFlash block acceptance telemetry for the shared schema."""
+
+    if not acceptance_lengths:
+        return {
+            "avg_accept_length": None,
+            "acceptance_rate": None,
+            "rejected_draft_ratio": None,
+        }
+    average = sum(float(value) for value in acceptance_lengths) / len(acceptance_lengths)
+    if block_size <= 1:
+        acceptance_rate = None
+        rejected_ratio = None
+    else:
+        proposed = len(acceptance_lengths) * (block_size - 1)
+        accepted_draft = sum(max(0, int(value) - 1) for value in acceptance_lengths)
+        acceptance_rate = round(accepted_draft / proposed, 4) if proposed else None
+        rejected_ratio = (
+            round(1.0 - acceptance_rate, 4)
+            if acceptance_rate is not None
+            else None
+        )
+    return {
+        "avg_accept_length": round(average, 4),
+        "acceptance_rate": acceptance_rate,
+        "rejected_draft_ratio": rejected_ratio,
+    }
+
+
 def normalize_generation_token_ids(config, tokenizer) -> dict[str, tuple[int, int]]:
     """Repair stale BOS/EOS ids that are outside the loaded tokenizer vocab.
 
@@ -196,6 +227,7 @@ def main() -> None:
             f"draft={draft_token_changes or 'none'}",
             flush=True,
         )
+    load_start = time.perf_counter()
     target = AutoModelForCausalLM.from_pretrained(
         args.target_model,
         dtype=dtype,
@@ -210,6 +242,8 @@ def main() -> None:
         low_cpu_mem_usage=True,
         config=draft_config,
     ).to(device).eval()
+    torch.cuda.synchronize(device)
+    model_load_ms = round((time.perf_counter() - load_start) * 1000.0, 3)
 
     if args.data_file:
         prompts = load_records(Path(args.data_file), args.max_samples)
@@ -240,6 +274,7 @@ def main() -> None:
                 block_size=1,
             )
         seed_everything(args.seed)
+        torch.cuda.reset_peak_memory_stats(device)
         result, elapsed = _run_generation(
             dflash_generate, draft, target, input_ids,
             max_new_tokens=args.max_new_tokens,
@@ -280,7 +315,7 @@ def main() -> None:
             "model": args.target_model,
             "draft_model": args.draft_model,
             "input_tokens": input_len,
-            "retained_tokens": None,
+            "retained_tokens": input_len,
             "output_tokens": n_tok,
             "baseline_output_tokens": baseline_n_tok,
             "batch_size": 1,
@@ -297,15 +332,34 @@ def main() -> None:
             "dense_decode_ms": round_optional(base_decode_ms),
             "dense_e2e_ms": round_optional(base_e2e_ms),
             "tpot_ms": round(decode_ms / n_tok, 3) if n_tok else None,
-            "throughput_tok_s": round(n_tok / (decode_ms / 1e3), 2)
+            "throughput_tok_s": round(n_tok / (e2e_ms / 1e3), 2)
+            if e2e_ms > 0 and n_tok else 0.0,
+            "decode_throughput_tok_s": round(n_tok / (decode_ms / 1e3), 2)
             if decode_ms > 0 and n_tok else 0.0,
             "qps": None,
-            "peak_memory_gb": None,
+            "peak_memory_gb": round(
+                torch.cuda.max_memory_allocated(device) / (1024**3), 6
+            ),
+            "model_load_ms": model_load_ms,
+            "device": str(device),
+            "measurement_scope": "full_e2e",
             "sample_id": sample["id"],
             "text": text,
+            "reference_output": sample.get("reference"),
             "baseline_text": baseline_text,
             "block_size": block_size,
             "acceptance_lengths": list(result.acceptance_lengths),
+            "draft_latency_ms": round_optional(
+                getattr(result, "draft_latency_ms", None)
+            ),
+            "verification_latency_ms": round_optional(
+                getattr(result, "verification_latency_ms", None)
+            ),
+            "draft_tokens_proposed": getattr(result, "draft_tokens_proposed", None),
+            "draft_tokens_accepted": getattr(result, "draft_tokens_accepted", None),
+            **summarize_acceptance(
+                list(result.acceptance_lengths), block_size=block_size
+            ),
             "speedup_scope": "paired_dflash_block_size_1" if baseline is not None else None,
             "speedup_valid": (
                 baseline is not None
@@ -316,6 +370,7 @@ def main() -> None:
             metrics.add_code_completion(record, text, sample.get("reference"))
         else:
             rouge.add_rouge(record, text, sample.get("reference"))
+            metrics.add_semantic(record, text, sample.get("reference"))
         writer.add(record)
         print(
             f"[sample {sample['id']}] dflash={e2e_ms:.1f}ms "
@@ -330,11 +385,13 @@ def main() -> None:
         checks.append(verify.check_new_tokens(n_tok))
         checks.append(verify.check_output_text(text))
 
-    quality = (
-        metrics.aggregate_code_completion(writer.records)
-        if any(r.get("task_type") == "code_completion" for r in writer.records)
-        else rouge.aggregate_rouge(writer.records)
-    )
+    if any(r.get("task_type") == "code_completion" for r in writer.records):
+        quality = metrics.aggregate_code_completion(writer.records)
+    else:
+        quality = {
+            **rouge.aggregate_rouge(writer.records),
+            **metrics.aggregate_semantic(writer.records),
+        }
     summary = {
         "type": "summary",
         "method": "dflash",

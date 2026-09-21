@@ -75,6 +75,15 @@ output token budget.
 Mỗi run lưu raw JSONL, timing phase, acceptance metadata, VRAM, batch/TP/DP
 assignment, `run_manifest.json`, live logs và `metrics_summary.{json,csv,md}`.
 
+Sau mỗi cell, runner còn ghi `metric_audit` cho từng sample và
+`metric_contract` cho summary. Contract strict kiểm tra coverage đủ mẫu,
+`measurement_scope=full_e2e`, output-token budget, timing raw, telemetry
+speculative và semantic metrics. Cell chạy xong nhưng thiếu một điều kiện sẽ
+được đánh dấu `metric_incomplete`; timing không bị bịa hoặc thay bằng zero.
+Speedup external chỉ được giữ khi reference dense cùng `sample_id` và cùng số
+output token. Vanilla output có cờ `output_quality_guard`; output lặp suy biến
+không được dùng làm dense reference.
+
 ## Chạy full an toàn và tự khôi phục
 
 Full run mặc định không dừng khi một child process, cell hoặc shard bị lỗi.
@@ -100,4 +109,14 @@ theo cấp số nhân và tiếp tục toàn bộ ma trận. `run_manifest.json`
 từng cell; các failure/OOM/timeout không được dùng như timing hợp lệ.
 
 Các input/output của từng lần retry được giữ trong `attempts/` để chẩn đoán;
-runner không sửa raw JSONL hoặc ghi đè artifact của run cũ.
+runner không sửa raw JSONL hoặc ghi đè artifact của run cũ. Khi audit lại một
+run đã có mà không chạy inference:
+
+```bash
+python3 scripts/audit_benchmark_metrics.py \
+  --run-dir outputs/longbench_viet_100/<run-id> \
+  --expected-output-tokens 2048
+```
+
+Script tự đọc `sample_count` từ `run_manifest.json`; có thể truyền
+`--expected-samples` khi audit một artifact không có manifest.

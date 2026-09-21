@@ -276,6 +276,42 @@ def _prepare_runtime_cache_env() -> None:
         os.environ.setdefault("CUDA_PATH", str(cuda_home))
         os.environ["PATH"] = f"{cuda_home / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
 
+        # Some pip CUDA layouts ship nvcc under ``nvidia/cu13`` while the
+        # runtime library lives under ``nvidia/cuda_runtime``.  SGLang's JIT
+        # invokes the host linker, so expose the runtime directory through
+        # the standard compiler/runtime search variables as well.
+        runtime_candidates = [
+            cuda_home / "lib64" / "libcudart.so",
+            cuda_home / "lib" / "libcudart.so",
+            cuda_home.parent / "cuda_runtime" / "lib" / "libcudart.so",
+        ]
+        runtime_candidates.extend(
+            path
+            for entry in package_roots
+            for path in entry.glob("nvidia/**/libcudart.so*")
+        )
+        runtime_library = next(
+            (path for path in runtime_candidates if path.exists()), None
+        )
+        if runtime_library is not None:
+            # The CUDA wheels may expose only ``libcudart.so.<major>``.  The
+            # JIT linker asks for ``-lcudart``, so create an unversioned alias
+            # in the writable runtime cache instead of mutating site-packages.
+            linker_dir = root / "cuda_lib"
+            linker_dir.mkdir(parents=True, exist_ok=True)
+            linker_alias = linker_dir / "libcudart.so"
+            if not linker_alias.exists():
+                linker_alias.symlink_to(runtime_library)
+            runtime_dir = str(linker_dir)
+            for variable in ("LIBRARY_PATH", "LD_LIBRARY_PATH"):
+                current = os.environ.get(variable, "")
+                if runtime_dir not in current.split(os.pathsep):
+                    os.environ[variable] = (
+                        runtime_dir
+                        if not current
+                        else f"{runtime_dir}{os.pathsep}{current}"
+                    )
+
 
 def initialize_specforge_distributed(*, tp_size: int) -> None:
     """Initialize SpecForge's device meshes before its ModelRunner is built.

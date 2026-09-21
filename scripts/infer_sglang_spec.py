@@ -21,7 +21,7 @@ from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-from common import io_util, rouge
+from common import io_util, metrics, rouge
 from common.benchmark_runtime import build_sample_record, runtime_metadata
 from common.data_loader import load_records
 from common.input_utils import truncate_input_ids
@@ -381,6 +381,7 @@ def main() -> int:
                     reference_output=sample.get("reference"),
                 )
                 rouge.add_rouge(record, text, sample.get("reference"))
+                metrics.add_semantic(record, text, sample.get("reference"))
                 record["run_id"] = args.run_id
                 record["raw_response_meta"] = payload.get("meta_info", {})
                 writer.add(record)
@@ -400,6 +401,7 @@ def main() -> int:
             "server_startup_ms": server_startup_ms,
             "runtime": runtime_metadata(),
             **rouge.aggregate_rouge(records_written),
+            **metrics.aggregate_semantic(records_written),
         }
         writer.finalize(summary)
         return 0 if successful == len(records) else 1

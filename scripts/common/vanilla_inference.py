@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from common import io_util, rouge
+from common import io_util, metrics, rouge
 from common.benchmark_runtime import (
     build_sample_record,
     measure_call,
@@ -446,6 +446,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             "action": "annotate_only",
         }
         rouge.add_rouge(record, text, sample.get("reference"))
+        metrics.add_semantic(record, text, sample.get("reference"))
         if record["output_quality_guard"]["degenerate_repetition"]:
             print(
                 f"[{method}][{sample['id']}] warning: output has a strong "
@@ -482,6 +483,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         "effective_attention_backend": effective_attention_backend or "unknown",
         "runtime": metadata,
         **rouge.aggregate_rouge(writer.records),
+        **metrics.aggregate_semantic(writer.records),
     }
     writer.finalize(summary)
     io_util.print_table(list(summary.items()))

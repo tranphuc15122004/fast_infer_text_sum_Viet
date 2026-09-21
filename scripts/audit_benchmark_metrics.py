@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from common.metric_audit import audit_output_file, format_audit_log
 
 
-def audit_run(run_dir: Path, expected_output_tokens: int | None = None) -> int:
+def audit_run(
+    run_dir: Path,
+    expected_output_tokens: int | None = None,
+    expected_samples: int | None = None,
+) -> int:
     """Audit canonical baseline/dataset JSONL files below ``run_dir``."""
 
     run_dir = Path(run_dir)
@@ -35,6 +40,7 @@ def audit_run(run_dir: Path, expected_output_tokens: int | None = None) -> int:
             dataset=dataset,
             audit_path=audit_path,
             expected_output_tokens=expected_output_tokens,
+            expected_samples=expected_samples,
         )
         line = format_audit_log(
             baseline=baseline,
@@ -53,8 +59,27 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--expected-output-tokens", type=int, default=None)
+    parser.add_argument(
+        "--expected-samples",
+        type=int,
+        default=None,
+        help="expected sample count per cell; defaults to run_manifest.json",
+    )
     args = parser.parse_args()
-    count = audit_run(args.run_dir, args.expected_output_tokens)
+    expected_samples = args.expected_samples
+    if expected_samples is None:
+        manifest_path = args.run_dir / "run_manifest.json"
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                expected_samples = int(manifest["sample_count"])
+            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+                expected_samples = None
+    count = audit_run(
+        args.run_dir,
+        args.expected_output_tokens,
+        expected_samples,
+    )
     print(f"Audited {count} canonical JSONL file(s) under {args.run_dir}")
 
 

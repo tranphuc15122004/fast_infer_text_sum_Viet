@@ -19,7 +19,10 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Callable, Iterator, Sequence
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import yaml
 
@@ -334,6 +337,77 @@ def _distributed_prefix(python_bin: str, nproc_per_node: int) -> list[str]:
     ]
 
 
+def generation_command_args(args: argparse.Namespace) -> list[str]:
+    """Build remote generation flags without starting a second torchrun tree."""
+
+    backend = str(args.generation_backend)
+    if backend == "hf":
+        return []
+    if backend not in {"sglang", "vllm"}:
+        raise LauncherError(f"unsupported generation backend: {backend}")
+    urls = [str(url) for url in getattr(args, "generation_server_urls", []) if str(url)]
+    if not urls:
+        raise LauncherError(
+            f"--generation-backend {backend} requires at least one --generation-server-url"
+        )
+    values = ["--generation-backend", backend]
+    for url in urls:
+        values.extend(["--generation-server-url", url])
+    model = getattr(args, "generation_model", None)
+    if model:
+        values.extend(["--generation-model", str(model)])
+    values.extend(
+        [
+            "--generation-concurrency-per-server",
+            str(args.generation_concurrency_per_server),
+            "--generation-timeout-seconds",
+            str(args.generation_timeout_seconds),
+            "--generation-retries",
+            str(args.generation_retries),
+            "--generation-backoff-seconds",
+            str(args.generation_backoff_seconds),
+            "--generation-window-size",
+            str(args.generation_window_size),
+        ]
+    )
+    return values
+
+
+def _default_generation_gpu_groups(nproc_per_node: int) -> list[str]:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        groups = [value.strip() for value in visible.split(",") if value.strip()]
+        if len(groups) >= nproc_per_node:
+            return groups[:nproc_per_node]
+    return [str(index) for index in range(nproc_per_node)]
+
+
+def resolve_generation_server_urls(
+    args: argparse.Namespace,
+    *,
+    nproc_per_node: int,
+) -> list[str]:
+    """Resolve endpoint URLs for external or launcher-managed servers."""
+
+    if not args.generation_launch_servers:
+        return list(args.generation_server_urls)
+    if args.generation_backend == "hf":
+        raise LauncherError("--generation-launch-servers requires sglang or vllm backend")
+    if args.generation_server_urls:
+        raise LauncherError(
+            "do not combine --generation-launch-servers with explicit server URLs"
+        )
+    groups = list(args.generation_server_gpu_groups)
+    if not groups:
+        groups = _default_generation_gpu_groups(nproc_per_node)
+        args.generation_server_gpu_groups = groups
+    host = str(args.generation_server_host).strip()
+    return [
+        f"http://{host}:{args.generation_server_base_port + index}/v1"
+        for index in range(len(groups))
+    ]
+
+
 def build_commands(
     config: dict[str, object],
     paths: RunPaths,
@@ -374,7 +448,24 @@ def build_commands(
     adaptive = _adaptive_args(args)
     prefix = _distributed_prefix(python_bin, nproc_per_node)
 
-    generate_base = [*prefix, "-m", "Finetuning.generate_targets", *prep_common, *adaptive]
+    if args.generation_backend == "hf":
+        generate_base = [
+            *prefix,
+            "-m",
+            "Finetuning.generate_targets",
+            *prep_common,
+            *adaptive,
+        ]
+    else:
+        # Remote servers already own the target model and their GPU workers.
+        # A torchrun wrapper would replicate clients and multiply requests.
+        generate_base = [
+            python_bin,
+            "-m",
+            "Finetuning.generate_targets",
+            *prep_common,
+            *generation_command_args(args),
+        ]
     cache_base = [
         *prefix,
         "-m",
@@ -665,6 +756,130 @@ def _job_lock(path: Path) -> Iterator[None]:
         handle.close()
 
 
+@dataclass
+class _ManagedGenerationServers:
+    process: subprocess.Popen[str]
+    log_handle: object
+
+
+def _server_probe_urls(base_url: str) -> tuple[str, ...]:
+    value = base_url.rstrip("/")
+    root = value[:-3] if value.endswith("/v1") else value
+    return (f"{root}/health", f"{value}/models")
+
+
+def _wait_for_generation_servers(
+    handle: _ManagedGenerationServers,
+    urls: Sequence[str],
+    *,
+    timeout_seconds: float,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    pending = set(urls)
+    while pending and time.monotonic() < deadline:
+        if handle.process.poll() is not None:
+            raise LauncherError(
+                "managed generation server launcher exited early; "
+                "inspect logs/target_servers_launcher.log"
+            )
+        ready: set[str] = set()
+        for base_url in pending:
+            for probe_url in _server_probe_urls(base_url):
+                try:
+                    with urllib_request.urlopen(probe_url, timeout=2) as response:
+                        if 200 <= int(response.status) < 300:
+                            ready.add(base_url)
+                            break
+                except (urllib_error.URLError, TimeoutError, OSError):
+                    continue
+        pending.difference_update(ready)
+        if pending:
+            time.sleep(1.0)
+    if pending:
+        raise LauncherError(
+            "managed generation servers did not become ready within "
+            f"{timeout_seconds:.0f}s: {sorted(pending)}"
+        )
+
+
+def _start_managed_generation_servers(
+    args: argparse.Namespace,
+    config: dict[str, object],
+    paths: RunPaths,
+    environment: dict[str, str],
+) -> _ManagedGenerationServers:
+    model_path = str(_mapping(config, "model")["target_model_path"])
+    command = [
+        args.python_bin,
+        str(ROOT / "scripts" / "launch_finetuning_target_servers.py"),
+        "--backend",
+        args.generation_backend,
+        "--model-path",
+        model_path,
+        "--host",
+        args.generation_server_host,
+        "--base-port",
+        str(args.generation_server_base_port),
+        "--tp-size",
+        str(args.generation_server_tp_size),
+        "--mem-fraction",
+        str(args.generation_server_mem_fraction),
+        "--log-dir",
+        str(paths.log_dir / "target_servers"),
+    ]
+    if args.generation_server_context_length is not None:
+        command.extend(["--context-length", str(args.generation_server_context_length)])
+    if args.generation_server_max_num_seqs:
+        command.extend(["--max-num-seqs", str(args.generation_server_max_num_seqs)])
+    if args.generation_model:
+        command.extend(["--served-model-name", str(args.generation_model)])
+    for group in args.generation_server_gpu_groups:
+        command.extend(["--gpu-group", str(group)])
+    log_path = paths.log_dir / "target_servers_launcher.log"
+    log_handle = log_path.open("a", encoding="utf-8")
+    log_handle.write(f"\n$ {shlex.join(command)}\n")
+    log_handle.flush()
+    process = subprocess.Popen(
+        command,
+        env=environment,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    handle = _ManagedGenerationServers(process, log_handle)
+    try:
+        _wait_for_generation_servers(
+            handle,
+            args.generation_server_urls,
+            timeout_seconds=args.generation_server_startup_timeout_seconds,
+        )
+    except Exception:
+        _stop_managed_generation_servers(handle)
+        raise
+    print(f"managed generation servers ready: {', '.join(args.generation_server_urls)}")
+    return handle
+
+
+def _stop_managed_generation_servers(handle: _ManagedGenerationServers | None) -> None:
+    if handle is None:
+        return
+    process = handle.process
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    if process.poll() is None:
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=10)
+    handle.log_handle.close()  # type: ignore[union-attr]
+
+
 def _write_run_manifest(
     paths: RunPaths,
     *,
@@ -688,6 +903,23 @@ def _write_run_manifest(
         "probe_batches": args.probe_batches,
         "capture_backend": args.capture_backend,
         "capture_method": args.capture_method,
+        "generation_backend": args.generation_backend,
+        "generation_server_urls": list(args.generation_server_urls),
+        "generation_model": args.generation_model,
+        "generation_concurrency_per_server": args.generation_concurrency_per_server,
+        "generation_timeout_seconds": args.generation_timeout_seconds,
+        "generation_retries": args.generation_retries,
+        "generation_backoff_seconds": args.generation_backoff_seconds,
+        "generation_window_size": args.generation_window_size,
+        "generation_launch_servers": args.generation_launch_servers,
+        "generation_server_gpu_groups": list(args.generation_server_gpu_groups),
+        "generation_server_host": args.generation_server_host,
+        "generation_server_base_port": args.generation_server_base_port,
+        "generation_server_tp_size": args.generation_server_tp_size,
+        "generation_server_mem_fraction": args.generation_server_mem_fraction,
+        "generation_server_context_length": args.generation_server_context_length,
+        "generation_server_max_num_seqs": args.generation_server_max_num_seqs,
+        "generation_server_startup_timeout_seconds": args.generation_server_startup_timeout_seconds,
         "sglang_tp_size": args.sglang_tp_size,
         "sglang_attention_backend": args.sglang_attention_backend,
         "sglang_mem_fraction_static": args.sglang_mem_fraction_static,
@@ -745,6 +977,103 @@ def _parser() -> argparse.ArgumentParser:
         default=os.environ.get("FINETUNE_CAPTURE_METHOD", "dflash"),
     )
     parser.add_argument(
+        "--generation-backend",
+        choices=("hf", "sglang", "vllm"),
+        default=os.environ.get("FINETUNE_GENERATION_BACKEND", "hf"),
+    )
+    parser.add_argument(
+        "--generation-server-url",
+        dest="generation_server_urls",
+        action="append",
+        default=[
+            value
+            for value in os.environ.get("FINETUNE_GENERATION_SERVER_URLS", "").split(",")
+            if value
+        ],
+    )
+    parser.add_argument(
+        "--generation-model",
+        default=os.environ.get("FINETUNE_GENERATION_MODEL"),
+    )
+    parser.add_argument(
+        "--generation-concurrency-per-server",
+        type=int,
+        default=int(os.environ.get("FINETUNE_GENERATION_CONCURRENCY_PER_SERVER", "8")),
+    )
+    parser.add_argument(
+        "--generation-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("FINETUNE_GENERATION_TIMEOUT_SECONDS", "120")),
+    )
+    parser.add_argument(
+        "--generation-retries",
+        type=int,
+        default=int(os.environ.get("FINETUNE_GENERATION_RETRIES", "2")),
+    )
+    parser.add_argument(
+        "--generation-backoff-seconds",
+        type=float,
+        default=float(os.environ.get("FINETUNE_GENERATION_BACKOFF_SECONDS", "0.25")),
+    )
+    parser.add_argument(
+        "--generation-window-size",
+        type=int,
+        default=int(os.environ.get("FINETUNE_GENERATION_WINDOW_SIZE", "0")),
+    )
+    parser.add_argument(
+        "--generation-launch-servers",
+        action="store_true",
+        default=os.environ.get("FINETUNE_GENERATION_LAUNCH_SERVERS", "0") == "1",
+        help="start target servers for regenerate and stop them before cache",
+    )
+    parser.add_argument(
+        "--generation-server-gpu-group",
+        dest="generation_server_gpu_groups",
+        action="append",
+        default=[],
+        help="GPU id/group per managed endpoint, e.g. 0 or 0,1; default one per GPU",
+    )
+    parser.add_argument(
+        "--generation-server-host",
+        default=os.environ.get("FINETUNE_GENERATION_SERVER_HOST", "127.0.0.1"),
+    )
+    parser.add_argument(
+        "--generation-server-base-port",
+        type=int,
+        default=int(os.environ.get("FINETUNE_GENERATION_SERVER_BASE_PORT", "30000")),
+    )
+    parser.add_argument(
+        "--generation-server-tp-size",
+        type=int,
+        default=int(os.environ.get("FINETUNE_GENERATION_SERVER_TP_SIZE", "1")),
+    )
+    parser.add_argument(
+        "--generation-server-mem-fraction",
+        type=float,
+        default=float(os.environ.get("FINETUNE_GENERATION_SERVER_MEM_FRACTION", "0.88")),
+    )
+    parser.add_argument(
+        "--generation-server-context-length",
+        type=int,
+        default=(
+            int(os.environ["FINETUNE_GENERATION_SERVER_CONTEXT_LENGTH"])
+            if os.environ.get("FINETUNE_GENERATION_SERVER_CONTEXT_LENGTH")
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--generation-server-max-num-seqs",
+        type=int,
+        default=int(os.environ.get("FINETUNE_GENERATION_SERVER_MAX_NUM_SEQS", "0")),
+    )
+    parser.add_argument(
+        "--generation-server-startup-timeout-seconds",
+        type=float,
+        default=float(
+            os.environ.get("FINETUNE_GENERATION_SERVER_STARTUP_TIMEOUT_SECONDS", "900")
+        ),
+    )
+    parser.add_argument(
         "--sglang-tp-size",
         type=int,
         default=int(os.environ.get("FINETUNE_CAPTURE_SGLANG_TP_SIZE", "1")),
@@ -756,12 +1085,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sglang-mem-fraction-static",
         type=float,
-        default=float(os.environ.get("FINETUNE_CAPTURE_SGLANG_MEM_FRACTION_STATIC", "0.40")),
+        default=float(os.environ.get("FINETUNE_CAPTURE_SGLANG_MEM_FRACTION_STATIC", "0.88")),
     )
     parser.add_argument(
         "--sglang-max-running-requests",
         type=int,
-        default=int(os.environ.get("FINETUNE_CAPTURE_SGLANG_MAX_RUNNING_REQUESTS", "8")),
+        default=int(os.environ.get("FINETUNE_CAPTURE_SGLANG_MAX_RUNNING_REQUESTS", "0")),
     )
     parser.add_argument(
         "--sglang-max-total-tokens",
@@ -822,6 +1151,10 @@ def main(argv: list[str] | None = None) -> int:
         args.target_model_path = str(Path(args.target_model_path).expanduser().resolve())
     if args.nproc_per_node is None:
         args.nproc_per_node = _gpu_count_from_nvidia_smi()
+    args.generation_server_urls = resolve_generation_server_urls(
+        args,
+        nproc_per_node=args.nproc_per_node,
+    )
     if args.target_memory_fraction is None:
         args.target_memory_fraction = 0.90
     if args.adaptive_min_batch_size is None:
@@ -842,13 +1175,33 @@ def main(argv: list[str] | None = None) -> int:
         raise LauncherError("--bucket-window must be >= --adaptive-min-batch-size")
     if args.probe_batches <= 0:
         raise LauncherError("--probe-batches must be positive")
+    if args.generation_backend != "hf":
+        generation_command_args(args)
+    if args.generation_concurrency_per_server <= 0:
+        raise LauncherError("--generation-concurrency-per-server must be positive")
+    if args.generation_timeout_seconds <= 0 or args.generation_retries < 0:
+        raise LauncherError("generation server retry/timeout settings are invalid")
+    if args.generation_backoff_seconds < 0 or args.generation_window_size < 0:
+        raise LauncherError("generation server backoff/window settings are invalid")
+    if args.generation_server_tp_size <= 0:
+        raise LauncherError("--generation-server-tp-size must be positive")
+    if args.generation_server_base_port <= 0 or args.generation_server_base_port > 65535:
+        raise LauncherError("--generation-server-base-port must be a valid TCP port")
+    if not args.generation_server_host.strip():
+        raise LauncherError("--generation-server-host must not be empty")
+    if not 0.0 < args.generation_server_mem_fraction < 1.0:
+        raise LauncherError("--generation-server-mem-fraction must be in (0, 1)")
+    if args.generation_server_max_num_seqs < 0:
+        raise LauncherError("--generation-server-max-num-seqs must be non-negative")
+    if args.generation_server_startup_timeout_seconds <= 0:
+        raise LauncherError("--generation-server-startup-timeout-seconds must be positive")
     if args.sglang_tp_size != 1:
         raise LauncherError(
             "--sglang-tp-size must be 1 for the current data-parallel cache launcher"
         )
     if args.sglang_mem_fraction_static <= 0 or args.sglang_mem_fraction_static >= 1:
         raise LauncherError("--sglang-mem-fraction-static must be in (0, 1)")
-    if args.sglang_max_running_requests <= 0 or args.sglang_max_total_tokens < 0:
+    if args.sglang_max_running_requests < 0 or args.sglang_max_total_tokens < 0:
         raise LauncherError("SGLang request/token limits are invalid")
     if args.parity_samples < 0:
         raise LauncherError("--parity-samples must be non-negative")
@@ -900,17 +1253,39 @@ def main(argv: list[str] | None = None) -> int:
             "cache_eval": lambda: _valid_features(paths.features_eval),
             "train": lambda: _valid_checkpoint(paths.checkpoints, run_id),
         }
-        for name, command, artifact in commands:
-            run_stage(
-                name,
-                command,
-                log_path=paths.log_dir / f"{name}.log",
-                marker_path=paths.state_dir / f"{name}.json",
-                artifact=artifact,
-                validator=validators[name],
-                environment=env,
-                dry_run=args.dry_run,
-            )
+        managed_servers: _ManagedGenerationServers | None = None
+        try:
+            if args.generation_launch_servers and not args.dry_run:
+                generation_ready = True
+                for teacher_path in (paths.teacher_train, paths.teacher_eval):
+                    try:
+                        _valid_jsonl(teacher_path)
+                    except LauncherError:
+                        generation_ready = False
+                        break
+                if not generation_ready:
+                    managed_servers = _start_managed_generation_servers(
+                        args,
+                        config,
+                        paths,
+                        env,
+                    )
+            for name, command, artifact in commands:
+                run_stage(
+                    name,
+                    command,
+                    log_path=paths.log_dir / f"{name}.log",
+                    marker_path=paths.state_dir / f"{name}.json",
+                    artifact=artifact,
+                    validator=validators[name],
+                    environment=env,
+                    dry_run=args.dry_run,
+                )
+                if name == "generate_eval" and managed_servers is not None:
+                    _stop_managed_generation_servers(managed_servers)
+                    managed_servers = None
+        finally:
+            _stop_managed_generation_servers(managed_servers)
         print(f"ALL DONE: {paths.output_root}")
     return 0
 

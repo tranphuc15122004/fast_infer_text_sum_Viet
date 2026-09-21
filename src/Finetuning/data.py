@@ -148,6 +148,66 @@ def render_summary_user_prompt(document: str, prompt_template: str) -> str:
     return prompt_template.format(document=document)
 
 
+def render_summary_user_prompt_budgeted(
+    record: SummaryRecord,
+    tokenizer: Any,
+    max_length: int,
+    *,
+    max_source_tokens: int,
+    max_summary_tokens: int,
+    chat_template: str = "qwen3",
+    prompt_template: str = DEFAULT_SUMMARY_PROMPT_TEMPLATE,
+) -> str:
+    """Render the same user prompt as local generation after source truncation.
+
+    Remote SGLang/vLLM servers receive text messages and apply their own chat
+    template.  Truncating the document with the local snapshot's tokenizer
+    keeps the server request within the exact source/summary budget used by
+    offline feature caching.
+    """
+
+    if not isinstance(record, SummaryRecord):
+        raise TypeError("record must be a SummaryRecord")
+    if max_length < 1 or max_source_tokens < 0 or max_summary_tokens < 1:
+        raise ValueError("invalid prompt token budget")
+    prompt_limit = max_length - max_summary_tokens
+    if prompt_limit < 1:
+        raise ValueError("max_length must leave room for a generation prompt")
+    user_prompt = render_summary_user_prompt(record.document, prompt_template)
+    prefix_ids = _apply_chat_template(
+        tokenizer,
+        [{"role": "user", "content": user_prompt}],
+        add_generation_prompt=True,
+        chat_template=chat_template,
+    )
+    source_ids = _tokenize_text(tokenizer, record.document)
+    if not source_ids:
+        if len(prefix_ids) > prompt_limit:
+            raise ValueError("chat template exceeds reserved prompt budget")
+        return user_prompt
+    source_start = _find_subsequence(prefix_ids, source_ids, 0)
+    if source_start is None:
+        raise ValueError("cannot locate document content span in chat template")
+    source_end = source_start + len(source_ids)
+    capacity = prompt_limit - source_start - (len(prefix_ids) - source_end)
+    if capacity < 0:
+        raise ValueError("chat template exceeds reserved prompt budget")
+    used_source_tokens = min(len(source_ids), max_source_tokens, capacity)
+    if used_source_tokens == len(source_ids):
+        return user_prompt
+    if not hasattr(tokenizer, "decode"):
+        raise TypeError("tokenizer must provide decode for remote prompt truncation")
+    try:
+        truncated_document = tokenizer.decode(
+            source_ids[:used_source_tokens],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        truncated_document = tokenizer.decode(source_ids[:used_source_tokens])
+    return render_summary_user_prompt(str(truncated_document), prompt_template)
+
+
 def _template_kwargs(tokenizer: Any, chat_template: str | None) -> dict[str, Any]:
     """Select a named local template only when the tokenizer exposes a map."""
 
@@ -435,6 +495,7 @@ __all__ = [
     "load_summary_jsonl",
     "DEFAULT_SUMMARY_PROMPT_TEMPLATE",
     "render_summary_user_prompt",
+    "render_summary_user_prompt_budgeted",
     "render_summary_prompt",
     "render_summary_example",
 ]

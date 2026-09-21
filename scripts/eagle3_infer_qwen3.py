@@ -27,6 +27,7 @@ import json
 import os
 import statistics
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -312,6 +313,7 @@ def main() -> None:
           f"[{args.question_begin}, {args.question_end}), "
           f"{args.num_choices} choice(s) each")
 
+    model_load_start = time.perf_counter()
     model = EaModel.from_pretrained(
         base_model_path=args.base_model,
         ea_model_path=args.eagle_model,
@@ -332,6 +334,8 @@ def main() -> None:
         use_eagle3=True,
     )
     model.eval()
+    torch.cuda.synchronize("cuda:0")
+    model_load_ms = round((time.perf_counter() - model_load_start) * 1000.0, 3)
     tokenizer = model.get_tokenizer()
 
     parity: dict[str, float | int | bool] | None = None
@@ -506,6 +510,10 @@ def main() -> None:
                                 if speedup is not None else None),
                     "base_model": args.base_model,
                     "eagle_model": args.eagle_model,
+                    "model_load_ms": model_load_ms,
+                    "retained_tokens": input_len,
+                    "device": "cuda:0",
+                    "batch_size": 1,
                 }
                 record.update(
                     build_eagle_timing_fields(
@@ -517,6 +525,23 @@ def main() -> None:
                     )
                 )
                 record["peak_memory_gb"] = eagle_phases.get("peak_memory_gb")
+                record["draft_latency_ms"] = eagle_phases.get("draft_latency_ms")
+                record["verification_latency_ms"] = eagle_phases.get(
+                    "verification_latency_ms"
+                )
+                record["draft_tokens_proposed"] = eagle_phases.get(
+                    "draft_tokens_proposed"
+                )
+                record["draft_tokens_accepted"] = eagle_phases.get(
+                    "draft_tokens_accepted"
+                )
+                record["acceptance_rate"] = eagle_phases.get("acceptance_rate")
+                record["rejected_draft_ratio"] = eagle_phases.get(
+                    "rejected_draft_ratio"
+                )
+                record["avg_accept_length"] = eagle_phases.get(
+                    "avg_accept_length", accept_length
+                )
                 record["eagle_phase_timings"] = eagle_phases
                 record["naive_phase_timings"] = naive_phases
                 reference = question.get("reference") or question.get("answer")
@@ -524,6 +549,7 @@ def main() -> None:
                     metrics.add_code_completion(record, answer, reference)
                 else:
                     rouge.add_rouge(record, answer, reference)
+                    metrics.add_semantic(record, answer, reference)
                 records.append(record)
                 raw_metrics.append({
                     "eagle_tokens": new_tokens,
@@ -591,11 +617,13 @@ def main() -> None:
     ]
     accept_lengths = [r["accept_length"] for r in raw_metrics]
 
-    quality = (
-        metrics.aggregate_code_completion(records)
-        if any(r.get("task_type") == "code_completion" for r in records)
-        else rouge.aggregate_rouge(records)
-    )
+    if any(r.get("task_type") == "code_completion" for r in records):
+        quality = metrics.aggregate_code_completion(records)
+    else:
+        quality = {
+            **rouge.aggregate_rouge(records),
+            **metrics.aggregate_semantic(records),
+        }
     summary = {
         "type": "summary",
         "num_questions": len(questions),

@@ -775,6 +775,29 @@ def _layer_ids_argument(value: str) -> list[int]:
     return layer_ids
 
 
+def resolve_sglang_capacity(
+    *,
+    max_length: int,
+    adaptive_max_batch_size: int,
+    requested_max_running_requests: int,
+    requested_max_total_tokens: int,
+) -> tuple[int, int]:
+    """Resolve SGLang limits from the adaptive batch policy.
+
+    ``0`` means auto: use the same request count selected by the adaptive
+    capture policy and reserve enough token capacity for that batch.  This
+    avoids the old fixed ``8`` request ceiling leaving B200 VRAM idle.
+    """
+
+    if max_length <= 0 or adaptive_max_batch_size <= 0:
+        raise ValueError("max_length and adaptive_max_batch_size must be positive")
+    running = requested_max_running_requests or adaptive_max_batch_size
+    total_tokens = requested_max_total_tokens or running * max_length
+    if running <= 0 or total_tokens <= 0:
+        raise ValueError("resolved SGLang request/token limits must be positive")
+    return int(running), int(total_tokens)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Capture frozen Qwen hidden states for offline DFlash training"
@@ -812,8 +835,13 @@ def _parser() -> argparse.ArgumentParser:
         default="flashinfer",
         help="SGLang attention backend for OfflineSGLangCapture",
     )
-    parser.add_argument("--sglang-mem-fraction-static", type=float, default=0.40)
-    parser.add_argument("--sglang-max-running-requests", type=int, default=8)
+    parser.add_argument("--sglang-mem-fraction-static", type=float, default=0.88)
+    parser.add_argument(
+        "--sglang-max-running-requests",
+        type=int,
+        default=0,
+        help="0 = follow adaptive max batch size",
+    )
     parser.add_argument("--sglang-max-total-tokens", type=int, default=0)
     parser.add_argument("--sglang-context-length", type=int, default=None)
     parser.add_argument("--sglang-disable-radix-cache", action="store_true")
@@ -875,6 +903,12 @@ def main(argv: list[str] | None = None) -> None:
         from .prepare_data import iter_summary_examples
 
         adaptive_settings = adaptive_settings_from_args(args, device)
+        sglang_max_running_requests, sglang_max_total_tokens = resolve_sglang_capacity(
+            max_length=args.max_length,
+            adaptive_max_batch_size=adaptive_settings.max_batch_size,
+            requested_max_running_requests=args.sglang_max_running_requests,
+            requested_max_total_tokens=args.sglang_max_total_tokens,
+        )
         capture_stats: dict[str, Any] = {}
         parity_thresholds = ParityThresholds(
             max_abs_error=args.parity_max_abs_error,
@@ -919,8 +953,8 @@ def main(argv: list[str] | None = None) -> None:
             capture_method=args.capture_method,
             sglang_attention_backend=args.sglang_attention_backend,
             sglang_mem_fraction_static=args.sglang_mem_fraction_static,
-            sglang_max_running_requests=args.sglang_max_running_requests,
-            sglang_max_total_tokens=args.sglang_max_total_tokens,
+            sglang_max_running_requests=sglang_max_running_requests,
+            sglang_max_total_tokens=sglang_max_total_tokens,
             sglang_context_length=args.sglang_context_length,
             sglang_disable_radix_cache=args.sglang_disable_radix_cache,
             parity_samples=args.parity_samples,
@@ -965,4 +999,9 @@ if __name__ == "__main__":
     main()
 
 
-__all__ = ["capture_dataset", "main", "merge_feature_shards"]
+__all__ = [
+    "capture_dataset",
+    "main",
+    "merge_feature_shards",
+    "resolve_sglang_capacity",
+]

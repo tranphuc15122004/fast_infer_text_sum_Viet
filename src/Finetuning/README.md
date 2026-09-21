@@ -16,8 +16,45 @@ Input gốc UTF-8 JSONL:
 {"id":"vi-001","document":"...","summary":"gold summary"}
 ```
 
+### Chuẩn hóa bộ dữ liệu 50k trên server
+
+Bộ dữ liệu fine-tune được cung cấp ở dạng JSONL mỗi dòng có hai trường
+`input` và `output`. File `outputs/sample_finetune_data_in_server/sample.txt`
+là mẫu 1000 dòng để kiểm tra; file `outputs/sample_finetune_data_in_server/path.txt`
+chứa đường dẫn tuyệt đối tới bộ 50k trên server. Adapter sẽ tạo ID theo số dòng,
+đổi sang contract `id/document/summary`, rồi chia train/eval deterministic theo
+nội dung document. Các bản ghi có cùng document luôn ở cùng một split.
+
+Kiểm tra trước trên mẫu 1000 dòng, không đụng tới dữ liệu nguồn:
+
+```bash
+PYTHONPATH=src python3 -m Finetuning.prepare_data \
+  --source outputs/sample_finetune_data_in_server/sample.txt \
+  --output-dir /tmp/finetune_data_sample \
+  --eval-ratio 0.02 \
+  --progress-interval 250
+```
+
+Trên server, sau khi mẫu đã đạt kiểm tra:
+
+```bash
+PYTHONPATH=src python3 -m Finetuning.prepare_data \
+  --source-path-file outputs/sample_finetune_data_in_server/path.txt \
+  --output-dir /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/finetune_data_50k \
+  --eval-ratio 0.02 \
+  --progress-interval 1000
+```
+
+Kết quả gồm `train.jsonl`, `eval.jsonl` và `manifest.json`. Lệnh không ghi đè
+output đã có; chỉ thêm `--force` khi chủ động tạo lại. Hai JSONL này là input cho
+`scripts/run_finetuning_b200.py` ở các cờ `--train-input` và `--eval-input`.
+
 Chạy ba stage riêng biệt. Mọi model đều phải là snapshot local khi
 `offline: true`.
+
+Ở B200, phase regenerate nên để target model trong SGLang hoặc vLLM server
+pool; phase cache vẫn dùng `OfflineSGLangCapture` nội bộ vì cache cần hidden
+states, thứ mà OpenAI-compatible HTTP API không trả về.
 
 ```bash
 # 1. Sinh trajectory greedy của frozen target. summary trong file output là
@@ -30,6 +67,17 @@ PYTHONPATH=src python3 -m Finetuning.generate_targets \
   --torch-dtype bfloat16 --device cuda \
   --adaptive-batch --target-memory-fraction 0.90 \
   --adaptive-max-batch-size 256 --bucket-window 512
+
+# Regenerate qua pool endpoint (lặp --generation-server-url cho từng GPU).
+PYTHONPATH=src python3 -m Finetuning.generate_targets \
+  --input /data/vietnamese_train.jsonl \
+  --output /work/teacher_train.jsonl \
+  --target-model-path /models/Qwen3-4B \
+  --max-length 2048 --max-source-tokens 1536 --max-summary-tokens 384 \
+  --device cuda --generation-backend sglang \
+  --generation-server-url http://127.0.0.1:30000/v1 \
+  --generation-server-url http://127.0.0.1:30001/v1 \
+  --generation-model qwen3
 
 # 2. Capture hidden state một lần. --num-draft-layers=5 sẽ chọn cùng rule
 #    target layer với config khi target_layer_ids: null.
@@ -135,6 +183,41 @@ batch đã chọn, peak reserved VRAM và VRAM target. `max-tokens-per-batch` n�
 được đặt nếu RAM host hạn chế; generation ước lượng cả prompt và số token tóm
 tắt tối đa, còn caching dùng độ dài sequence thực tế.
 
+## B200 server pool và lifecycle GPU
+
+Có thể để launcher tự tạo một endpoint trên mỗi GPU, giữ chúng chỉ trong hai
+stage `generate_*`, rồi giải phóng toàn bộ GPU trước `cache_*`:
+
+```bash
+PYTHONPATH=src python3 scripts/run_finetuning_b200.py \
+  --config src/Finetuning/configs/qwen3_4b.yaml \
+  --train-input /server/data/vietnamese_train.jsonl \
+  --eval-input /server/data/vietnamese_eval.jsonl \
+  --target-model-path /server/models/Qwen3-4B \
+  --output-root /server/work/dflash-qwen3-4b \
+  --nproc-per-node 8 \
+  --generation-backend sglang \
+  --generation-launch-servers \
+  --capture-backend sglang \
+  --sglang-mem-fraction-static 0.88 \
+  --sglang-max-running-requests 0
+```
+
+`--generation-launch-servers` mặc định dùng một GPU mỗi server, port bắt đầu
+từ 30000; dùng lặp `--generation-server-gpu-group 0,1` và
+`--generation-server-tp-size 2` nếu target không vừa trên một B200. Có thể
+kiểm tra lệnh trước bằng:
+
+```bash
+python3 scripts/launch_finetuning_target_servers.py \
+  --backend sglang --model-path /server/models/Qwen3-4B \
+  --gpu-group 0 --gpu-group 1 --dry-run
+```
+
+Nếu server đã được vận hành bên ngoài, bỏ `--generation-launch-servers` và
+truyền các URL bằng `--generation-server-url`; khi đó operator phải dừng pool
+trước khi chạy cache để không tranh VRAM.
+
 ## OfflineSGLangCapture cho hidden-state cache
 
 `capture_features` có hai backend:
@@ -164,7 +247,7 @@ PYTHONPATH=src python3 -m Finetuning.capture_features \
   --torch-dtype bfloat16 --device cuda \
   --capture-backend sglang --capture-method dflash \
   --sglang-attention-backend flashinfer \
-  --sglang-max-running-requests 8 \
+  --sglang-max-running-requests 0 \
   --parity-samples 2 \
   --adaptive-batch --adaptive-max-batch-size 8
 ```
@@ -175,6 +258,11 @@ Nếu dependency SGLang/SpecForge không import được hoặc parity thất b�
 trả lỗi và không publish generation mới. Khi chạy nhiều GPU bằng `torchrun`,
 backend hiện hỗ trợ data parallel (`--sglang-tp-size 1`); TP lớn hơn một cần
 launcher DP-aware riêng để mọi TP rank nhận cùng input batch.
+
+Với cache SGLang, `--sglang-mem-fraction-static` mặc định là `0.88` trên
+launcher B200. `--sglang-max-running-requests 0` nghĩa là tự lấy
+`adaptive-max-batch-size`, còn `--sglang-max-total-tokens 0` tự lấy tích của
+request limit và `max_length`; truyền số dương chỉ khi cần khóa capacity.
 
 ## Chạy nhiều GPU trên một server
 

@@ -1,0 +1,24 @@
+# Manifest runtime server B200/cu130 cho benchmark tiếng Việt.
+#
+# Không thêm URI local, editable install hoặc public URL. Server offline phải cài
+# từ wheelhouse đã mirror sẵn bằng scripts/setup_server_env.py --offline.
+# Các repo vendored (EAGLE, DeepSpec, dflash, SpecForge, Domino) được checker
+# đưa vào PYTHONPATH, không cài editable vào môi trường dùng chung.
+
+accelerate==1.14.0
+flashinfer-cubin==0.6.13
+flashinfer-python==0.6.13
+gguf==0.19.0
+huggingface_hub==1.21.0
+numpy==2.2.6
+PyYAML==6.0.3
+safetensors==0.8.0
+sglang==0.5.19
+sglang-kernel==0.4.7
+tokenizers==0.22.2
+torch==2.14.0+cu130
+tqdm==4.68.3
+transformers==5.12.1
+
+# flash-attn là artifact CUDA tùy image và có thể cần build C++20 riêng; nó
+# được kiểm tra là optional bởi preflight và không tự build trong script này.

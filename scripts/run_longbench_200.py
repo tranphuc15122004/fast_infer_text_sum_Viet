@@ -41,6 +41,7 @@ from common.benchmark_runtime import (  # noqa: E402
 )
 from common.data_loader import normalize  # noqa: E402
 from common.metric_audit import (  # noqa: E402
+    BASELINE_MEASUREMENT_SCOPE,
     audit_output_file,
     format_audit_log,
 )
@@ -96,6 +97,31 @@ def _filter_matrix_baselines(values: Sequence[str]) -> tuple[list[str], list[str
     return selected, skipped
 
 
+def _reference_quality_error(path: Path) -> str | None:
+    """Reject a dense reference with a known degenerate output."""
+
+    try:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"reference is not readable JSONL: {exc}"
+    bad_samples: list[Any] = []
+    for row in rows:
+        if row.get("type") == "summary":
+            continue
+        guard = row.get("output_quality_guard")
+        if row.get("degenerate_repetition") or (
+            isinstance(guard, Mapping) and guard.get("degenerate_repetition")
+        ):
+            bad_samples.append(row.get("sample_id"))
+    if bad_samples:
+        return f"degenerate output on samples {bad_samples[:5]}"
+    return None
+
+
 def _select_external_reference(
     run_dir: Path, dataset: str, baselines: Sequence[str]
 ) -> Path | None:
@@ -134,7 +160,12 @@ def _select_external_reference(
             continue
         seen.add(baseline)
         candidate = run_dir / baseline / f"{dataset}.jsonl"
-        if candidate.is_file() and candidate.stat().st_size > 0 and usable(candidate):
+        if (
+            candidate.is_file()
+            and candidate.stat().st_size > 0
+            and usable(candidate)
+            and _reference_quality_error(candidate) is None
+        ):
             return candidate
     return None
 
@@ -491,6 +522,7 @@ def _audit_cell_output(
     dataset: str,
     run_dir: Path,
     expected_output_tokens: int | None,
+    expected_samples: int | None = None,
 ) -> dict[str, Any]:
     """Audit one cell and emit a grep-friendly live log line."""
 
@@ -504,6 +536,7 @@ def _audit_cell_output(
             dataset=dataset,
             audit_path=audit_path,
             expected_output_tokens=expected_output_tokens,
+            expected_samples=expected_samples,
         )
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
         print(
@@ -527,6 +560,7 @@ def _audit_cell_output(
     return {
         "metric_audit_path": str(audit_path),
         "metric_audit_summary": summary,
+        "metric_contract": summary.get("metric_contract"),
     }
 
 
@@ -2176,10 +2210,17 @@ def _normalize_child_output(
             row["throughput_tok_s"] = row["eagle_tok_s"]
         if row.get("dense_decode_ms") is None and row.get("naive_time") is not None:
             row["dense_decode_ms"] = round(float(row["naive_time"]) * 1000.0, 3)
-        if row.get("eagle_time") is not None:
+        if row.get("eagle_time") is not None and not all(
+            row.get(field) is not None
+            for field in ("prefill_ms", "ttft_ms", "decode_ms", "e2e_ms")
+        ):
             # EAGLE's upstream timer explicitly excludes prefill.  Keep that
             # fact visible instead of calling decode-only time "E2E".
             row.setdefault("measurement_scope", "decode_only")
+        elif row.get("measurement_scope") is None:
+            expected_scope = BASELINE_MEASUREMENT_SCOPE.get(baseline)
+            if expected_scope is not None:
+                row["measurement_scope"] = expected_scope
 
         sample_id = row.get("sample_id")
         source = by_id.get(str(sample_id)) if sample_id is not None else None
@@ -3159,6 +3200,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         dataset=dataset,
                         run_dir=run_dir,
                         expected_output_tokens=max_new_tokens,
+                        expected_samples=len(normalized),
                     )
                 )
                 _append_cell(cell)
@@ -3187,6 +3229,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         dataset=dataset,
                         run_dir=run_dir,
                         expected_output_tokens=max_new_tokens,
+                        expected_samples=len(normalized),
                     )
                 )
                 _append_cell(cell)
@@ -3261,6 +3304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         dataset=dataset,
                         run_dir=run_dir,
                         expected_output_tokens=max_new_tokens,
+                        expected_samples=len(normalized),
                     )
                 )
                 _append_cell(cell)
@@ -3407,15 +3451,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                         config=cfg,
                         run_id=run_id,
                     )
-            cell.update(
-                _audit_cell_output(
-                    output_path,
-                    baseline=baseline,
-                    dataset=dataset,
-                    run_dir=run_dir,
-                    expected_output_tokens=max_new_tokens,
-                )
+            audit_result = _audit_cell_output(
+                output_path,
+                baseline=baseline,
+                dataset=dataset,
+                run_dir=run_dir,
+                expected_output_tokens=max_new_tokens,
+                expected_samples=len(normalized),
             )
+            cell.update(audit_result)
+            contract = audit_result.get("metric_contract") or {}
+            if (
+                child.get("status") == "success"
+                and args.strict
+                and not args.allow_unsupported
+                and contract.get("status") != "complete"
+            ):
+                child["status"] = "metric_incomplete"
+                child["reason"] = (
+                    "metric contract failed: "
+                    f"{contract.get('issue_counts', {})}"
+                )
+                cell.update(status="metric_incomplete", reason=child["reason"])
+                failures += 1
             _append_cell(cell)
             print(
                 f"[{baseline}/{dataset}] {child['status']} in "

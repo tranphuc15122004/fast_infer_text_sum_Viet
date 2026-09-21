@@ -227,6 +227,13 @@ def build_sample_record(
     )
     record["input_tokens"] = int(input_tokens)
     record["output_tokens"] = int(output_tokens)
+    retained_tokens = timing.get(
+        "retained_tokens",
+        (config or {}).get("retained_tokens", input_tokens),
+    )
+    record["retained_tokens"] = (
+        int(retained_tokens) if retained_tokens is not None else None
+    )
     record["text"] = text
     record["reference_output"] = reference_output
     for key in TIMING_FIELDS:
