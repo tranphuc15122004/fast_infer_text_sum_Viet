@@ -15,13 +15,10 @@ fast_infer_resolve_python() {
     candidate="$FAST_INFER_PYTHON"
   elif [[ -n "${FAST_INFER_VENV:-}" ]]; then
     candidate="$FAST_INFER_VENV/bin/python"
-  elif [[ -n "${VIRTUAL_ENV:-}" ]]; then
-    candidate="$VIRTUAL_ENV/bin/python"
-  elif [[ -x "$ROOT/.venv/bin/python" ]]; then
-    candidate="$ROOT/.venv/bin/python"
   else
-    # A production server may intentionally have no project venv. In that
-    # case use the Python 3.12 command provided by the image/PATH.
+    # Production B200 runs must not silently inherit an activated developer
+    # virtualenv.  The server image provides Python 3.12 as `python3`; local
+    # simulation uses the explicit FAST_INFER_VENV branch above.
     candidate="${FAST_INFER_SYSTEM_PYTHON:-python3}"
   fi
 

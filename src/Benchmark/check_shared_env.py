@@ -119,6 +119,10 @@ import sys
 
 module_name = sys.argv[1]
 distribution = sys.argv[2]
+if module_name == "eagle.model.ea_model":
+    from Benchmark.eagle_compat import install_eagle_transformers_compat
+
+    install_eagle_transformers_compat()
 module = importlib.import_module(module_name)
 version = getattr(module, "__version__", None)
 if not version and distribution:

@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "externals" / "EAGLE"))
 
 from Benchmark.common import metrics, rouge  # noqa: E402
+from Benchmark.eagle_compat import install_eagle_transformers_compat  # noqa: E402
 from Benchmark.common.input_utils import truncate_input_ids  # noqa: E402
 from Benchmark.common.reproducibility import seed_everything  # noqa: E402
 
@@ -302,6 +303,7 @@ def main() -> None:
 
     # Keep --help and preflight cheap.  The vendored model imports custom
     # attention/KV modules and may trigger CUDA extension discovery.
+    install_eagle_transformers_compat()
     from eagle.model.ea_model import EaModel
     from eagle.model.kv_cache import initialize_past_key_values
 
