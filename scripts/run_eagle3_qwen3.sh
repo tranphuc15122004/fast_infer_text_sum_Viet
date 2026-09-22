@@ -82,7 +82,7 @@ if mismatches:
     raise SystemExit("Incompatible base/EAGLE3 config fields: " + ", ".join(mismatches))
 PY
 
-export PYTHONPATH="$ROOT/externals/EAGLE${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$ROOT/src:$ROOT/externals/EAGLE${PYTHONPATH:+:$PYTHONPATH}"
 
 NAIVE_ARGS=()
 if [[ "${SKIP_NAIVE:-0}" == "1" ]]; then
@@ -94,7 +94,7 @@ if [[ "${SMOKE:-0}" == "1" ]]; then
   SMOKE_ARGS+=(--smoke)
 fi
 
-exec "$FAST_INFER_PYTHON" "$ROOT/scripts/eagle3_infer_qwen3.py" \
+exec "$FAST_INFER_PYTHON" -m Benchmark.eagle3_infer_qwen3 \
   --base-model "$BASE_MODEL" \
   --eagle-model "$EAGLE_MODEL" \
   --question-file "$QUESTION_FILE" \

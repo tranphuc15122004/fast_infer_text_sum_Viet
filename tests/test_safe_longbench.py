@@ -6,11 +6,11 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "src"))
 
 
 def test_unresolved_samples_include_missing_and_failed_rows(tmp_path) -> None:
-    from run_longbench_200 import _unresolved_sample_records
+    from Benchmark.run_longbench_200 import _unresolved_sample_records
 
     output = tmp_path / "cell.jsonl"
     output.write_text(
@@ -32,7 +32,7 @@ def test_unresolved_samples_include_missing_and_failed_rows(tmp_path) -> None:
 
 
 def test_rewrite_safe_output_preserves_success_and_fills_failed_samples(tmp_path) -> None:
-    from run_longbench_200 import _rewrite_safe_cell_output
+    from Benchmark.run_longbench_200 import _rewrite_safe_cell_output
 
     output = tmp_path / "cell.jsonl"
     source = [
@@ -72,7 +72,7 @@ def test_rewrite_safe_output_preserves_success_and_fills_failed_samples(tmp_path
 
 
 def test_retry_attempt_path_is_unique_per_sample_and_attempt(tmp_path) -> None:
-    from run_longbench_200 import _safe_retry_paths
+    from Benchmark.run_longbench_200 import _safe_retry_paths
 
     first = _safe_retry_paths(
         tmp_path, baseline="dflash", dataset="vims", sample_id="row/1", attempt=1
@@ -88,7 +88,7 @@ def test_retry_attempt_path_is_unique_per_sample_and_attempt(tmp_path) -> None:
 
 
 def test_retry_unresolved_samples_runs_each_sample_and_recovers(monkeypatch, tmp_path) -> None:
-    import run_longbench_200 as runner
+    import Benchmark.run_longbench_200 as runner
 
     output = tmp_path / "vanilla_hf" / "vietnews.jsonl"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -166,7 +166,7 @@ def test_retry_unresolved_samples_runs_each_sample_and_recovers(monkeypatch, tmp
 
 
 def test_main_continues_to_next_cell_after_orchestration_exception(monkeypatch, tmp_path) -> None:
-    import run_longbench_200 as runner
+    import Benchmark.run_longbench_200 as runner
 
     monkeypatch.setattr(runner, "_effective_cuda_available", lambda: False)
     monkeypatch.setattr(
@@ -249,7 +249,7 @@ def test_main_continues_to_next_cell_after_orchestration_exception(monkeypatch, 
 
 
 def test_retry_unresolved_sample_retries_after_oom_log(monkeypatch, tmp_path) -> None:
-    import run_longbench_200 as runner
+    import Benchmark.run_longbench_200 as runner
 
     output = tmp_path / "cell.jsonl"
     raw = [{"id": "oom-1", "document": "D", "reference": "R"}]
@@ -327,7 +327,7 @@ def test_retry_unresolved_sample_retries_after_oom_log(monkeypatch, tmp_path) ->
 
 
 def test_metric_collector_ignores_retry_attempt_artifacts(tmp_path) -> None:
-    from collect_metrics import load_run_records
+    from Benchmark.collect_metrics import load_run_records
 
     main = tmp_path / "vanilla_hf" / "vietnews.jsonl"
     main.parent.mkdir(parents=True, exist_ok=True)

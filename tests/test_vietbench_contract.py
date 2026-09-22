@@ -6,11 +6,11 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "src"))
 
 
 def test_vietbench_registry_and_prompt_contract() -> None:
-    from common import benchmark_data
+    from Benchmark.common import benchmark_data
 
     assert benchmark_data.DATASETS == ("vietnews", "wikilingua", "vims", "vlsp")
     row = {
@@ -40,7 +40,7 @@ def test_eval_profile_has_four_datasets_with_one_hundred_rows() -> None:
 
 
 def test_vietbench_selection_is_deterministic() -> None:
-    from common import benchmark_data
+    from Benchmark.common import benchmark_data
 
     rows = benchmark_data.read_jsonl(ROOT / "datasets" / "eval_100" / "vims_100.jsonl")
     first = benchmark_data.select_rows(rows, dataset="vims", n=20, seed=42)
@@ -49,7 +49,7 @@ def test_vietbench_selection_is_deterministic() -> None:
 
 
 def test_loader_renders_vietnamese_prompt_and_reference() -> None:
-    from common.data_loader import load_records
+    from Benchmark.common.data_loader import load_records
 
     rows = load_records(ROOT / "datasets/eval_100/vietnews_100.jsonl", max_samples=1)
     assert "tóm tắt" in rows[0]["prompt"].lower()

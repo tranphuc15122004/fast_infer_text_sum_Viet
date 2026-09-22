@@ -47,5 +47,5 @@ fi
 [[ "${SMOKE:-0}" == "1" ]] && ARGS+=(--smoke)
 
 cd "$ROOT"
-export PYTHONPATH="$ROOT/scripts:$ROOT/externals/dflash${PYTHONPATH:+:$PYTHONPATH}"
-exec "$FAST_INFER_PYTHON" "$ROOT/scripts/infer_dflash.py" "${ARGS[@]}" "$@"
+export PYTHONPATH="$ROOT/src:$ROOT/externals/dflash${PYTHONPATH:+:$PYTHONPATH}"
+exec "$FAST_INFER_PYTHON" -m Benchmark.infer_dflash "${ARGS[@]}" "$@"

@@ -10,16 +10,16 @@ from typing import Any
 
 import torch
 
-from common import io_util, metrics, rouge
-from common.benchmark_runtime import (
+from Benchmark.common import io_util, metrics, rouge
+from Benchmark.common.benchmark_runtime import (
     build_sample_record,
     measure_call,
     runtime_metadata,
 )
-from common.data_loader import load_records
-from common.input_utils import truncate_input_ids
-from common.quality_guard import is_degenerate_output
-from common.reproducibility import seed_everything
+from Benchmark.common.data_loader import load_records
+from Benchmark.common.input_utils import truncate_input_ids
+from Benchmark.common.quality_guard import is_degenerate_output
+from Benchmark.common.reproducibility import seed_everything
 
 
 def build_parser(default_backend: str, description: str) -> argparse.ArgumentParser:

@@ -1,6 +1,6 @@
 """Exact-target and ROUGE evaluation for a trained DFlash draft.
 
-This module is deliberately separate from ``scripts/infer_dflash.py``: it
+This module is deliberately separate from ``src/Benchmark/infer_dflash.py``: it
 loads only the portable draft export produced by this package and has no
 runtime dependency on ``MR_DFlash`` or the benchmark adapters.
 """

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Baseline entry point for the vendored official EAGLE-3 Qwen3 runner."""
+"""Compatibility launcher for the Benchmark package."""
 
-from __future__ import annotations
+from pathlib import Path
+import sys
 
-from eagle3_infer_qwen3 import main
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from Benchmark.infer_eagle3 import main
 
 
 if __name__ == "__main__":

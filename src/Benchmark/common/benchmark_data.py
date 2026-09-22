@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 DATASETS = ("vietnews", "wikilingua", "vims", "vlsp")
 CODE_DATASETS = frozenset()
 EXPECTED_SOURCE_COUNTS = {dataset: 100 for dataset in DATASETS}

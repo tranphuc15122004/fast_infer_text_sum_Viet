@@ -17,5 +17,5 @@ fast_infer_load_config longbench
 source "$ROOT/scripts/common/runtime.sh"
 
 cd "$ROOT"
-export PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
-exec "$FAST_INFER_PYTHON" "$ROOT/scripts/run_longbench_200.py" "$@"
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$FAST_INFER_PYTHON" -m Benchmark.run_longbench_200 "$@"

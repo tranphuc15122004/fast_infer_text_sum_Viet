@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
-"""Vanilla Hugging Face inference using PyTorch eager attention."""
+"""Compatibility launcher for the Benchmark package."""
 
-from __future__ import annotations
+from pathlib import Path
+import sys
 
-from common.vanilla_inference import build_parser as _build_parser, run
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-
-def build_parser():
-    return _build_parser("eager", __doc__)
-
-
-def main() -> int:
-    return run(build_parser().parse_args(), method="vanilla_hf")
+from Benchmark.infer_vanilla_hf import main
 
 
 if __name__ == "__main__":

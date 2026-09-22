@@ -6,11 +6,11 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "src"))
 
 
 def test_qwen3_viet_baseline_registry_has_no_duplicate_methods() -> None:
-    from common.longbench_adapter import BASELINES
+    from Benchmark.common.longbench_adapter import BASELINES
 
     assert BASELINES == (
         "vanilla_hf",
@@ -23,7 +23,7 @@ def test_qwen3_viet_baseline_registry_has_no_duplicate_methods() -> None:
 
 
 def test_baseline_config_uses_qwen3_target_and_viet_defaults(monkeypatch) -> None:
-    from common.longbench_adapter import baseline_config_from_env
+    from Benchmark.common.longbench_adapter import baseline_config_from_env
 
     monkeypatch.setenv("MODEL_TARGET", "/models/Qwen3-4B")
     monkeypatch.setenv("LONG_BENCH_EAGLE_MODEL", "/models/eagle3-qwen3-4b")
@@ -33,7 +33,7 @@ def test_baseline_config_uses_qwen3_target_and_viet_defaults(monkeypatch) -> Non
 
 
 def test_sglang_config_keeps_auto_concurrency_resolvable(monkeypatch) -> None:
-    from common.longbench_adapter import baseline_config_from_env, build_adapter_command
+    from Benchmark.common.longbench_adapter import baseline_config_from_env, build_adapter_command
 
     monkeypatch.setenv("MODEL_TARGET", "/models/Qwen3-4B")
     monkeypatch.setenv("MODEL_DOMINO_DRAFT", "/models/Qwen3-4B-Domino")
@@ -56,7 +56,7 @@ def test_sglang_config_keeps_auto_concurrency_resolvable(monkeypatch) -> None:
 
 
 def test_reference_selection_ignores_vanilla_status_records(tmp_path) -> None:
-    from run_longbench_200 import _select_external_reference
+    from Benchmark.run_longbench_200 import _select_external_reference
 
     for baseline, row in (
         ("vanilla_fa", {"status": "unsupported_cpu", "sample_id": "x"}),

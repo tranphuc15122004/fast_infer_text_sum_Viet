@@ -7,7 +7,7 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-from common.paths import ROOT
+from Benchmark.common.paths import ROOT
 
 # Base schema: every run record must carry at least these keys.
 BASE_SCHEMA_KEYS = [

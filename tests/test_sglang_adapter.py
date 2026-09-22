@@ -5,11 +5,11 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "src"))
 
 
 def test_sglang_server_args_keep_official_speculative_contract() -> None:
-    from infer_sglang_spec import build_server_args
+    from Benchmark.infer_sglang_spec import build_server_args
 
     args = build_server_args(
         method="domino",
@@ -28,7 +28,7 @@ def test_sglang_server_args_keep_official_speculative_contract() -> None:
 
 
 def test_sglang_payload_extracts_phase_and_acceptance_metrics() -> None:
-    from infer_sglang_spec import extract_response_metrics
+    from Benchmark.infer_sglang_spec import extract_response_metrics
 
     payload = {
         "text": "bản tóm tắt",
@@ -57,7 +57,7 @@ def test_sglang_payload_extracts_phase_and_acceptance_metrics() -> None:
 
 
 def test_auto_batch_size_uses_b200_default_and_explicit_override(monkeypatch) -> None:
-    from infer_sglang_spec import resolve_batch_size
+    from Benchmark.infer_sglang_spec import resolve_batch_size
 
     monkeypatch.delenv("LONG_BENCH_AUTO_BATCH_SIZE", raising=False)
     assert resolve_batch_size("auto", total_memory_gb=180.0) == 8

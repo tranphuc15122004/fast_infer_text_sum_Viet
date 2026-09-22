@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
-"""Thin baseline entry point for the official SGLang DSpark path."""
+"""Compatibility launcher for the Benchmark package."""
 
-from __future__ import annotations
-
+from pathlib import Path
 import sys
 
-from infer_sglang_spec import main as _main
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-
-def main() -> int:
-    sys.argv[1:1] = ["--method", "dspark"]
-    return _main()
+from Benchmark.infer_dspark import main
 
 
 if __name__ == "__main__":

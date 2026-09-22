@@ -28,5 +28,5 @@ ARGS=(--model "$LONG_BENCH_MODEL" --data-file "$DATA_FILE"
   --output "$OUTPUT_FILE")
 [[ "${SMOKE:-0}" == "1" || "${LONG_BENCH_MODE:-}" == "smoke" ]] && ARGS+=(--smoke)
 cd "$ROOT"
-export PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
-exec "$FAST_INFER_PYTHON" "$ROOT/scripts/infer_vanilla_fa.py" "${ARGS[@]}" "$@"
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$FAST_INFER_PYTHON" -m Benchmark.infer_vanilla_fa "${ARGS[@]}" "$@"

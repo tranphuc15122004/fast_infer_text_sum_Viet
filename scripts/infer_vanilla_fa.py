@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
-"""Vanilla Hugging Face inference using flash-attention 2."""
+"""Compatibility launcher for the Benchmark package."""
 
-from __future__ import annotations
+from pathlib import Path
+import sys
 
-from common.vanilla_inference import build_parser as _build_parser, run
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-
-def build_parser():
-    return _build_parser("flash_attention_2", __doc__)
-
-
-def main() -> int:
-    return run(build_parser().parse_args(), method="vanilla_fa")
+from Benchmark.infer_vanilla_fa import main
 
 
 if __name__ == "__main__":

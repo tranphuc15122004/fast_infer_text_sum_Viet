@@ -134,17 +134,19 @@ Không repo nào hỗ trợ T4. Khi cần hiểu quan hệ giữa các method, �
 
 ## Convention phải theo
 
-- **1 baseline = 1 bộ file**: `scripts/infer_<b>.py` + `scripts/run_<b>.sh` +
+- **1 baseline = 1 bộ file**: `src/Benchmark/infer_<b>.py` + `scripts/run_<b>.sh` +
   `docs/baselines/<b>.md`, nối vào `scripts/run.sh` và thêm loader
   `fast_infer__load_<b>()` trong `scripts/common/config.sh`.
 - Mọi launcher resolve master config qua `config/master.path` (hoặc
   `FAST_INFER_MASTER_CONFIG`), rồi source `scripts/common/runtime.sh`.
+- Implementation benchmark nằm trong `src/Benchmark/`; `scripts/` chỉ chứa
+  launcher shell và compatibility entrypoint mỏng gọi package này.
 - **Smoke vs full**: mặc định `--smoke`; full cần GPU lớn + model/cache thật.
 - **Output schema**: mọi record ghi qua `io_util.JsonlWriter`
-  (`scripts/common/io_util.py`), kết thúc bằng summary record. Key chuẩn xem
+  (`src/Benchmark/common/io_util.py`), kết thúc bằng summary record. Key chuẩn xem
   `BASE_SCHEMA_KEYS` / `SPEC_SCHEMA_KEYS`.
 - **ROUGE**: khi có reference, gọi `rouge.add_rouge()`; summary gọi
-  `rouge.aggregate_rouge()` (`scripts/common/rouge.py`).
+  `rouge.aggregate_rouge()` (`src/Benchmark/common/rouge.py`).
 - **Output/checkpoint không commit** — `outputs/` và `checkpoints/` gitignored.
 
 ## Lệnh (sau khi đã port scripts/)

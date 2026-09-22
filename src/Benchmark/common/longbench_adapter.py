@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from common.paths import ROOT
+from Benchmark.common.paths import ROOT
 
 
 BASELINES = (
@@ -531,7 +531,7 @@ def build_adapter_command(
     if baseline == "vanilla_hf":
         return [
             python,
-            str(ROOT / "scripts" / "infer_vanilla_hf.py"),
+            str(ROOT / "src" / "Benchmark" / "infer_vanilla_hf.py"),
             "--model",
             str(cfg.get("model") or ""),
             "--data-file",
@@ -562,14 +562,14 @@ def build_adapter_command(
             config={**cfg, "smoke": smoke},
         )
         assert command is not None
-        command[1] = str(ROOT / "scripts" / "infer_vanilla_fa.py")
+        command[1] = str(ROOT / "src" / "Benchmark" / "infer_vanilla_fa.py")
         # The parser enforces flash_attention_2 from the wrapper default.
         return command
 
     if baseline == "magicdec":
         return [
             python,
-            str(ROOT / "scripts" / "infer_magicdec.py"),
+            str(ROOT / "src" / "Benchmark" / "infer_magicdec.py"),
             "--model-pth",
             str(cfg.get("magicdec_model_pth") or ""),
             "--model-name",
@@ -596,7 +596,7 @@ def build_adapter_command(
     if baseline == "dflash":
         command = [
             python,
-            str(ROOT / "scripts" / "infer_dflash.py"),
+            str(ROOT / "src" / "Benchmark" / "infer_dflash.py"),
             "--target-model",
             str(cfg.get("model") or ""),
             "--draft-model",
@@ -623,7 +623,7 @@ def build_adapter_command(
     if baseline == "longspec":
         command = [
             python,
-            str(ROOT / "scripts" / "infer_longspec.py"),
+            str(ROOT / "src" / "Benchmark" / "infer_longspec.py"),
             "--target-model",
             str(cfg.get("longspec_target_model") or cfg.get("model") or ""),
             "--draft-model",
@@ -650,7 +650,7 @@ def build_adapter_command(
     if baseline == "eagle3":
         command = [
             python,
-            str(ROOT / "scripts" / "infer_eagle3.py"),
+            str(ROOT / "src" / "Benchmark" / "infer_eagle3.py"),
             "--base-model",
             str(cfg.get("model") or ""),
             "--eagle-model",
@@ -688,7 +688,7 @@ def build_adapter_command(
         method = baseline
         command = [
             python,
-            str(ROOT / "scripts" / "infer_domino.py" if method == "domino" else ROOT / "scripts" / "infer_dspark.py"),
+            str(ROOT / "src" / "Benchmark" / "infer_domino.py" if method == "domino" else ROOT / "src" / "Benchmark" / "infer_dspark.py"),
             "--model",
             str(cfg.get("model") or ""),
             "--draft-model",
@@ -728,7 +728,7 @@ def build_adapter_command(
     if baseline == "specextend":
         return [
             python,
-            str(ROOT / "scripts" / "infer_specextend.py"),
+            str(ROOT / "src" / "Benchmark" / "infer_specextend.py"),
             "--script",
             str(cfg.get("specextend_script", "run_eagle.py")),
             "--model-name",
@@ -757,7 +757,7 @@ def build_adapter_command(
     if baseline == "sssd":
         command = [
             python,
-            str(ROOT / "scripts" / "infer_sssd.py"),
+            str(ROOT / "src" / "Benchmark" / "infer_sssd.py"),
             "--model",
             str(cfg.get("model") or ""),
             "--data-file",
@@ -790,7 +790,7 @@ def build_adapter_command(
     if baseline == "fafo":
         command = [
             python,
-            str(ROOT / "scripts" / "infer_fafo.py"),
+            str(ROOT / "src" / "Benchmark" / "infer_fafo.py"),
             "--model",
             str(cfg.get("model") or ""),
             "--data-file",

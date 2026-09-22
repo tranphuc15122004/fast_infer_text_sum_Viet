@@ -6,8 +6,8 @@ metric tốc độ (mean/median/p90/std) từ schema §13 (baseline_repo_guide.m
 
 Module pure-Python, không cần cài thêm package ngoài venv chung. Dùng chung cho:
 
-  * scripts/infer_*.py        - ghi metric semantic mở rộng vào từng record;
-  * scripts/collect_metrics.py - tổng hợp toàn bộ run thành báo cáo.
+  * src/Benchmark/infer_*.py        - ghi metric semantic mở rộng vào từng record;
+  * src/Benchmark/collect_metrics.py - tổng hợp toàn bộ run thành báo cáo.
 
 Quy ước key (flat, theo schema §13):
   rouge1_p / rouge1_r / rouge1_f / rouge2_* / rougeL_*   (ROUGE P/R/F)
@@ -25,7 +25,7 @@ from difflib import SequenceMatcher
 from collections import Counter
 from typing import Mapping, Optional, Sequence
 
-from common.rouge import _f1, _lcs_length, rouge_all, tokenize
+from Benchmark.common.rouge import _f1, _lcs_length, rouge_all, tokenize
 
 # Các key tốc độ (số) trong schema §13 dùng để tổng hợp.
 SPEED_KEYS = [

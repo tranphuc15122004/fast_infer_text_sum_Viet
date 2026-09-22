@@ -63,7 +63,7 @@ from typing import Any, Iterator
 # --------------------------------------------------------------------------- #
 
 #: Thư mục gốc chứa dữ liệu thô, tính từ gốc repository.
-DEFAULT_RAW_DIR = Path(__file__).resolve().parents[2] / "datasets" / "raw"
+DEFAULT_RAW_DIR = Path(__file__).resolve().parents[3] / "datasets" / "raw"
 
 VIETNEWS_DIR = "vietnews-master/data"
 WIKILINGUA_DIR = "wikilingua"

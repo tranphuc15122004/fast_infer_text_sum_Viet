@@ -2,7 +2,8 @@
 
 Runner dùng algorithm DFLASH/Domino chính thức của SGLang, được phát hành
 qua `externals/Domino`/runtime SGLang; repo này chỉ chuẩn hóa JSONL, prompt,
-server lifecycle và metadata. Entry là `scripts/infer_domino.py`.
+server lifecycle và metadata. Implementation là `src/Benchmark/infer_domino.py`;
+launcher là `scripts/run_domino.sh`.
 
 Draft checkpoint dùng `MODEL_DOMINO_DRAFT` hoặc `LONG_BENCH_DOMINO_MODEL`.
 Batch tự động trên B200 180 GiB bắt đầu ở 8, có thể override bằng

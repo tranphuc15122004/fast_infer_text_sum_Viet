@@ -44,14 +44,14 @@ def normalize(record: dict, idx: int) -> dict:
         record, "prompt", "question", "instruction", "document", "text", "turns"
     )
     if record.get("dataset") in {"vietnews", "wikilingua", "vims", "vlsp"}:
-        from common.benchmark_data import render_prompt
+        from Benchmark.common.benchmark_data import render_prompt
 
         prompt = render_prompt(record)
     elif prompt is None and record.get("dataset") in {
         "gov_report", "qmsum", "multi_news", "lcc", "repobench-p",
         "vietnews", "wikilingua", "vims", "vlsp",
     }:
-        from common.benchmark_data import render_prompt
+        from Benchmark.common.benchmark_data import render_prompt
 
         prompt = render_prompt(record)
     return {
@@ -74,7 +74,7 @@ def load_records(path: Path, max_samples: int | None = None) -> list[dict]:
     """Load and normalize a jsonl file of records."""
     path = Path(path)
     if not path.is_absolute():
-        from common.paths import ROOT
+        from Benchmark.common.paths import ROOT
         path = ROOT / path
     rows = [
         json.loads(line)

@@ -10,8 +10,8 @@ source "$ROOT/scripts/common/runtime.sh"
 : "${DATA_FILE:?DATA_FILE is required}"
 : "${OUTPUT_FILE:?OUTPUT_FILE is required}"
 cd "$ROOT"
-export PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
-exec "$FAST_INFER_PYTHON" "$ROOT/scripts/infer_dspark.py" \
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$FAST_INFER_PYTHON" -m Benchmark.infer_dspark \
   --model "$MODEL" --draft-model "$DRAFT_MODEL" \
   --data-file "$DATA_FILE" --output "$OUTPUT_FILE" \
   --max-samples "${MAX_SAMPLES:-1}" --max-new-tokens "${MAX_NEW_TOKENS:-2048}" \

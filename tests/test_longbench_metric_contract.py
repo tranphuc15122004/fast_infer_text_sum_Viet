@@ -6,7 +6,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "src"))
 
 
 def _complete_vanilla_record() -> dict:
@@ -54,7 +54,7 @@ def _complete_vanilla_record() -> dict:
 
 
 def test_viet_baseline_contract_is_persisted_on_summary(tmp_path) -> None:
-    from common.metric_audit import audit_output_file
+    from Benchmark.common.metric_audit import audit_output_file
 
     output = tmp_path / "vietnews.jsonl"
     output.write_text(
@@ -87,7 +87,7 @@ def test_viet_baseline_contract_is_persisted_on_summary(tmp_path) -> None:
 
 
 def test_normalize_dflash_backfills_full_e2e_scope(tmp_path) -> None:
-    from run_longbench_200 import _normalize_child_output
+    from Benchmark.run_longbench_200 import _normalize_child_output
 
     output = tmp_path / "dflash.jsonl"
     output.write_text(
@@ -129,7 +129,7 @@ def test_normalize_dflash_backfills_full_e2e_scope(tmp_path) -> None:
 
 
 def test_reference_selection_skips_degenerate_vanilla_output(tmp_path) -> None:
-    from run_longbench_200 import _select_external_reference
+    from Benchmark.run_longbench_200 import _select_external_reference
 
     flash = tmp_path / "vanilla_fa" / "vietnews.jsonl"
     flash.parent.mkdir(parents=True)
@@ -163,7 +163,7 @@ def test_reference_selection_skips_degenerate_vanilla_output(tmp_path) -> None:
 
 
 def test_sample_records_default_retained_tokens_to_input_tokens() -> None:
-    from common.benchmark_runtime import build_sample_record
+    from Benchmark.common.benchmark_runtime import build_sample_record
 
     record = build_sample_record(
         method="vanilla_hf",
@@ -186,7 +186,7 @@ def test_sample_records_default_retained_tokens_to_input_tokens() -> None:
 
 
 def test_dflash_acceptance_summary_uses_draft_budget() -> None:
-    from infer_dflash import summarize_acceptance
+    from Benchmark.infer_dflash import summarize_acceptance
 
     summary = summarize_acceptance([3, 2], block_size=4)
 
