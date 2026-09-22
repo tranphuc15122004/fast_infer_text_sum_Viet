@@ -21,6 +21,7 @@ from Benchmark.common.data_loader import load_records
 from Benchmark.common.input_utils import truncate_input_ids
 from Benchmark.common.paths import ROOT
 from Benchmark.common.reproducibility import seed_everything
+from Benchmark.dflash_compat import install_dflash_transformers_compat
 
 
 # DFlash is vendored rather than installed into the shared server Python.
@@ -208,6 +209,7 @@ def main() -> None:
         args.max_new_tokens = min(args.max_new_tokens, 32)
 
     dtype, attn_impl = _dtype_and_attention()
+    install_dflash_transformers_compat()
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     from dflash.model import DFlashDraftModel, dflash_generate
 

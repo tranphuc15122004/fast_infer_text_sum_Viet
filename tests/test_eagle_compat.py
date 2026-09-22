@@ -41,3 +41,16 @@ def test_eagle_compat_does_not_replace_existing_loss_kwargs(monkeypatch):
 
     assert installed is False
     assert transformers_utils.LossKwargs is ExistingLossKwargs
+
+
+def test_eagle_compat_restores_default_rope_initializer(monkeypatch):
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    monkeypatch.delitem(ROPE_INIT_FUNCTIONS, "default", raising=False)
+
+    from Benchmark.eagle_compat import install_eagle_transformers_compat
+
+    install_eagle_transformers_compat()
+
+    initializer = ROPE_INIT_FUNCTIONS["default"]
+    assert callable(initializer)

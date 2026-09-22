@@ -232,7 +232,10 @@ fast_infer__load_longbench() {
   fast_infer_default LONG_BENCH_OUTPUT_DIR "outputs/longbench_viet_100"
   fast_infer_default LONG_BENCH_MODEL "${MODEL_TARGET:-}"
   fast_infer_default LONG_BENCH_DEVICE "${FI_DEVICE:-cuda}"
-  fast_infer_default LONG_BENCH_GPU_IDS "${FI_GPU_IDS:-0}"
+  # Empty means "inherit CUDA_VISIBLE_DEVICES".  Do not default to physical
+  # GPU 0: cluster schedulers can expose a different allocated index, and the
+  # runner must preserve that mapping for both the parent and child process.
+  fast_infer_default LONG_BENCH_GPU_IDS "${FI_GPU_IDS:-${CUDA_VISIBLE_DEVICES:-}}"
   fast_infer_default LONG_BENCH_DTYPE "bfloat16"
   fast_infer_default LONG_BENCH_BASELINES "vanilla_hf vanilla_fa eagle3 dflash domino dspark"
   fast_infer_default LONG_BENCH_REFERENCE_BASELINE "vanilla_fa"

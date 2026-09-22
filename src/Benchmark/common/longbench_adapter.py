@@ -155,6 +155,31 @@ def _module_importable(name: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def _sglang_algorithm_supported(algorithm: str) -> tuple[bool, str | None]:
+    """Check an algorithm against the installed SGLang registry.
+
+    SGLang releases can import successfully while supporting different
+    speculative algorithms.  In particular, the stock 0.5.14 wheel accepts
+    DFLASH but rejects the DSpark name; detect that during preflight instead
+    of starting a server that can only fail and be retried.
+    """
+
+    try:
+        module = importlib.import_module("sglang.srt.speculative.spec_info")
+        registry = module.SpeculativeAlgorithm
+        registry.from_string(algorithm)
+    except (
+        AttributeError,
+        ImportError,
+        KeyError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return False, f"SGLang does not support {algorithm}: {exc}"
+    return True, None
+
+
 def _sssd_child_env() -> dict[str, str]:
     """Environment the SSSD adapter uses for its SGLang child process."""
     env = dict(os.environ)
@@ -331,10 +356,31 @@ def preflight_baseline(
             "available": sglang_available,
             "reason": sglang_reason,
         }
+        algorithm_ok = False
+        algorithm_reason: str | None = None
+        if sglang_available:
+            default_algorithm = "DFLASH" if baseline == "domino" else "DSPARK"
+            algorithm = str(
+                os.environ.get(
+                    f"LONG_BENCH_{baseline.upper()}_ALGORITHM",
+                    default_algorithm,
+                )
+            )
+            algorithm_ok, algorithm_reason = _sglang_algorithm_supported(algorithm)
+            result["requirements"]["speculative_algorithm"] = {
+                "name": algorithm,
+                "available": algorithm_ok,
+                "reason": algorithm_reason,
+            }
         if not source_path.is_dir() and result["status"] == "ready":
             result.update(status="missing_dependency", reason=f"vendored {source_name} source is missing")
         elif not sglang_available and result["status"] == "ready":
             result.update(status="missing_dependency", reason=f"sglang is required for {baseline}: {sglang_reason}")
+        elif not algorithm_ok and result["status"] == "ready":
+            result.update(
+                status="missing_dependency",
+                reason=algorithm_reason or f"SGLang does not support {baseline}",
+            )
         elif not draft_ok and result["status"] == "ready":
             result.update(
                 status="missing_checkpoint",

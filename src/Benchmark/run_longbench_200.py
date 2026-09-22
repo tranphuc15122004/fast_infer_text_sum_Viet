@@ -576,9 +576,12 @@ def _safe_env(cuda_visible_devices: str | None = None) -> dict[str, str]:
     env["PYTHONUNBUFFERED"] = "1"
     source = str(ROOT / "src")
     env["PYTHONPATH"] = source + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-    gpu_ids = env.get("LONG_BENCH_GPU_IDS") or env.get("FI_GPU_IDS")
-    if gpu_ids is not None:
-        env["CUDA_VISIBLE_DEVICES"] = gpu_ids
+    # Preserve the parent's CUDA visibility for ordinary cells.  This is
+    # important on schedulers that expose an allocated GPU through a UUID or a
+    # remapped index: LONG_BENCH_GPU_IDS/FI_GPU_IDS may still contain a stale
+    # default such as ``0`` and must not replace the working mapping.  Data-
+    # parallel/retry callers pass an explicit physical GPU group below and
+    # intentionally override the inherited value.
     if cuda_visible_devices is not None:
         env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     return env

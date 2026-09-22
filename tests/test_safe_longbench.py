@@ -31,6 +31,31 @@ def test_unresolved_samples_include_missing_and_failed_rows(tmp_path) -> None:
     assert [row["id"] for row in unresolved] == ["b", "c"]
 
 
+def test_child_env_preserves_scheduler_cuda_visibility(monkeypatch) -> None:
+    from Benchmark.run_longbench_200 import _safe_env
+
+    # A cluster scheduler may expose a physical GPU through a UUID or a
+    # remapped index. Empty config aliases must not turn that mapping into an
+    # empty CUDA_VISIBLE_DEVICES value for the child.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-allocated-by-scheduler")
+    monkeypatch.setenv("LONG_BENCH_GPU_IDS", "")
+    monkeypatch.setenv("FI_GPU_IDS", "")
+
+    child_env = _safe_env()
+
+    assert child_env["CUDA_VISIBLE_DEVICES"] == "GPU-allocated-by-scheduler"
+
+
+def test_child_env_explicit_gpu_pin_overrides_inherited_visibility(monkeypatch) -> None:
+    from Benchmark.run_longbench_200 import _safe_env
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-allocated-by-scheduler")
+
+    child_env = _safe_env(cuda_visible_devices="0")
+
+    assert child_env["CUDA_VISIBLE_DEVICES"] == "0"
+
+
 def test_rewrite_safe_output_preserves_success_and_fills_failed_samples(tmp_path) -> None:
     from Benchmark.run_longbench_200 import _rewrite_safe_cell_output
 
