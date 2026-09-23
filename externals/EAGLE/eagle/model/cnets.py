@@ -29,6 +29,7 @@ from torch import nn
 
 from transformers.activations import ACT2FN
 from huggingface_hub import hf_hub_download
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 
 try:
@@ -188,6 +189,43 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
 
 
+class Llama3RotaryEmbedding(LlamaRotaryEmbedding):
+    """RoPE for the Transformers 5 normalized Llama-3 configuration."""
+
+    def __init__(self, dim, max_position_embeddings=2048, config=None):
+        if config is None:
+            raise ValueError("Llama3RotaryEmbedding requires the model config")
+        self.config = config
+        self.rope_type = "llama3"
+        rope_init = ROPE_INIT_FUNCTIONS[self.rope_type]
+        inv_freq, self.attention_scaling = rope_init(config, device=None)
+        nn.Module.__init__(self)
+        self.dim = inv_freq.numel() * 2
+        self.max_position_embeddings = max_position_embeddings
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings,
+            device=self.inv_freq.device,
+            dtype=torch.get_default_dtype(),
+        )
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer(
+            "cos_cached",
+            (emb.cos() * self.attention_scaling)[None, None, :, :].to(dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sin_cached",
+            (emb.sin() * self.attention_scaling)[None, None, :, :].to(dtype),
+            persistent=False,
+        )
+
+
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -196,15 +234,21 @@ class LlamaAttention(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        # Qwen3-4B has hidden_size=2560 but head_dim=128, so its Q/K/V
+        # projections are 4096/1024/1024 wide.  Older EAGLE checkpoints
+        # expose this explicitly; falling back to hidden_size/num_heads keeps
+        # the legacy Llama/Vicuna checkpoints compatible.
+        self.head_dim = getattr(config, "head_dim", None) or (
+            self.hidden_size // self.num_heads
+        )
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
+        if self.head_dim <= 0 or self.num_heads <= 0:
             raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
+                f"invalid attention geometry: head_dim={self.head_dim}, "
+                f"num_heads={self.num_heads}"
             )
         self.q_proj = nn.Linear(self.hidden_size * 2, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False)
@@ -213,7 +257,8 @@ class LlamaAttention(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
-        if self.config.rope_scaling is None:
+        rope_scaling = getattr(self.config, "rope_scaling", None)
+        if rope_scaling is None:
             if hasattr(self.config, "rope_theta"):
                 self.rotary_emb = LlamaRotaryEmbedding(self.head_dim,
                                                        max_position_embeddings=self.max_position_embeddings,
@@ -222,8 +267,24 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(self.head_dim,
                                                        max_position_embeddings=self.max_position_embeddings)
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
+            # Transformers 5 normalizes the legacy ``type`` key to
+            # ``rope_type`` for Llama 3.1 checkpoints.
+            scaling_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+            scaling_factor = rope_scaling.get("factor", 1.0)
+            if scaling_type in (None, "default"):
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000.0),
+                )
+                return
+            if scaling_type == "llama3":
+                self.rotary_emb = Llama3RotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    config=self.config,
+                )
+                return
             if scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
@@ -318,11 +379,15 @@ class LlamaAttention(nn.Module):
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        # Qwen3 uses head_dim=128 with hidden_size=2560, so the concatenated
+        # Q heads are 4096 wide and only become 2560-wide after o_proj.
+        projection_width = self.num_heads * self.head_dim
+        attn_output = attn_output.reshape(bsz, q_len, projection_width)
 
         if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
+            split_width = projection_width // self.config.pretraining_tp
+            attn_output = attn_output.split(split_width, dim=2)
+            o_proj_slices = self.o_proj.weight.split(split_width, dim=1)
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
         else:
             attn_output = self.o_proj(attn_output)

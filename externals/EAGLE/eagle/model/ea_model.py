@@ -46,6 +46,14 @@ class EaModel(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path, use_fast=False)
         self.use_eagle3 = use_eagle3
         config = EConfig.from_pretrained(ea_model_path)
+        # The EAGLE draft config predates Qwen3's separate head_dim field.
+        # The released Qwen3-4B draft weights use the target model's 128-wide
+        # heads; copy the target attention geometry before constructing the
+        # draft layer so its Q/K/V shapes match the checkpoint.
+        for name in ("head_dim", "num_attention_heads", "num_key_value_heads"):
+            value = getattr(base_model.config, name, None)
+            if value is not None:
+                setattr(config, name, value)
         with open(ea_model_path, "r") as f:
             con = json.loads(f.read())
         try:
@@ -206,6 +214,8 @@ class EaModel(nn.Module):
             max_length=2048,
             log=False,
             is_llama3=False,
+            return_stats=False,
+            return_phase_timings=False,
 
     ):
         if is_llama3:
@@ -241,19 +251,36 @@ class EaModel(nn.Module):
             self.current_length_data = current_length_data
 
         input_len = input_ids.shape[1]
+        if input_ids.is_cuda:
+            torch.cuda.synchronize(input_ids.device)
+        e2e_start = time.perf_counter()
+        prefill_start = time.perf_counter()
         reset_tree_mode(self)
         # prefill
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor
         )
+        if input_ids.is_cuda:
+            torch.cuda.synchronize(input_ids.device)
+        prefill_ms = (time.perf_counter() - prefill_start) * 1000.0
+        decode_start = time.perf_counter()
+        acceptance_lengths = []
+        draft_latency_ms = 0.0
+        verification_latency_ms = 0.0
+        draft_tokens_proposed = 0
+        draft_tokens_accepted = 0
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
+        idx = -1
         for idx in range(max_length):
             # with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens = draft_tokens.to(input_ids.device)
             # Target model forward, get logits
+            if input_ids.is_cuda:
+                torch.cuda.synchronize(input_ids.device)
+            verification_start = time.perf_counter()
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -270,8 +297,19 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
+            if input_ids.is_cuda:
+                torch.cuda.synchronize(input_ids.device)
+            verification_latency_ms += (time.perf_counter() - verification_start) * 1000.0
+            accepted = int(accept_length.item()) if torch.is_tensor(accept_length) else int(accept_length)
+            acceptance_lengths.append(accepted + 1)
+            proposed = max(0, int(candidates.shape[1]) - 1)
+            draft_tokens_proposed += proposed
+            draft_tokens_accepted += min(accepted, proposed)
             # print(accept_length)
             # Adjusting the input sequence, draft model forward
+            if input_ids.is_cuda:
+                torch.cuda.synchronize(input_ids.device)
+            draft_start = time.perf_counter()
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
                 candidates,
@@ -286,6 +324,9 @@ class EaModel(nn.Module):
                 hidden_state_new,
                 sample_p
             )
+            if input_ids.is_cuda:
+                torch.cuda.synchronize(input_ids.device)
+            draft_latency_ms += (time.perf_counter() - draft_start) * 1000.0
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
@@ -297,8 +338,41 @@ class EaModel(nn.Module):
                 break
             if input_ids.shape[1] > max_length:
                 break
+        if input_ids.is_cuda:
+            torch.cuda.synchronize(input_ids.device)
+        e2e_ms = (time.perf_counter() - e2e_start) * 1000.0
+        decode_ms = max(0.0, e2e_ms - prefill_ms)
+        phase_timings = {
+            "prefill_ms": prefill_ms,
+            "decode_ms": decode_ms,
+            "e2e_ms": e2e_ms,
+            "draft_latency_ms": draft_latency_ms,
+            "verification_latency_ms": verification_latency_ms,
+            "draft_tokens_proposed": draft_tokens_proposed,
+            "draft_tokens_accepted": draft_tokens_accepted,
+            "acceptance_rate": (
+                draft_tokens_accepted / draft_tokens_proposed
+                if draft_tokens_proposed > 0 else 0.0
+            ),
+            "rejected_draft_ratio": (
+                1.0 - draft_tokens_accepted / draft_tokens_proposed
+                if draft_tokens_proposed > 0 else 0.0
+            ),
+            "avg_accept_length": (
+                sum(acceptance_lengths) / len(acceptance_lengths)
+                if acceptance_lengths else 0.0
+            ),
+            "peak_memory_gb": (
+                torch.cuda.max_memory_allocated(input_ids.device) / (1024 ** 3)
+                if input_ids.is_cuda else None
+            ),
+        }
         if not log:
             return input_ids
+        if return_stats:
+            if return_phase_timings:
+                return input_ids, new_token, idx, e2e_ms / 1000.0, acceptance_lengths, phase_timings
+            return input_ids, new_token, idx, e2e_ms / 1000.0, acceptance_lengths
         else:
             return input_ids, new_token, idx
 
@@ -313,6 +387,8 @@ class EaModel(nn.Module):
             max_length=2048,
             log=False,
             is_llama3=False,
+            return_stats=False,
+            return_phase_timings=False,
 
     ):
         if is_llama3:
@@ -348,8 +424,16 @@ class EaModel(nn.Module):
             self.current_length_data = current_length_data
 
         input_len = input_ids.shape[1]
+        if input_ids.is_cuda:
+            torch.cuda.synchronize(input_ids.device)
+        e2e_start = time.perf_counter()
+        prefill_start = time.perf_counter()
         reset_tree_mode(self)
         outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
+        if input_ids.is_cuda:
+            torch.cuda.synchronize(input_ids.device)
+        prefill_ms = (time.perf_counter() - prefill_start) * 1000.0
+        decode_start = time.perf_counter()
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
@@ -374,8 +458,24 @@ class EaModel(nn.Module):
                 break
             if input_ids.shape[1] > max_length:
                 break
+        if input_ids.is_cuda:
+            torch.cuda.synchronize(input_ids.device)
+        e2e_ms = (time.perf_counter() - e2e_start) * 1000.0
+        phase_timings = {
+            "prefill_ms": prefill_ms,
+            "decode_ms": max(0.0, e2e_ms - prefill_ms),
+            "e2e_ms": e2e_ms,
+            "peak_memory_gb": (
+                torch.cuda.max_memory_allocated(input_ids.device) / (1024 ** 3)
+                if input_ids.is_cuda else None
+            ),
+        }
         if not log:
             return input_ids
+        if return_stats:
+            if return_phase_timings:
+                return input_ids, new_token, idx, e2e_ms / 1000.0, phase_timings
+            return input_ids, new_token, idx, e2e_ms / 1000.0
         else:
             return input_ids, new_token, idx
 

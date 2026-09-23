@@ -168,6 +168,14 @@ def timed_generate(
         steps = int(idx) + 1
         acceptance_lengths = []
 
+    # EAGLE's upstream loop checks ``new_token > max_new_tokens`` after a
+    # speculative step, so that step can include one fallback token beyond the
+    # requested budget.  Truncate the returned sequence at the adapter
+    # boundary; otherwise strict metric auditing correctly rejects the sample.
+    max_output_len = input_ids.shape[1] + max_new_tokens
+    if output_ids.shape[1] > max_output_len:
+        output_ids = output_ids[:, :max_output_len]
+
     # Use the returned sequence as the source of truth after max-token
     # truncation, rather than relying on the internal loop counter.
     new_tokens = int(output_ids.shape[1] - input_ids.shape[1])

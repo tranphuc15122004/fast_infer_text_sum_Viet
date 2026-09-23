@@ -25,8 +25,11 @@ BASELINE_MEASUREMENT_SCOPE = {
     "vanilla_fa": "full_e2e",
     "eagle3": "full_e2e",
     "dflash": "full_e2e",
-    "domino": "full_e2e",
-    "dspark": "full_e2e",
+    # Stock SGLang's non-streaming /generate response exposes request-level
+    # timing but not prompt/decode phase timing.  Keep those cells eligible for
+    # honest e2e comparison while preventing phase-speedup claims.
+    "domino": "e2e_only",
+    "dspark": "e2e_only",
 }
 
 _TIMING_BY_SCOPE = {
@@ -102,7 +105,6 @@ _TEXT_QUALITY_FIELDS = (
     "bleu4",
     "length_ratio",
 )
-_SPECULATIVE_BASELINES = {"eagle3", "dflash", "domino", "dspark"}
 _DERIVED_ISSUES = {
     "speedup_invalid",
     "missing_tpot_ms",
@@ -112,16 +114,18 @@ _DERIVED_ISSUES = {
 _QUALITY_FIELDS = tuple(dict.fromkeys(_QUALITY_FIELDS + _TEXT_QUALITY_FIELDS))
 
 
-def required_direct_metrics(baseline: str) -> tuple[str, ...]:
+def required_direct_metrics(
+    baseline: str, *, measurement_scope: str | None = None
+) -> tuple[str, ...]:
     """Return raw fields required by the Vietnamese baseline contract.
 
-    SGLang-backed Domino/DSpark do not expose model-load or process peak
-    memory from the client process, so those server-level diagnostics remain
-    optional for the current adapter.  They are still retained in records
-    whenever the runtime provides them.
+    SGLang-backed Domino/DSpark do not expose model-load, process peak memory,
+    or (in the stock non-streaming endpoint) phase timing from the client
+    process.  Those server-level diagnostics remain optional for the current
+    adapter and are retained whenever the runtime provides them.
     """
 
-    scope = BASELINE_MEASUREMENT_SCOPE.get(baseline)
+    scope = measurement_scope or BASELINE_MEASUREMENT_SCOPE.get(baseline)
     if scope is None:
         return ()
     fields = list(_COMMON_DIRECT_FIELDS)
@@ -129,7 +133,10 @@ def required_direct_metrics(baseline: str) -> tuple[str, ...]:
         fields.extend(_MODEL_MEMORY_DIRECT_FIELDS)
     if scope == "full_e2e":
         fields.extend(_FULL_E2E_DIRECT_FIELDS)
-    if baseline in _SPECULATIVE_BASELINES:
+    # EAGLE/DFlash expose per-iteration draft/verification timing directly.
+    # SGLang server adapters retain these fields when upstream provides them,
+    # but must not be marked incomplete merely because stock SGLang omits them.
+    if baseline in {"eagle3", "dflash"}:
         fields.extend(_SPECULATIVE_DIRECT_FIELDS)
     return tuple(fields)
 
@@ -369,7 +376,9 @@ def validate_cell_metric_contract(
         if record.get("status", "success") == "success":
             direct_missing = [
                 field
-                for field in required_direct_metrics(baseline)
+                for field in required_direct_metrics(
+                    baseline, measurement_scope=scope
+                )
                 if not _is_present(record.get(field))
             ]
             for field in direct_missing:
@@ -426,7 +435,9 @@ def validate_cell_metric_contract(
         "duplicate_sample_ids": duplicate_ids,
         "scope_counts": dict(scopes),
         "missing_field_counts": dict(missing_field_counts),
-        "required_direct_metrics": list(required_direct_metrics(baseline)),
+        "required_direct_metrics": list(
+            required_direct_metrics(baseline, measurement_scope=expected_scope)
+        ),
         "missing_direct_field_counts": dict(missing_direct_field_counts),
         "missing_quality_field_counts": dict(missing_quality_field_counts),
         "issue_counts": dict(issue_counts),

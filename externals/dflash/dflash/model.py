@@ -222,6 +222,10 @@ def dflash_generate(
 
     decode_start = _cuda_time() if return_stats else None
     acceptance_lengths = []
+    draft_latency = 0.0
+    verification_latency = 0.0
+    draft_tokens_proposed = 0
+    draft_tokens_accepted = 0
     start = num_input_tokens
     stop_tokens = (
         torch.tensor(stop_token_ids, dtype=output_ids.dtype, device=output_ids.device)
@@ -235,6 +239,7 @@ def dflash_generate(
         block_output_ids = output_ids[:, start : start + verify_size].clone()
         block_position_ids = position_ids[:, start : start + verify_size]
         if verify_size > 1:
+            draft_start = _cuda_time() if return_stats else None
             noise_embedding = _raw_input_embeddings(
                 target,
                 block_output_ids,
@@ -266,6 +271,10 @@ def dflash_generate(
                     draft_indices = None
                 else:
                     block_output_ids[:, 1:] = torch.argmax(draft_logits, dim=-1)
+            if return_stats:
+                draft_latency += _cuda_time() - draft_start
+            draft_tokens_proposed += verify_size - 1
+        verification_start = _cuda_time() if return_stats else None
         output = target(
             block_output_ids,
             position_ids=block_position_ids,
@@ -273,6 +282,8 @@ def dflash_generate(
             use_cache=True,
             output_hidden_states=verify_size > 1,
         )
+        if return_stats:
+            verification_latency += _cuda_time() - verification_start
 
         if temperature > 0:
             target_probs = _sampling_probs(output.logits, temperature, top_p, top_k)
@@ -303,6 +314,7 @@ def dflash_generate(
         start += produced
         _crop_to(past_key_values_target, start)
         acceptance_lengths.append(produced)
+        draft_tokens_accepted += min(acceptance_length, verify_size - 1)
 
         if verify_size > 1:
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :produced, :]
@@ -321,6 +333,10 @@ def dflash_generate(
         time_to_first_token=time_to_first_token,
         time_per_output_token=total_decode_time / num_output_tokens,
         acceptance_lengths=acceptance_lengths,
+        draft_latency_ms=draft_latency * 1e3,
+        verification_latency_ms=verification_latency * 1e3,
+        draft_tokens_proposed=draft_tokens_proposed,
+        draft_tokens_accepted=draft_tokens_accepted,
     )
 
 

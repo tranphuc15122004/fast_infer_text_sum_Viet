@@ -554,9 +554,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
             # Prepare mask arguments
             mask_kwargs = {
                 "config": self.config,
-                "input_embeds": inputs_embeds,
+                "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
@@ -621,7 +620,10 @@ class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 @auto_docstring
 class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    # Transformers 5 expects a target->source mapping here.  The upstream
+    # generated model used the pre-5 list form, which fails in
+    # PreTrainedModel.post_init() before any checkpoint tensor is loaded.
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 

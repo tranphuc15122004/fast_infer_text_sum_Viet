@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import importlib
+import importlib.util
+import inspect
 import os
 from pathlib import Path
+import sys
 import time
+import types
 from typing import Any
 
 import torch
@@ -20,6 +26,175 @@ from Benchmark.common.data_loader import load_records
 from Benchmark.common.input_utils import truncate_input_ids
 from Benchmark.common.quality_guard import is_degenerate_output
 from Benchmark.common.reproducibility import seed_everything
+
+
+FLASH_ATTENTION_BACKENDS = frozenset({"flash_attention_2", "flash_attention_4"})
+
+
+def _install_flash_attention_4_cutlass_compat() -> bool:
+    """Install process-local shims required by the FA4 beta wheel.
+
+    The offline B200 runtime combines FA4 beta with a newer CUTLASS DSL.  FA4
+    still imports a removed CUTLASS helper and calls ``nvvm.fmax`` using the
+    old ABI.  Keep the compatibility layer local to this process; never edit
+    the shared site-packages tree.
+    """
+
+    changed = False
+    module_name = "cutlass.utils.ampere_helpers"
+    try:
+        missing_ampere_helpers = importlib.util.find_spec(module_name) is None
+    except Exception:
+        missing_ampere_helpers = False
+
+    if missing_ampere_helpers:
+        try:
+            cutlass_utils = importlib.import_module("cutlass.utils")
+        except Exception:
+            cutlass_utils = None
+        if cutlass_utils is not None:
+            shim = types.ModuleType(module_name)
+            shim.SMEM_CAPACITY = {
+                "sm80": 163840,
+                "sm86": 102400,
+                "sm89": 102400,
+                "sm90": 232448,
+                "sm100": 229376,
+            }
+            sys.modules[module_name] = shim
+            setattr(cutlass_utils, "ampere_helpers", shim)
+            changed = True
+
+    # CUTLASS 4.5 made the optional ``c`` argument keyword-only and expects
+    # MLIR values.  FA4 b15 still uses the older positional/CuTe convention.
+    try:
+        nvvm = importlib.import_module("cutlass._mlir.dialects.nvvm")
+        fmax = nvvm.fmax
+        cutlass = importlib.import_module("cutlass")
+        float32 = cutlass.Float32
+        mlir_ir = importlib.import_module("cutlass._mlir.ir")
+
+        try:
+            cute_arch = importlib.import_module("cutlass.cute.arch")
+            for enum_name in (
+                "ProxyKind",
+                "SharedSpace",
+                "RoundingModeKind",
+                "ReduxKind",
+                "AtomicOpKind",
+            ):
+                if not hasattr(cute_arch, enum_name) and hasattr(nvvm, enum_name):
+                    enum_class = getattr(nvvm, enum_name)
+                    setattr(
+                        cute_arch,
+                        enum_name,
+                        types.SimpleNamespace(
+                            **{member.name: str(member) for member in enum_class}
+                        ),
+                    )
+                    changed = True
+        except Exception:
+            pass
+
+        parameters = inspect.signature(fmax).parameters
+        c_parameter = parameters.get("c")
+        if (
+            c_parameter is not None
+            and c_parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            and not getattr(fmax, "_fast_infer_fa4_compat", False)
+        ):
+            @functools.wraps(fmax)
+            def fmax_compat(a, b, *args, **kwargs):
+                result_type = None
+                if isinstance(a, mlir_ir.Type):
+                    result_type = a
+                    operands = (b, *args)
+                    if len(operands) < 2:
+                        return fmax(a, b, *args, **kwargs)
+                    a, b, *args = operands
+                if len(args) == 1:
+                    kwargs["c"] = args[0]
+                    args = ()
+                if args:
+                    return fmax(a, b, *args, **kwargs)
+                loc = kwargs.get("loc")
+                ip = kwargs.get("ip")
+                c = kwargs.get("c")
+
+                def as_ir_value(value):
+                    ir_value = getattr(value, "ir_value", None)
+                    if callable(ir_value):
+                        return ir_value(loc=loc, ip=ip)
+                    try:
+                        return float32(value).ir_value(loc=loc, ip=ip)
+                    except Exception as exc:
+                        attrs = tuple(
+                            name
+                            for name in (
+                                "value",
+                                "type",
+                                "dtype",
+                                "shape",
+                                "__extract_mlir_values__",
+                                "__new_from_mlir_values__",
+                            )
+                            if hasattr(value, name)
+                        )
+                        raise TypeError(
+                            "FA4 nvvm.fmax operand is not directly convertible: "
+                            f"type={type(value).__module__}.{type(value).__qualname__}, "
+                            f"text={value!s}, attrs={attrs}"
+                        ) from exc
+
+                raw_kwargs = {
+                    "a": as_ir_value(a),
+                    "b": as_ir_value(b),
+                    "c": as_ir_value(c) if c is not None else None,
+                    "ftz": kwargs.get("ftz"),
+                    "nan": kwargs.get("nan"),
+                    "abs": kwargs.get("abs"),
+                    "loc": loc,
+                    "ip": ip,
+                }
+                if next(iter(inspect.signature(fmax).parameters), None) == "res":
+                    if result_type is None:
+                        result_type = getattr(cutlass, "T", None)
+                        result_type = result_type.f32() if result_type else None
+                    if result_type is None:
+                        raise TypeError(
+                            "CUTLASS nvvm.fmax requires `res`, but FA4 did not "
+                            "provide an explicit result type"
+                        )
+                    raw_kwargs["res"] = result_type
+                return fmax(**raw_kwargs)
+
+            fmax_compat._fast_infer_fa4_compat = True
+            nvvm.fmax = fmax_compat
+            changed = True
+    except Exception:
+        # The import probe below remains authoritative when CUTLASS is absent
+        # or incompatible in a way this shim cannot safely cover.
+        pass
+
+    return changed
+
+
+def _probe_flash_attention_4() -> tuple[bool, str | None]:
+    """Probe the complete FA4/CuTe import chain, not only package discovery."""
+
+    try:
+        if importlib.util.find_spec("flash_attn.cute") is None:
+            return False, "flash_attn.cute is not installed"
+    except Exception as exc:
+        detail = str(exc).strip().splitlines()[0] or repr(exc)
+        return False, f"{type(exc).__name__}: {detail}"
+    _install_flash_attention_4_cutlass_compat()
+    try:
+        importlib.import_module("flash_attn.cute")
+    except Exception as exc:
+        detail = str(exc).strip().splitlines()[0] or repr(exc)
+        return False, f"{type(exc).__name__}: {detail}"
+    return True, None
 
 
 def build_parser(default_backend: str, description: str) -> argparse.ArgumentParser:
@@ -49,8 +224,12 @@ def build_parser(default_backend: str, description: str) -> argparse.ArgumentPar
     )
     parser.add_argument(
         "--attention-backend",
-        choices=[default_backend],
-        default=default_backend,
+        choices=sorted(
+            {default_backend, "flash_attention_4"}
+            if default_backend == "flash_attention_2"
+            else {default_backend}
+        ),
+        default=os.environ.get("LONG_BENCH_ATTENTION_BACKEND", default_backend),
     )
     parser.add_argument("--run-id", default=os.environ.get("LONG_BENCH_RUN_ID"))
     parser.add_argument("--smoke", action="store_true")
@@ -88,7 +267,9 @@ def _generate(model: Any, input_ids: torch.Tensor, args: argparse.Namespace) -> 
     }
     if args.temperature > 0:
         kwargs["temperature"] = args.temperature
-    attention_mask = torch.ones_like(input_ids)
+    attention_mask = _attention_mask_for_backend(
+        torch.ones_like(input_ids), getattr(args, "attention_backend", None)
+    )
     return model.generate(input_ids, attention_mask=attention_mask, **kwargs)
 
 
@@ -117,6 +298,20 @@ def _is_eos(token: torch.Tensor, eos_token_id: int | list[int] | None) -> bool:
         return False
     eos_ids = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
     return int(token.reshape(-1)[0]) in {int(value) for value in eos_ids}
+
+
+def _attention_mask_for_backend(
+    attention_mask: torch.Tensor | None, attention_backend: str | None
+) -> torch.Tensor | None:
+    """Avoid selecting FlashAttention's varlen path for an all-ones mask."""
+
+    if (
+        attention_backend in FLASH_ATTENTION_BACKENDS
+        and attention_mask is not None
+        and bool(torch.all(attention_mask != 0))
+    ):
+        return None
+    return attention_mask
 
 
 def _build_decode_attention_mask(
@@ -189,7 +384,27 @@ def _should_use_static_cache(attention_backend: str | None) -> bool:
     and decoding policy remain unchanged.
     """
 
-    return attention_backend != "flash_attention_2"
+    return attention_backend not in FLASH_ATTENTION_BACKENDS
+
+
+def _resolve_flash_attention_backend(
+    attention_backend: str,
+    *,
+    compute_capability: tuple[int, int] | None,
+    flash_attention_4_available: bool,
+) -> str:
+    """Select a backend valid for the installed GPU architecture."""
+
+    if attention_backend != "flash_attention_2" or compute_capability is None:
+        return attention_backend
+    if int(compute_capability[0]) < 10:
+        return attention_backend
+    if flash_attention_4_available:
+        return "flash_attention_4"
+    raise RuntimeError(
+        "vanilla_fa requested FlashAttention-2 on Blackwell/B200, but FA2 is "
+        "unsupported and flash_attn.cute (FA4) is not installed"
+    )
 
 
 def _timed_generate(
@@ -231,7 +446,10 @@ def _timed_generate(
         prefill_start = time.perf_counter()
         prefill_kwargs = {
             "input_ids": input_ids,
-            "attention_mask": attention_mask[:, :input_length],
+            "attention_mask": _attention_mask_for_backend(
+                attention_mask[:, :input_length],
+                getattr(args, "attention_backend", None),
+            ),
             "use_cache": True,
             "return_dict": True,
         }
@@ -254,7 +472,10 @@ def _timed_generate(
                 current_length = input_length + len(generated)
                 step = model(
                     input_ids=next_token,
-                    attention_mask=attention_mask[:, :current_length],
+                    attention_mask=_attention_mask_for_backend(
+                        attention_mask[:, :current_length],
+                        getattr(args, "attention_backend", None),
+                    ),
                     past_key_values=past,
                     use_cache=True,
                     return_dict=True,
@@ -316,12 +537,47 @@ def _load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, An
     if device.type == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA is unavailable; use orchestrator smoke preflight on this host")
 
-    if args.attention_backend == "flash_attention_2":
+    if args.attention_backend in FLASH_ATTENTION_BACKENDS:
+        requested_backend = args.attention_backend
+        compute_capability = (
+            torch.cuda.get_device_capability(device)
+            if device.type == "cuda"
+            else None
+        )
+        fa4_available, fa4_reason = (
+            _probe_flash_attention_4()
+            if requested_backend == "flash_attention_4"
+            or (
+                requested_backend == "flash_attention_2"
+                and compute_capability is not None
+                and int(compute_capability[0]) >= 10
+            )
+            else (False, None)
+        )
         try:
-            import flash_attn  # noqa: F401
+            args.attention_backend = _resolve_flash_attention_backend(
+                requested_backend,
+                compute_capability=compute_capability,
+                flash_attention_4_available=fa4_available,
+            )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+
+        if args.attention_backend == "flash_attention_4" and not fa4_available:
+            detail = f" ({fa4_reason})" if fa4_reason else ""
+            raise SystemExit(
+                "vanilla_fa requires an importable FlashAttention-4 runtime"
+                f"{detail}; no fallback is allowed"
+            )
+        try:
+            if args.attention_backend == "flash_attention_4":
+                from flash_attn import cute as _flash_attention_cute  # noqa: F401
+            else:
+                import flash_attn  # noqa: F401
         except Exception as exc:
             raise SystemExit(
-                "vanilla_fa requires the installed flash-attn wheel; no fallback is allowed"
+                f"vanilla_fa requires the installed {args.attention_backend} "
+                "runtime; no fallback is allowed"
             ) from exc
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -362,6 +618,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
     device = torch.device(args.device)
     records = load_records(Path(args.data_file), args.max_samples)
     data_name = Path(args.data_file).stem
+    requested_attention_backend = args.attention_backend
 
     load_start = time.perf_counter()
     model, tokenizer = _load_model(args, device)
@@ -383,7 +640,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         "warmup_runs": args.warmup_runs,
         "batch_size": 1,
         "extra_metrics": {
-            "requested_attention_backend": args.attention_backend,
+            "requested_attention_backend": requested_attention_backend,
             "effective_attention_backend": effective_attention_backend
             or "unknown",
         },
@@ -479,6 +736,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         "successful_samples": successful,
         "model": args.model,
         "model_load_ms": model_load_ms,
+        "requested_attention_backend": requested_attention_backend,
         "attention_backend": args.attention_backend,
         "effective_attention_backend": effective_attention_backend or "unknown",
         "runtime": metadata,

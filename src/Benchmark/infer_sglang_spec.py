@@ -131,20 +131,37 @@ def extract_response_metrics(payload: dict[str, Any], *, request_elapsed_ms: flo
         multiplier = 1.0 if str(selected_key).endswith("_ms") else 1000.0
         return round(float(value) * multiplier, 3)
 
+    prefill_ms = duration_ms("prompt_latency")
+    decode_ms = duration_ms("completion_latency")
+    acceptance_histogram = meta.get("spec_accept_histogram")
+    if isinstance(acceptance_histogram, (list, tuple)):
+        acceptance_histogram = [int(value) for value in acceptance_histogram]
+    else:
+        acceptance_histogram = None
+
     return {
         "input_tokens": int(meta["prompt_tokens"]) if meta.get("prompt_tokens") is not None else None,
         "output_tokens": int(meta["completion_tokens"]) if meta.get("completion_tokens") is not None else None,
         "queue_wait_ms": duration_ms("queue_wait_ms", "queue_wait_time", "queue_time"),
         "batch_wait_ms": duration_ms("batch_wait_ms", "batch_wait_time", "batch_time"),
-        "prefill_ms": duration_ms("prompt_latency"),
-        "ttft_ms": duration_ms("prompt_latency"),
-        "decode_ms": duration_ms("completion_latency"),
+        "prefill_ms": prefill_ms,
+        "ttft_ms": prefill_ms,
+        "decode_ms": decode_ms,
         "draft_latency_ms": duration_ms("spec_draft_time", "draft_latency"),
         "verification_latency_ms": duration_ms("spec_verify_time", "verification_latency"),
         "server_reported_e2e_ms": duration_ms("e2e_latency", "request_time"),
         "e2e_ms": round(float(request_elapsed_ms), 3),
+        "measurement_scope": (
+            "full_e2e" if prefill_ms is not None and decode_ms is not None else "e2e_only"
+        ),
         "avg_accept_length": meta.get("spec_accept_length"),
-        "acceptance_rate": meta.get("spec_acceptance_rate"),
+        "acceptance_rate": meta.get(
+            "spec_acceptance_rate", meta.get("spec_accept_rate")
+        ),
+        # This is a histogram indexed by accepted draft-token count, not a
+        # per-iteration list.  Keep it separate from EAGLE/DFlash's
+        # ``acceptance_lengths`` field to avoid fabricating trace data.
+        "acceptance_histogram": acceptance_histogram,
         "verification_steps": meta.get("spec_verify_ct"),
         "rejected_draft_ratio": meta.get("spec_rejected_draft_ratio"),
     }
@@ -368,12 +385,13 @@ def main() -> int:
                         "temperature": args.temperature,
                         "max_new_tokens": args.max_new_tokens,
                         "batch_size": args.batch_size,
-                        "measurement_scope": "full_e2e",
+                        "measurement_scope": timing.get("measurement_scope", "e2e_only"),
                         "extra_metrics": {
                             "server_startup_ms": server_startup_ms,
                             "tp_size": args.tp_size,
                             "max_running_requests": args.max_running_requests,
                             "verification_steps": timing.get("verification_steps"),
+                            "acceptance_histogram": timing.get("acceptance_histogram"),
                             "server_reported_e2e_ms": timing.get("server_reported_e2e_ms"),
                         },
                     },

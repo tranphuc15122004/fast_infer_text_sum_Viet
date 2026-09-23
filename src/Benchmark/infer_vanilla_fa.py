@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vanilla Hugging Face inference using flash-attention 2."""
+"""Vanilla Hugging Face inference using FlashAttention-2/4."""
 
 from __future__ import annotations
 

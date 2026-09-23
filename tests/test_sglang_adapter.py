@@ -41,6 +41,7 @@ def test_sglang_payload_extracts_phase_and_acceptance_metrics() -> None:
             "queue_time": 0.002,
             "batch_wait_ms": 1.5,
             "spec_accept_length": 3.5,
+            "spec_accept_rate": 0.25,
             "spec_verify_ct": 4,
         },
     }
@@ -52,8 +53,33 @@ def test_sglang_payload_extracts_phase_and_acceptance_metrics() -> None:
     assert metrics["queue_wait_ms"] == 2.0
     assert metrics["batch_wait_ms"] == 1.5
     assert metrics["avg_accept_length"] == 3.5
+    assert metrics["acceptance_rate"] == 0.25
     assert metrics["verification_steps"] == 4
     assert metrics["e2e_ms"] == 90.0
+    assert metrics["measurement_scope"] == "full_e2e"
+
+
+def test_sglang_payload_downgrades_honestly_when_phase_timing_is_unavailable() -> None:
+    from Benchmark.infer_sglang_spec import extract_response_metrics
+
+    payload = {
+        "text": "bản tóm tắt",
+        "meta_info": {
+            "prompt_tokens": 120,
+            "completion_tokens": 8,
+            "e2e_latency": 0.08,
+            "spec_accept_length": 1.0,
+            "spec_accept_histogram": [0, 7],
+            "spec_verify_ct": 7,
+        },
+    }
+
+    metrics = extract_response_metrics(payload, request_elapsed_ms=90.0)
+
+    assert metrics["measurement_scope"] == "e2e_only"
+    assert metrics["prefill_ms"] is None
+    assert metrics["decode_ms"] is None
+    assert metrics["acceptance_histogram"] == [0, 7]
 
 
 def test_auto_batch_size_uses_b200_default_and_explicit_override(monkeypatch) -> None:
@@ -63,3 +89,39 @@ def test_auto_batch_size_uses_b200_default_and_explicit_override(monkeypatch) ->
     assert resolve_batch_size("auto", total_memory_gb=180.0) == 8
     monkeypatch.setenv("LONG_BENCH_AUTO_BATCH_SIZE", "5")
     assert resolve_batch_size("auto", total_memory_gb=180.0) == 5
+
+
+def test_vanilla_fa_parser_accepts_blackwell_backend() -> None:
+    from Benchmark.common.vanilla_inference import build_parser
+
+    parser = build_parser("flash_attention_2", "test")
+    args = parser.parse_args(
+        ["--attention-backend", "flash_attention_4", "--output", "/tmp/out.jsonl"]
+    )
+    assert args.attention_backend == "flash_attention_4"
+
+
+def test_vanilla_fa_resolves_fa2_to_fa4_on_blackwell() -> None:
+    from Benchmark.common.vanilla_inference import _resolve_flash_attention_backend
+
+    assert (
+        _resolve_flash_attention_backend(
+            "flash_attention_2",
+            compute_capability=(10, 0),
+            flash_attention_4_available=True,
+        )
+        == "flash_attention_4"
+    )
+
+
+def test_vanilla_fa_rejects_fa2_on_blackwell_without_fa4() -> None:
+    import pytest
+
+    from Benchmark.common.vanilla_inference import _resolve_flash_attention_backend
+
+    with pytest.raises(RuntimeError, match="FA2.*unsupported"):
+        _resolve_flash_attention_backend(
+            "flash_attention_2",
+            compute_capability=(10, 0),
+            flash_attention_4_available=False,
+        )

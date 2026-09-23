@@ -117,11 +117,15 @@ def _dtype_and_attention() -> tuple[torch.dtype, str]:
         raise SystemExit("DFlash Transformers adapter requires CUDA")
     capability = torch.cuda.get_device_capability()
     dtype = torch.bfloat16 if capability[0] >= 8 else torch.float16
-    try:
-        import flash_attn  # noqa: F401
-    except Exception:
-        return dtype, "sdpa"
-    return dtype, "flash_attention_2" if capability[0] >= 8 else "sdpa"
+    requested = os.environ.get("LONG_BENCH_DFLASH_ATTENTION", "sdpa").strip().lower()
+    if requested in {"sdpa", "eager"}:
+        return dtype, requested
+    if requested not in {"flash_attention_2", "flash_attention_4"}:
+        raise ValueError(
+            "LONG_BENCH_DFLASH_ATTENTION must be sdpa, eager, "
+            "flash_attention_2, or flash_attention_4"
+        )
+    return dtype, requested
 
 
 def _chat_prompt(tokenizer, prompt: str) -> str:

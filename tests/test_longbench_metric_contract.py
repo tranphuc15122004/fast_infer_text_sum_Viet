@@ -193,3 +193,65 @@ def test_dflash_acceptance_summary_uses_draft_budget() -> None:
     assert summary["avg_accept_length"] == 2.5
     assert summary["acceptance_rate"] == 0.5
     assert summary["rejected_draft_ratio"] == 0.5
+
+
+def test_domino_e2e_only_contract_does_not_require_unavailable_phase_metrics(
+    tmp_path,
+) -> None:
+    from Benchmark.common.metric_audit import audit_output_file
+
+    record = {
+        "method": "domino",
+        "dataset": "vietnews",
+        "sample_id": "a",
+        "status": "success",
+        "measurement_scope": "e2e_only",
+        "input_tokens": 10,
+        "output_tokens": 4,
+        "retained_tokens": 10,
+        "batch_size": 1,
+        "device": "cuda",
+        "e2e_ms": 20.0,
+        "throughput_tok_s": 200.0,
+        "text": "tóm tắt",
+        "reference_output": "tóm tắt",
+        "rouge1": 1.0,
+        "rouge2": 1.0,
+        "rougeL": 1.0,
+        "rouge1_p": 1.0,
+        "rouge1_r": 1.0,
+        "rouge1_f": 1.0,
+        "rouge2_p": 1.0,
+        "rouge2_r": 1.0,
+        "rouge2_f": 1.0,
+        "rougeL_p": 1.0,
+        "rougeL_r": 1.0,
+        "rougeL_f": 1.0,
+        "rougeLsum_p": 1.0,
+        "rougeLsum_r": 1.0,
+        "rougeLsum_f": 1.0,
+        "bleu1": 1.0,
+        "bleu2": 1.0,
+        "bleu3": 1.0,
+        "bleu4": 1.0,
+        "length_ratio": 1.0,
+    }
+    output = tmp_path / "domino.jsonl"
+    output.write_text(
+        json.dumps(record, ensure_ascii=False)
+        + "\n"
+        + json.dumps({"type": "summary", "status": "success"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = audit_output_file(
+        output,
+        baseline="domino",
+        dataset="vietnews",
+        audit_path=tmp_path / "audit.json",
+        expected_output_tokens=8,
+        expected_samples=1,
+    )
+
+    assert summary["metric_contract"]["status"] == "complete"

@@ -42,3 +42,28 @@ def test_dflash_compat_does_not_replace_existing_hook(monkeypatch):
     assert installed is False
     cache = object.__new__(DynamicCache)
     assert cache.activate_past_recording() == "existing"
+
+
+def test_dflash_normalizes_qwen_stop_ids_for_llama_vocab() -> None:
+    from Benchmark.infer_dflash import normalize_generation_token_ids
+
+    class Config:
+        vocab_size = 128256
+        bos_token_id = 151643
+        eos_token_id = 151645
+
+    class Tokenizer:
+        bos_token_id = 128000
+        eos_token_id = 128001
+
+        def __len__(self):
+            return 128256
+
+    changed = normalize_generation_token_ids(Config, Tokenizer())
+
+    assert changed == {
+        "bos_token_id": (151643, 128000),
+        "eos_token_id": (151645, 128001),
+    }
+    assert Config.bos_token_id == 128000
+    assert Config.eos_token_id == 128001

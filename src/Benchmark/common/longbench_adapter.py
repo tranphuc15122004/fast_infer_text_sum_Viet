@@ -145,6 +145,18 @@ def _module_available(name: str) -> bool:
 
 def _module_importable(name: str) -> tuple[bool, str | None]:
     """Check that a module and its native dependencies can actually import."""
+    if name == "flash_attn.cute":
+        # Use the same process-local FA4/CUTLASS shim as the child runner.
+        # This keeps preflight from rejecting a runtime that is usable once
+        # the compatibility module is registered in memory.
+        try:
+            from Benchmark.common.vanilla_inference import (
+                _install_flash_attention_4_cutlass_compat,
+            )
+
+            _install_flash_attention_4_cutlass_compat()
+        except Exception:
+            pass
     if not _module_available(name):
         return False, f"{name} is not installed"
     try:
@@ -153,6 +165,19 @@ def _module_importable(name: str) -> tuple[bool, str | None]:
         detail = str(exc).strip().splitlines()[0] or repr(exc)
         return False, f"{type(exc).__name__}: {detail}"
     return True, None
+
+
+def _cuda_compute_capability() -> tuple[int, int] | None:
+    """Read the first CUDA device capability without failing preflight."""
+
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return tuple(int(value) for value in torch.cuda.get_device_capability(0))
+    except Exception:
+        return None
 
 
 def _sglang_algorithm_supported(algorithm: str) -> tuple[bool, str | None]:
@@ -297,6 +322,24 @@ def preflight_baseline(
                     f"({import_reason})"
                 ),
             )
+        elif installed and result["status"] == "ready" and cuda_available:
+            capability = _cuda_compute_capability()
+            if capability is not None and capability[0] >= 10:
+                fa4_installed, fa4_reason = _module_importable("flash_attn.cute")
+                result["requirements"]["flash_attention_4"] = {
+                    "available": fa4_installed,
+                    "reason": fa4_reason,
+                    "auto_selected_for_blackwell": fa4_installed,
+                }
+                if not fa4_installed:
+                    result.update(
+                        status="unsupported_hardware",
+                        reason=(
+                            "vanilla_fa requests FlashAttention-2 on Blackwell/B200, "
+                            "but FA2 is unsupported and flash_attn.cute (FA4) is "
+                            "not installed"
+                        ),
+                    )
 
     if baseline == "eagle3":
         draft_ok, draft_reason = _local_requirement(
@@ -609,7 +652,7 @@ def build_adapter_command(
         )
         assert command is not None
         command[1] = str(ROOT / "src" / "Benchmark" / "infer_vanilla_fa.py")
-        # The parser enforces flash_attention_2 from the wrapper default.
+        # The parser resolves FA2 to FA4 automatically on Blackwell/B200.
         return command
 
     if baseline == "magicdec":

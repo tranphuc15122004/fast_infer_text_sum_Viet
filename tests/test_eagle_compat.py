@@ -54,3 +54,38 @@ def test_eagle_compat_restores_default_rope_initializer(monkeypatch):
 
     initializer = ROPE_INIT_FUNCTIONS["default"]
     assert callable(initializer)
+
+
+def test_eagle_draft_attention_accepts_transformers5_llama3_rope():
+    """The vendored EAGLE draft block must accept Transformers 5 RoPE keys."""
+
+    import torch
+
+    sys.path.insert(0, str(ROOT / "externals" / "EAGLE"))
+    from eagle.model.cnets import LlamaAttention
+
+    class Config:
+        hidden_size = 8
+        num_attention_heads = 2
+        num_key_value_heads = 2
+        max_position_embeddings = 16
+        pretraining_tp = 1
+        rope_scaling = {
+            "rope_type": "llama3",
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8,
+        }
+        rope_parameters = {**rope_scaling, "rope_theta": 500000.0}
+        rope_theta = 500000.0
+
+        @staticmethod
+        def standardize_rope_params():
+            return None
+
+    attention = LlamaAttention(Config())
+    assert type(attention.rotary_emb).__name__ == "Llama3RotaryEmbedding"
+    cos, sin = attention.rotary_emb(torch.zeros(1, 2, 2, 4), seq_len=2)
+    assert cos.shape == (1, 1, 2, 4)
+    assert sin.shape == (1, 1, 2, 4)
