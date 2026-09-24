@@ -55,6 +55,27 @@ def test_sglang_config_keeps_auto_concurrency_resolvable(monkeypatch) -> None:
     assert "--max-running-requests" not in command
 
 
+def test_dflash_command_propagates_warmup_runs() -> None:
+    from Benchmark.common.longbench_adapter import build_adapter_command
+
+    command = build_adapter_command(
+        "dflash",
+        config={
+            "model": "/models/Qwen3-4B",
+            "dflash_model": "/models/Qwen3-4B-DFlash",
+            "warmup_runs": 1,
+        },
+        data_file=ROOT / "datasets/eval_100/vietnews_100.jsonl",
+        output=ROOT / "outputs/test.jsonl",
+        max_samples=1,
+        max_new_tokens=8,
+    )
+
+    assert command is not None
+    warmup_flag = command.index("--warmup-runs")
+    assert command[warmup_flag + 1] == "1"
+
+
 def test_reference_selection_ignores_vanilla_status_records(tmp_path) -> None:
     from Benchmark.run_longbench_200 import _select_external_reference
 

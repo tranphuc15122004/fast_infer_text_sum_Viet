@@ -24,6 +24,7 @@ from Benchmark.common.benchmark_runtime import (
 )
 from Benchmark.common.data_loader import load_records
 from Benchmark.common.input_utils import truncate_input_ids
+from Benchmark.common.prompt_format import format_chat_prompt
 from Benchmark.common.quality_guard import is_degenerate_output
 from Benchmark.common.reproducibility import seed_everything
 
@@ -253,7 +254,10 @@ def _dtype(name: str) -> torch.dtype:
 
 
 def _prompt_batch(tokenizer: Any, prompt: str, *, max_input_tokens: int) -> torch.Tensor:
-    encoded = tokenizer(prompt, return_tensors="pt")
+    formatted_prompt = format_chat_prompt(tokenizer, prompt)
+    encoded = tokenizer(
+        formatted_prompt, return_tensors="pt", add_special_tokens=False
+    )
     return truncate_input_ids(encoded.input_ids, max_input_tokens)
 
 

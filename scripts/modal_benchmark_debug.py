@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """GPU Modal debug runner for the Vietnamese LongBench smoke path.
 
-The local B200-simulation venv is fingerprinted but not uploaded.  Modal builds
-an equivalent Python 3.12 image and downloads public Qwen3 checkpoints into the
-temporary job filesystem, so this runner creates no persistent Volume.
+Modal builds a Python 3.12 image from the exact versions in requirements.txt.
+Internal file:// wheel references are resolved by wheel filename and fetched
+from public package indexes; no local venv or private server path is uploaded.
+Public Qwen3 checkpoints are downloaded into the temporary job filesystem, so
+this runner creates no persistent Volume.
 
 Example::
 
-    FAST_INFER_VENV=/home/tuantb/fast_infer_text_sum/.venv \
-    MODAL_GPU=B200 \
-    modal run scripts/modal_benchmark_debug.py --action smoke
+    MODAL_GPU=B200 modal run scripts/modal_benchmark_debug.py --action smoke
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ import threading
 import time
 import uuid
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import modal
 
@@ -31,9 +33,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REMOTE_ROOT = Path("/workspace/repo")
 REMOTE_RUN_ROOT = Path("/tmp/fast-infer-modal-debug")
 GPU = os.environ.get("MODAL_GPU", "B200")
-LOCAL_VENV = Path(
-    os.environ.get("FAST_INFER_VENV", "/home/tuantb/fast_infer_text_sum/.venv")
-)
+REQUIREMENTS_FILE = PROJECT_ROOT / "requirements.txt"
+if not REQUIREMENTS_FILE.is_file():
+    REQUIREMENTS_FILE = REMOTE_ROOT / "requirements.txt"
 REMOTE_DATA = REMOTE_ROOT / "datasets" / "eval_100"
 
 MODEL = os.environ.get("MODAL_QWEN3_MODEL", "Qwen/Qwen3-4B")
@@ -94,65 +96,238 @@ PACKAGE_NAMES = (
     "nvidia-cutlass-dsl-libs-base",
     "nvidia-cutlass-dsl-libs-cu13",
     "typing_extensions",
+    "ninja",
     "modal",
 )
-# Keep packages from the cloned B200 environment unchanged when they do not
-# conflict with the required speculative/B200 kernel stack.
-MODAL_COMPATIBLE_SOURCE_VERSIONS = {
-    "transformers": "5.12.1",
-    "tokenizers": "0.22.2",
-    "accelerate": "1.15.0",
-    "datasets": "5.0.1",
-    "einops": "0.8.2",
-    "huggingface_hub": "1.31.0",
-    "numpy": "2.2.6",
-    "protobuf": "6.33.6",
-    "psutil": "7.2.2",
-    "rouge_score": "0.1.2",
-    "safetensors": "0.8.0",
-    "sentencepiece": "0.2.2",
-    "tqdm": "4.70.1",
-    "regex": "2026.6.28",
-    "packaging": "26.2",
-    "Jinja2": "3.1.6",
-    "filelock": "3.29.4",
-    "sympy": "1.14.0",
-    "networkx": "3.6.1",
-    "PyYAML": "6.0.3",
-    "torch_c_dlpack_ext": "0.1.5",
+
+
+def parse_requirements_pin_map(path: Path) -> dict[str, str]:
+    """Read exact versions, resolving local wheel references by wheel filename.
+
+    The server's requirements may point at private ``file://`` wheelhouse paths.
+    Modal cannot access those paths; the package/version pins remain usable from
+    PyPI or the package owner's public index.
+    """
+
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name, parse_wheel_filename
+
+    versions: dict[str, str] = {}
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            requirement = Requirement(line)
+        except Exception as exc:
+            raise ValueError(
+                f"invalid requirement at {path}:{line_number}: {line}"
+            ) from exc
+        package_name = canonicalize_name(requirement.name)
+        if requirement.url:
+            wheel_name = Path(unquote(urlsplit(requirement.url).path)).name
+            try:
+                artifact_name, artifact_version, _, _ = parse_wheel_filename(wheel_name)
+            except Exception as exc:
+                raise ValueError(
+                    f"cannot extract version from direct wheel at {path}:{line_number}: {line}"
+                ) from exc
+            if canonicalize_name(artifact_name) != package_name:
+                raise ValueError(
+                    f"wheel name mismatch at {path}:{line_number}: "
+                    f"{artifact_name} != {requirement.name}"
+                )
+            version = str(artifact_version)
+        else:
+            exact = [item.version for item in requirement.specifier if item.operator == "=="]
+            if len(exact) != 1:
+                continue
+            version = exact[0]
+        prior = versions.get(package_name)
+        if prior is not None and prior != version:
+            raise ValueError(
+                f"conflicting pins for {package_name}: {prior} and {version}"
+            )
+        versions[package_name] = version
+    return versions
+
+
+MODAL_REQUIREMENT_PINS = parse_requirements_pin_map(REQUIREMENTS_FILE)
+
+
+def _requirement_versions(package_names: tuple[str, ...]) -> dict[str, str]:
+    from packaging.utils import canonicalize_name
+
+    result: dict[str, str] = {}
+    for name in package_names:
+        key = canonicalize_name(name)
+        if key not in MODAL_REQUIREMENT_PINS:
+            raise ValueError(f"{name} is not exactly pinned in {REQUIREMENTS_FILE}")
+        result[name] = MODAL_REQUIREMENT_PINS[key]
+    return result
+
+
+# These are the compatible Hugging Face/data/runtime pins copied from the
+# current requirements.txt.  The server-only direct wheel URLs are reduced to
+# their version pins and fetched from public package indexes on Modal.
+MODAL_COMPATIBLE_PACKAGE_NAMES = (
+    "transformers",
+    "tokenizers",
+    "accelerate",
+    "datasets",
+    "einops",
+    "huggingface_hub",
+    "numpy",
+    "protobuf",
+    "psutil",
+    "safetensors",
+    "sentencepiece",
+    "tqdm",
+    "regex",
+    "packaging",
+    "Jinja2",
+    "filelock",
+    "sympy",
+    "networkx",
+    "PyYAML",
+    "ninja",
+    "triton",
+)
+MODAL_COMPATIBLE_SOURCE_VERSIONS = _requirement_versions(
+    MODAL_COMPATIBLE_PACKAGE_NAMES
+)
+
+# Runtime stack pins that are required for SGLang, speculative kernels and FA4.
+# They are read from requirements.txt rather than copied from another venv.
+MODAL_REQUIRED_OVERRIDE_NAMES = (
+    "torch",
+    "sglang",
+    "sglang-kernel",
+    "flashinfer-python",
+    "flashinfer-cubin",
+    "apache-tvm-ffi",
+    "nvidia-cutlass-dsl",
+    "nvidia-cutlass-dsl-libs-base",
+    "nvidia-cutlass-dsl-libs-cu13",
+    "quack-kernels",
+    "typing_extensions",
+    "torch_c_dlpack_ext",
+    "flash-attn-4",
+)
+MODAL_REQUIRED_OVERRIDES = _requirement_versions(MODAL_REQUIRED_OVERRIDE_NAMES)
+# FA4 b19 calls quack.activation.sub_packed_f32x2, removed by the pinned
+# Quack runtime. Upstream FA4 b26 fixes this; b32 also includes PyTorch 2.13
+# extension-build support. Its metadata requires TVM FFI >=0.1.12.
+MODAL_REQUIRED_OVERRIDES.update(
+    {"flash-attn-4": "4.0.0b32", "apache-tvm-ffi": "0.1.12"}
+)
+# The server freeze has mixed CUDA compiler/header releases (13.2/13.3) on top
+# of a CUDA 13.0 runtime. FlashInfer JIT on SM100 requires matching 13.0 headers
+# and nvcc, so select the components published by cuda-toolkit 13.0.3.0.
+MODAL_CUDA_TOOLCHAIN_OVERRIDES = {
+    "nvidia-cuda-cccl": "13.0.85",
+    "nvidia-cuda-crt": "13.0.88",
+    "nvidia-cuda-nvcc": "13.0.88",
+    "nvidia-nvvm": "13.0.88",
 }
-# These explicit upgrades/additions reconcile the clone with SGLang 0.5.19
-# and the B200 FlashAttention-4 kernel stack.
-MODAL_REQUIRED_OVERRIDES = {
-    "torch": "2.13.0",
-    "sglang": "0.5.19",
-    "sglang-kernel": "0.4.6.post1",
-    "flashinfer-python": "0.6.18",
-    "apache-tvm-ffi": "0.1.11",
-    "nvidia-cutlass-dsl": "4.6.2",
-    "nvidia-cutlass-dsl-libs-base": "4.6.2",
-    "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
-    "quack-kernels": "0.6.4",
-    "typing_extensions": "4.16.0",
-    "flash-attn-4": "4.0.0b19",
-}
-MODAL_REQUIRED_OVERRIDE_REASONS = {
-    "torch": "SGLang 0.5.19 requires the Torch 2.13 runtime.",
-    "sglang": "Required by Domino and DSpark runtime adapters.",
-    "sglang-kernel": "Must match the SGLang 0.5.19 kernel contract.",
-    "flashinfer-python": "Selected by the SGLang cu13 extra.",
-    "apache-tvm-ffi": "Required by the pinned FlashAttention-4 package stack.",
-    "nvidia-cutlass-dsl": "Required by the pinned FlashAttention-4 package stack.",
-    "nvidia-cutlass-dsl-libs-base": "Required by the pinned FlashAttention-4 package stack.",
-    "nvidia-cutlass-dsl-libs-cu13": "Required by the pinned FlashAttention-4 package stack.",
-    "quack-kernels": "Required by the pinned FlashAttention-4 package stack.",
-    "typing_extensions": "Required by the pinned FlashAttention-4 package stack.",
-    "flash-attn-4": "Provides the Blackwell kernel required by vanilla_fa.",
-}
+MODAL_REQUIRED_OVERRIDES.update(MODAL_CUDA_TOOLCHAIN_OVERRIDES)
+MODAL_RUNTIME_ADDITIONS = {"rouge_score": "0.1.2", "absl-py": "2.5.0"}
 MODAL_REQUIRED_VERSIONS = {
     **MODAL_COMPATIBLE_SOURCE_VERSIONS,
     **MODAL_REQUIRED_OVERRIDES,
+    **MODAL_RUNTIME_ADDITIONS,
 }
+MODAL_REQUIRED_OVERRIDE_REASONS = {
+    "torch": "Pinned in requirements.txt as the CUDA 13 runtime used for B200.",
+    "sglang": "Pinned in requirements.txt for Domino and DSpark speculative serving.",
+    "sglang-kernel": "Must match the SGLang kernel version pinned in requirements.txt.",
+    "flashinfer-python": "Pinned in requirements.txt; installed from the public package index.",
+    "flashinfer-cubin": "Pinned in requirements.txt; installed from the official FlashInfer index.",
+    "apache-tvm-ffi": "FA4 4.0.0b32 requires TVM FFI >=0.1.12,<0.2.",
+    "nvidia-cutlass-dsl": "Pinned FA4/SGLang kernel dependency from requirements.txt.",
+    "nvidia-cutlass-dsl-libs-base": "Pinned FA4 dependency from requirements.txt.",
+    "nvidia-cutlass-dsl-libs-cu13": "Pinned CUDA 13 FA4 dependency from requirements.txt.",
+    "quack-kernels": "Pinned FA4 dependency from requirements.txt.",
+    "typing_extensions": "Pinned FA4 dependency from requirements.txt.",
+    "torch_c_dlpack_ext": "Pinned FA4 dependency from requirements.txt.",
+    "flash-attn-4": "FA4 4.0.0b32 fixes the removed Quack packed-subtraction API and supports Torch 2.13.",
+    "nvidia-cuda-cccl": "Override mixed server headers with CUDA 13.0.85 to match B200 runtime.",
+    "nvidia-cuda-crt": "Override mixed server headers with CUDA 13.0.88 to match B200 runtime.",
+    "nvidia-cuda-nvcc": "Override nvcc 13.2 with CUDA 13.0.88; FlashInfer JIT rejected mixed compiler/headers.",
+    "nvidia-nvvm": "Override NVVM 13.2 with CUDA 13.0.88 to match nvcc/runtime.",
+}
+
+MODAL_SPECIAL_INSTALL_PACKAGE_NAMES = {
+    "torch",
+    "sglang",
+    "flashinfer-python",
+    "flashinfer-cubin",
+    "flash-attn-4",
+    # vLLM is present in the server freeze but is not used by these six baselines.
+    "vllm",
+}
+MODAL_IMAGE_PACKAGE_NAMES = tuple(
+    name
+    for name in MODAL_REQUIREMENT_PINS
+    if name not in MODAL_SPECIAL_INSTALL_PACKAGE_NAMES
+)
+MODAL_PROBE_PACKAGE_NAMES = tuple(
+    dict.fromkeys(
+        (
+            *PACKAGE_NAMES,
+            *MODAL_IMAGE_PACKAGE_NAMES,
+            "sglang",
+            "flashinfer-python",
+            "flashinfer-cubin",
+            "flash-attn-4",
+            *MODAL_RUNTIME_ADDITIONS,
+            "vllm",
+        )
+    )
+)
+MODAL_INSTALL_PIN_NAMES = tuple(
+    name
+    for name in MODAL_REQUIREMENT_PINS
+    if name != "vllm"
+    and name not in MODAL_CUDA_TOOLCHAIN_OVERRIDES
+    and name not in {"flash-attn-4", "apache-tvm-ffi"}
+)
+MODAL_TORCH_INDEX = "https://download.pytorch.org/whl/cu130"
+MODAL_TORCH_SPEC = f"torch=={MODAL_REQUIRED_OVERRIDES['torch']}+cu130"
+MODAL_PYPI_INDEX = "https://pypi.org/simple"
+
+
+def ensure_cuda_runtime_link(cuda_home: Path) -> dict[str, str]:
+    """Expose pip-installed libcudart under CUDA_HOME/lib64 for extension linkers."""
+
+    runtime_root = cuda_home.parent
+    candidates = [
+        path
+        for path in runtime_root.rglob("libcudart.so*")
+        if path.is_file() and "stubs" not in path.parts
+    ]
+    candidates.sort(
+        key=lambda path: (
+            path.name != "libcudart.so",
+            path.parent != cuda_home / "lib",
+            len(path.name),
+            str(path),
+        )
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            f"no pip-installed libcudart.so found under {runtime_root}"
+        )
+    target = candidates[0]
+    lib64 = cuda_home / "lib64"
+    lib64.mkdir(parents=True, exist_ok=True)
+    link = lib64 / "libcudart.so"
+    if link.is_symlink() or link.exists():
+        if link.resolve() == target.resolve():
+            return {"link": str(link), "target": str(target)}
+        link.unlink()
+    link.symlink_to(target)
+    return {"link": str(link), "target": str(target)}
 
 
 def parse_baselines(value: str, allowed: tuple[str, ...] = BASELINES) -> list[str]:
@@ -237,90 +412,168 @@ def validate_smoke_result(
     }
 
 
-def capture_environment_fingerprint(venv_path: Path) -> dict[str, Any]:
-    """Capture relevant pins and Torch/CUDA facts from the source venv."""
+def capture_requirements_fingerprint(
+    requirements_path: Path = REQUIREMENTS_FILE,
+) -> dict[str, Any]:
+    """Fingerprint the declared server package pins without reading its venv."""
 
-    python = Path(venv_path) / "bin" / "python"
-    if not python.is_file():
-        raise FileNotFoundError(f"venv interpreter does not exist: {python}")
-    code = """
-import importlib.metadata as metadata
-import json, platform, sys, torch
-names = __PACKAGE_NAMES__
-packages = {}
-for name in names:
-    try:
-        packages[name] = metadata.version(name)
-    except metadata.PackageNotFoundError:
-        packages[name] = None
-try:
-    cuda_available = torch.cuda.is_available()
-    gpu = torch.cuda.get_device_name(0) if cuda_available else None
-except Exception as exc:
-    cuda_available, gpu = False, None
-    torch_error = f"{type(exc).__name__}: {exc}"
-print(json.dumps({
-    "python": sys.version,
-    "executable": sys.executable,
-    "platform": platform.platform(),
-    "packages": packages,
-    "torch_cuda": torch.version.cuda,
-    "cuda_available": cuda_available,
-    "gpu": gpu,
-    "torch_error": locals().get("torch_error"),
-}, ensure_ascii=False))
-""".replace("__PACKAGE_NAMES__", repr(list(PACKAGE_NAMES)))
-    details = subprocess.run(
-        [str(python), "-c", code],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
-    if details.returncode != 0:
-        raise RuntimeError(f"could not inspect source venv: {details.stdout}")
-    try:
-        fingerprint = json.loads(details.stdout.splitlines()[-1])
-    except (IndexError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"invalid source venv fingerprint: {details.stdout}") from exc
-    frozen = subprocess.run(
-        [str(python), "-m", "pip", "freeze", "--disable-pip-version-check"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
-    fingerprint["pip_freeze"] = frozen.stdout if frozen.returncode == 0 else None
-    fingerprint["pip_freeze_returncode"] = frozen.returncode
-    fingerprint["venv_path"] = str(venv_path)
-    return fingerprint
+    from packaging.utils import canonicalize_name
+
+    pins = parse_requirements_pin_map(requirements_path)
+    direct_reference_names: list[str] = []
+    for raw_line in requirements_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith("#"):
+            from packaging.requirements import Requirement
+
+            requirement = Requirement(line)
+            if requirement.url:
+                direct_reference_names.append(canonicalize_name(requirement.name))
+    return {
+        "kind": "requirements.txt",
+        "requirements_path": str(requirements_path),
+        "requirements_sha256": hashlib.sha256(requirements_path.read_bytes()).hexdigest(),
+        "packages": {
+            name: pins.get(canonicalize_name(name)) for name in PACKAGE_NAMES
+        },
+        "all_exact_pins": pins,
+        "internal_wheel_references_resolved_by_version": sorted(direct_reference_names),
+    }
+
+
+def classify_pip_check_output(
+    output: str,
+    modal_packages: dict[str, Any],
+) -> dict[str, list[str]]:
+    """Separate real dependency gaps from conflicts in the frozen pin set.
+
+    Some packages' upstream metadata disagrees with other explicit versions in
+    the recorded server freeze (for example SGLang/CUTLASS and outlines/core).
+    Such a line is accepted only if both the requiring package and installed
+    dependency exactly match their requirements.txt pins. Missing/unpinned
+    dependencies and unrelated conflicts remain fatal.
+    """
+
+    from packaging.specifiers import SpecifierSet
+    from packaging.utils import canonicalize_name
+    from packaging.version import Version
+
+    package_versions = {
+        canonicalize_name(name): value for name, value in modal_packages.items()
+    }
+
+    def matches_pin(actual: Any, expected: str | None) -> bool:
+        if actual is None or expected is None:
+            return False
+        try:
+            return SpecifierSet(f"=={expected}").contains(
+                Version(str(actual)), prereleases=True
+            )
+        except Exception:
+            return str(actual) == expected
+
+    accepted: list[str] = []
+    errors: list[str] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        allowed = False
+        if " has requirement " in line and ", but you have " in line:
+            try:
+                requiring, detail = line.split(" has requirement ", 1)
+                requiring_name, requiring_version = requiring.rsplit(" ", 1)
+                _, installed = detail.rsplit(", but you have ", 1)
+                installed_name, installed_version = installed.rstrip(".").rsplit(" ", 1)
+                requiring_key = canonicalize_name(requiring_name)
+                installed_key = canonicalize_name(installed_name)
+                requiring_pin = MODAL_REQUIRED_OVERRIDES.get(
+                    requiring_key, MODAL_REQUIREMENT_PINS.get(requiring_key)
+                )
+                installed_pin = MODAL_REQUIRED_OVERRIDES.get(
+                    installed_key, MODAL_REQUIREMENT_PINS.get(installed_key)
+                )
+                allowed = (
+                    matches_pin(package_versions.get(requiring_key), requiring_pin)
+                    and package_versions.get(requiring_key) == requiring_version
+                    and matches_pin(package_versions.get(installed_key), installed_pin)
+                    and package_versions.get(installed_key) == installed_version
+                )
+            except (ValueError, TypeError):
+                allowed = False
+        (accepted if allowed else errors).append(line)
+    return {"requirements_frozen_conflicts": accepted, "errors": errors}
 
 
 def modal_package_policy_issues(
     source_packages: dict[str, Any],
     modal_packages: dict[str, Any],
 ) -> list[str]:
-    """Require clone-compatible pins while enforcing documented runtime overrides."""
+    """Require requirements.txt application pins and B200 runtime stack pins."""
 
     issues: list[str] = []
+    from packaging.specifiers import SpecifierSet
+    from packaging.version import Version
+
+    def matches_pin(actual: Any, expected: str) -> bool:
+        if actual is None:
+            return False
+        try:
+            return SpecifierSet(f"=={expected}").contains(
+                Version(str(actual)), prereleases=True
+            )
+        except Exception:
+            return str(actual) == expected
+
     for name, expected in MODAL_COMPATIBLE_SOURCE_VERSIONS.items():
         source_actual = source_packages.get(name)
         modal_actual = modal_packages.get(name)
-        if source_actual != expected:
+        if not matches_pin(source_actual, expected):
             issues.append(
-                f"source venv pin mismatch {name}: expected {expected}, got {source_actual}"
+                f"requirements compatible pin mismatch {name}: "
+                f"expected {expected}, got {source_actual}"
             )
-        if modal_actual != source_actual:
+        if not matches_pin(modal_actual, expected):
             issues.append(
                 f"clone-compatible package mismatch {name}: "
-                f"source venv {source_actual}, Modal {modal_actual}"
+                f"requirements {expected}, Modal {modal_actual}"
             )
     for name, expected in MODAL_REQUIRED_OVERRIDES.items():
         actual = modal_packages.get(name)
+        if not matches_pin(actual, expected):
+            issues.append(
+                f"requirements B200 runtime pin mismatch {name}: "
+                f"expected {expected}, got {actual}"
+            )
+    for name, expected in MODAL_RUNTIME_ADDITIONS.items():
+        actual = modal_packages.get(name)
         if actual != expected:
             issues.append(
-                f"required B200 runtime override mismatch {name}: "
+                f"required benchmark addition mismatch {name}: "
                 f"expected {expected}, got {actual}"
+            )
+    return issues
+
+
+def modal_requirement_pin_issues(modal_packages: dict[str, Any]) -> list[str]:
+    """Ensure every installed requirements pin is present at its exact version."""
+
+    from packaging.specifiers import SpecifierSet
+    from packaging.version import Version
+
+    issues: list[str] = []
+    for name in MODAL_INSTALL_PIN_NAMES:
+        expected = MODAL_REQUIREMENT_PINS[name]
+        actual = modal_packages.get(name)
+        try:
+            matches = actual is not None and SpecifierSet(f"=={expected}").contains(
+                Version(str(actual)), prereleases=True
+            )
+        except Exception:
+            matches = str(actual) == expected
+        if not matches:
+            issues.append(
+                f"requirements pin mismatch {name}: expected {expected}, got {actual}"
             )
     return issues
 
@@ -392,7 +645,7 @@ def _persist_local_outputs(result: dict[str, Any]) -> Path:
         path.write_text(str(content), encoding="utf-8")
 
     environment = {
-        "source_venv": result.get("source_environment"),
+        "source_requirements": result.get("source_environment"),
         "modal": result.get("modal_environment"),
         "package_differences": result.get("package_differences"),
         "package_policy": result.get("package_policy"),
@@ -413,15 +666,18 @@ def _persist_local_outputs(result: dict[str, Any]) -> Path:
         f"# Báo cáo debug Modal — {run_id}",
         "",
         f"- Kết quả: **{result.get('status', 'unknown')}**",
+        f"- Chế độ benchmark: {result.get('benchmark_mode', 'smoke')}",
+        f"- Giới hạn output: {result.get('max_new_tokens', 8)} token",
         f"- GPU yêu cầu/thực tế: {GPU} / {runtime.get('gpu')}",
         f"- Compute capability: {runtime.get('compute_capability')}",
         f"- CUDA Torch / driver API: {runtime.get('torch_cuda')} / "
         f"{runtime.get('cuda_driver_api')}",
-        f"- Venv nguồn: {(result.get('source_environment') or {}).get('venv_path')}",
+        f"- requirements.txt: {(result.get('source_environment') or {}).get('requirements_path')}",
+        f"- SHA-256: {(result.get('source_environment') or {}).get('requirements_sha256')}",
         "",
-        "## Package pin và override",
+        "## Pin môi trường Modal",
         "",
-        "Các package tương thích được giữ theo venv clone; override bắt buộc:",
+        "Các pin ứng dụng được giữ theo requirements.txt; nhóm CUDA/SGLang/FlashInfer/FA4 được cài theo pin runtime B200:",
     ]
     lines.extend(
         f"- {name}=={version}: {MODAL_REQUIRED_OVERRIDE_REASONS[name]}"
@@ -450,8 +706,9 @@ def _persist_local_outputs(result: dict[str, Any]) -> Path:
             "",
             "## Giới hạn diễn giải",
             "",
-            "Đây là smoke 1 mẫu, đầu ra tối đa 8 token: chỉ xác nhận đường chạy, "
-            "coverage và metric audit; không dùng ROUGE hoặc timing để kết luận "
+            f"Đây là lượt {result.get('benchmark_mode', 'smoke')} 1 mẫu, "
+            f"đầu ra tối đa {result.get('max_new_tokens', 8)} token: "
+            "chỉ xác nhận đường chạy, coverage và metric audit; không dùng ROUGE hoặc timing để kết luận "
             "chất lượng/tốc độ.",
             "Modal B200 xác nhận nhánh kernel Blackwell/SM100; smoke này không "
             "thay thế lần chạy production với master config và cache offline trên server B200.",
@@ -463,77 +720,84 @@ def _persist_local_outputs(result: dict[str, Any]) -> Path:
     (output_dir / "report_vi.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output_dir
 
+def _requirement_pin(name: str) -> str:
+    from packaging.utils import canonicalize_name
+
+    version = MODAL_REQUIREMENT_PINS[canonicalize_name(name)]
+    return f"{name}=={version}"
+
+
 app = modal.App("fast-infer-text-sum-viet-debug")
 
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install(
-        f"torch=={MODAL_REQUIRED_OVERRIDES['torch']}",
-        f"transformers=={MODAL_COMPATIBLE_SOURCE_VERSIONS['transformers']}",
-        f"tokenizers=={MODAL_COMPATIBLE_SOURCE_VERSIONS['tokenizers']}",
-        f"accelerate=={MODAL_COMPATIBLE_SOURCE_VERSIONS['accelerate']}",
-        f"datasets=={MODAL_COMPATIBLE_SOURCE_VERSIONS['datasets']}",
-        f"einops=={MODAL_COMPATIBLE_SOURCE_VERSIONS['einops']}",
-        f"huggingface_hub=={MODAL_COMPATIBLE_SOURCE_VERSIONS['huggingface_hub']}",
-        f"numpy=={MODAL_COMPATIBLE_SOURCE_VERSIONS['numpy']}",
-        f"protobuf=={MODAL_COMPATIBLE_SOURCE_VERSIONS['protobuf']}",
-        f"psutil=={MODAL_COMPATIBLE_SOURCE_VERSIONS['psutil']}",
-        f"rouge_score=={MODAL_COMPATIBLE_SOURCE_VERSIONS['rouge_score']}",
-        f"safetensors=={MODAL_COMPATIBLE_SOURCE_VERSIONS['safetensors']}",
-        f"sentencepiece=={MODAL_COMPATIBLE_SOURCE_VERSIONS['sentencepiece']}",
-        f"tqdm=={MODAL_COMPATIBLE_SOURCE_VERSIONS['tqdm']}",
-        f"regex=={MODAL_COMPATIBLE_SOURCE_VERSIONS['regex']}",
-        f"packaging=={MODAL_COMPATIBLE_SOURCE_VERSIONS['packaging']}",
-        f"Jinja2=={MODAL_COMPATIBLE_SOURCE_VERSIONS['Jinja2']}",
-        f"filelock=={MODAL_COMPATIBLE_SOURCE_VERSIONS['filelock']}",
-        f"sympy=={MODAL_COMPATIBLE_SOURCE_VERSIONS['sympy']}",
-        f"networkx=={MODAL_COMPATIBLE_SOURCE_VERSIONS['networkx']}",
-        f"PyYAML=={MODAL_COMPATIBLE_SOURCE_VERSIONS['PyYAML']}",
-    )
-    .add_local_dir(str(PROJECT_ROOT / "src"), remote_path=str(REMOTE_ROOT / "src"), copy=True)
-    .add_local_dir(
-        str(PROJECT_ROOT / "datasets" / "eval_100"),
-        remote_path=str(REMOTE_DATA),
-        copy=True,
-    )
+# Install the cu130 PyTorch wheel explicitly for B200. The requirement uses the
+# public version (2.13.0); PyTorch's CUDA index supplies its CUDA 13 build.
+image = modal.Image.debian_slim(python_version="3.12").pip_install(
+    MODAL_TORCH_SPEC,
+    extra_options=(
+        f"--index-url {MODAL_TORCH_INDEX} --extra-index-url {MODAL_PYPI_INDEX}"
+    ),
 )
-
-# Keep the large Torch/Transformers layer cacheable independently from the
-# SGLang resolver.  uv is substantially faster here and gives Modal a clear
-# package-install layer instead of making one pip resolver transaction with
-# the whole ML stack.
-image = image.uv_pip_install(
-    # SGLang 0.5.19's cu13 extra pins FlashInfer 0.6.18.  The configured
-    # mirror does not publish a separate 0.6.18 cubin package, so let the
-    # extra select the compatible CUDA artifacts.
-    f"flashinfer-python[cu13]=={MODAL_REQUIRED_OVERRIDES['flashinfer-python']}",
-    f"sglang=={MODAL_REQUIRED_OVERRIDES['sglang']}",
-    # sglang 0.5.19 declares this exact kernel build; 0.4.7 is used by a
-    # newer server manifest and is incompatible with this SGLang release.
-    f"sglang-kernel=={MODAL_REQUIRED_OVERRIDES['sglang-kernel']}",
+# SGLang's published metadata hard-pins an older CUTLASS than the server
+# requirements freeze. Install it without dependency resolution, then install
+# the rest of the frozen SGLang runtime set from exact package/version pins.
+image = image.pip_install(
+    _requirement_pin("sglang"), extra_options="--no-deps"
 )
-# NVIDIA's pip CUDA 13 wheel keeps libcudart under ``lib`` while nvcc/JIT
-# build scripts conventionally link ``$CUDA_HOME/lib64``. Normalize that
-# layout once in the image so SGLang/FlashInfer extensions can link.
-image = image.run_commands(
-    "ln -s /usr/local/lib/python3.12/site-packages/nvidia/cu13/lib "
-    "/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib64 && "
-    "ln -s /usr/local/lib/python3.12/site-packages/nvidia/cu13/lib/libcudart.so.13 "
-    "/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib/libcudart.so"
+# Install the full frozen package set without asking pip to reconcile it. This
+# mirrors the recorded server freeze, whose deliberately overlaid package pins
+# include known upstream Requires-Dist conflicts. Internal wheel URLs were
+# converted to exact name/version pins; only unrelated vLLM is omitted.
+image = image.pip_install(
+    *[_requirement_pin(name) for name in MODAL_IMAGE_PACKAGE_NAMES],
+    "rouge-score==0.1.2",
+    extra_options="--no-deps",
 )
-
-if os.environ.get("MODAL_INSTALL_FA4", "1").strip().lower() in {"1", "true", "yes"}:
-    image = image.pip_install(
-        f"apache-tvm-ffi=={MODAL_REQUIRED_OVERRIDES['apache-tvm-ffi']}",
-        f"nvidia-cutlass-dsl=={MODAL_REQUIRED_OVERRIDES['nvidia-cutlass-dsl']}",
-        f"nvidia-cutlass-dsl-libs-base=={MODAL_REQUIRED_OVERRIDES['nvidia-cutlass-dsl-libs-base']}",
-        f"nvidia-cutlass-dsl-libs-cu13=={MODAL_REQUIRED_OVERRIDES['nvidia-cutlass-dsl-libs-cu13']}",
-        f"quack-kernels=={MODAL_REQUIRED_OVERRIDES['quack-kernels']}",
-        "torch_c_dlpack_ext==0.1.5",
-        f"typing_extensions=={MODAL_REQUIRED_OVERRIDES['typing_extensions']}",
-        f"flash-attn-4=={MODAL_REQUIRED_OVERRIDES['flash-attn-4']}",
-        extra_options="--no-deps",
-    )
+# Correct only CUDA compiler/header components whose requirements.txt versions
+# produced an incompatible FlashInfer JIT toolchain (nvcc 13.2, headers 13.3).
+# cuda-toolkit 13.0.3.0 publishes this matched CUDA 13.0 component set.
+image = image.pip_install(
+    f"cuda-toolkit[cccl,crt,nvcc,nvvm]=={MODAL_REQUIREMENT_PINS['cuda-toolkit']}"
+)
+# rouge-score has one runtime dependency absent from the requirements freeze.
+image = image.pip_install("absl-py==2.5.0", extra_options="--no-deps")
+# FlashInfer Python is on PyPI; its matching cubins are served from the official
+# FlashInfer index. Keep both versions equal to the internal wheel filenames.
+image = image.pip_install(
+    _requirement_pin("flashinfer-python"),
+    extra_options="--no-deps --extra-index-url https://flashinfer.ai/whl",
+)
+image = image.pip_install(
+    _requirement_pin("flashinfer-cubin"),
+    extra_options="--no-deps --index-url https://flashinfer.ai/whl",
+)
+# FA4's frozen b19 uses a Quack API removed by the requirements.txt Quack pin.
+# Install the upstream API fix plus its required TVM FFI version without letting
+# its metadata alter unrelated packages in the recorded server freeze.
+image = image.pip_install(
+    f"apache-tvm-ffi=={MODAL_REQUIRED_OVERRIDES['apache-tvm-ffi']}",
+    extra_options="--no-deps",
+)
+image = image.pip_install(
+    f"flash-attn-4=={MODAL_REQUIRED_OVERRIDES['flash-attn-4']}",
+    extra_options="--no-deps",
+)
+# SGLang is installed after its complete dependency pin set so its published
+# metadata cannot replace the selected runtime versions.
+image = image.pip_install(
+    _requirement_pin("sglang"), extra_options="--no-deps"
+)
+image = image.add_local_file(
+    str(REQUIREMENTS_FILE),
+    remote_path=str(REMOTE_ROOT / "requirements.txt"),
+    copy=True,
+)
+image = image.add_local_dir(
+    str(PROJECT_ROOT / "src"), remote_path=str(REMOTE_ROOT / "src"), copy=True
+).add_local_dir(
+    str(PROJECT_ROOT / "datasets" / "eval_100"),
+    remote_path=str(REMOTE_DATA),
+    copy=True,
+)
 
 for _name in ("EAGLE", "dflash", "Domino", "SpecForge"):
     image = image.add_local_dir(
@@ -550,6 +814,8 @@ def _child_env(
     hf_home: Path,
     run_root: Path,
     output_dir: Path,
+    max_new_tokens: int = 8,
+    benchmark_mode: str = "smoke",
 ) -> dict[str, str]:
     env = dict(os.environ)
     pythonpath = [
@@ -560,6 +826,10 @@ def _child_env(
         str(REMOTE_ROOT / "externals" / "SpecForge"),
     ]
     hf_hub_cache = hf_home / "hub"
+    cuda_home = Path(
+        os.environ.get("CUDA_HOME", "/usr/local/lib/python3.12/site-packages/nvidia/cu13")
+    )
+    cuda_library_paths = [str(cuda_home / "lib64"), str(cuda_home / "lib")]
     env.update(
         {
             "PYTHONPATH": os.pathsep.join(pythonpath),
@@ -580,11 +850,17 @@ def _child_env(
                 "CUDA_HOME", "/usr/local/lib/python3.12/site-packages/nvidia/cu13"
             ),
             "LD_LIBRARY_PATH": os.pathsep.join(
-                (
-                    os.environ.get("LD_LIBRARY_PATH", ""),
-                    "/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib",
+                filter(
+                    None,
+                    [os.environ.get("LD_LIBRARY_PATH", ""), *cuda_library_paths],
                 )
-            ).strip(os.pathsep),
+            ),
+            "LIBRARY_PATH": os.pathsep.join(
+                filter(
+                    None,
+                    [os.environ.get("LIBRARY_PATH", ""), *cuda_library_paths],
+                )
+            ),
             "MODEL_TARGET": model_paths["target"],
             "LONG_BENCH_MODEL": model_paths["target"],
             "MODEL_EAGLE_DRAFT": model_paths.get("eagle3", EAGLE_MODEL),
@@ -600,14 +876,19 @@ def _child_env(
             "LONG_BENCH_DEVICE": "cuda",
             "LONG_BENCH_GPU_IDS": "0",
             "LONG_BENCH_LOCAL_FILES_ONLY": "1",
-            "LONG_BENCH_MODE": "smoke",
+            "LONG_BENCH_MODE": benchmark_mode,
             "LONG_BENCH_BASELINES": baselines,
             "LONG_BENCH_DATASETS": "vietnews",
-            "LONG_BENCH_MAX_NEW_TOKENS": "8",
-            "LONG_BENCH_SMOKE_MAX_NEW_TOKENS": "8",
+            "LONG_BENCH_MAX_NEW_TOKENS": str(max_new_tokens),
+            "LONG_BENCH_SMOKE_MAX_NEW_TOKENS": str(max_new_tokens),
             "LONG_BENCH_MAX_INPUT_TOKENS": "4096",
             "LONG_BENCH_SMOKE_MAX_INPUT_TOKENS": "4096",
             "LONG_BENCH_WARMUP_RUNS": "1",
+            "LONG_BENCH_BATCH_SIZE": "1",
+            "LONG_BENCH_MAX_RUNNING_REQUESTS": "1",
+            "LONG_BENCH_MEM_FRACTION_STATIC": os.environ.get(
+                "MODAL_SGLANG_MEM_FRACTION_STATIC", "0.75"
+            ),
             "LONG_BENCH_SEED": "42",
             "LONG_BENCH_TEMPERATURE": "0",
             "LONG_BENCH_STRICT": "1",
@@ -620,7 +901,7 @@ def _child_env(
                 "MODAL_VANILLA_ATTENTION_BACKEND", "flash_attention_4"
             ),
             "LONG_BENCH_SGLANG_ATTENTION_BACKEND": os.environ.get(
-                "MODAL_SGLANG_ATTENTION_BACKEND", "triton"
+                "MODAL_SGLANG_ATTENTION_BACKEND", "flashinfer"
             ),
             "PYTHONUNBUFFERED": "1",
             "TOKENIZERS_PARALLELISM": "false",
@@ -800,6 +1081,8 @@ def debug(
     dflash_model: str = DFLASH_MODEL,
     domino_model: str = DOMINO_MODEL,
     dspark_model: str = DSPARK_MODEL,
+    max_new_tokens: int = 8,
+    benchmark_mode: str = "smoke",
 ) -> dict[str, Any]:
     """Run focused DSpark first, then the six-baseline regression on one B200."""
 
@@ -808,6 +1091,12 @@ def debug(
     if action not in {"smoke", "debug"}:
         raise ValueError(f"unsupported action: {action}")
     selected_baselines = ["dspark"] if action == "smoke" else parse_baselines(baselines)
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be a positive integer")
+    if benchmark_mode not in {"smoke", "representative"}:
+        raise ValueError("benchmark_mode must be smoke or representative")
+    if action == "smoke" and benchmark_mode != "smoke":
+        raise ValueError("action=smoke requires benchmark_mode=smoke")
     run_root = REMOTE_RUN_ROOT / run_id
     hf_home = run_root / "hf"
     hf_cache = hf_home / "hub"
@@ -847,6 +1136,14 @@ def debug(
                 if role:
                     needed_roles.add(role)
 
+        cuda_runtime_link = ensure_cuda_runtime_link(
+            Path(os.environ.get("CUDA_HOME", "/usr/local/lib/python3.12/site-packages/nvidia/cu13"))
+        )
+        print(
+            "[preflight] CUDA runtime linker alias: "
+            f"{cuda_runtime_link['link']} -> {cuda_runtime_link['target']}",
+            flush=True,
+        )
         requested_models = {role: model_ids[role] for role in sorted(needed_roles)}
         local_paths, checkpoints = _download_checkpoints(
             cache_dir=hf_cache,
@@ -858,6 +1155,8 @@ def debug(
 import importlib.metadata as metadata
 import importlib.util
 import json
+import os
+from pathlib import Path
 import platform
 import subprocess
 import sys
@@ -891,14 +1190,34 @@ try:
             algorithms[name] = f"ERROR: {type(exc).__name__}: {exc}"
 except Exception as exc:
     algorithms["import_error"] = f"{type(exc).__name__}: {exc}"
+fa4_importable = False
+fa4_import_error = None
 try:
-    fa4_importable = importlib.util.find_spec("flash_attn.cute") is not None
-except Exception:
-    fa4_importable = False
+    from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+    fa4_importable = callable(flash_attn_func) and callable(flash_attn_varlen_func)
+except Exception as exc:
+    fa4_import_error = f"{type(exc).__name__}: {exc}"
+flashinfer_importable = False
+flashinfer_import_error = None
+try:
+    import flashinfer
+    flashinfer_importable = True
+except Exception as exc:
+    flashinfer_import_error = f"{type(exc).__name__}: {exc}"
 smi = subprocess.run(["nvidia-smi"], text=True, stdout=subprocess.PIPE,
                      stderr=subprocess.STDOUT, check=False)
 smi_text = smi.stdout if smi.returncode == 0 else f"nvidia-smi exit {smi.returncode}: {smi.stdout}"
 driver_api = None
+cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+nvcc_path = Path(cuda_home) / "bin" / "nvcc"
+nvcc = subprocess.run([str(nvcc_path), "--version"], text=True,
+                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+nvcc_text = nvcc.stdout if nvcc.returncode == 0 else f"nvcc exit {nvcc.returncode}: {nvcc.stdout}"
+nvcc_release = None
+for line in nvcc_text.splitlines():
+    if "release " in line:
+        nvcc_release = line.split("release ", 1)[1].split(",", 1)[0].strip()
+        break
 for line in smi_text.splitlines():
     if "CUDA Version:" in line:
         driver_api = line.split("CUDA Version:", 1)[1].split("|", 1)[0].strip()
@@ -913,11 +1232,17 @@ print(json.dumps({
     "compute_capability": capability,
     "torch_error": torch_error,
     "cuda_driver_api": driver_api,
+    "nvcc_release": nvcc_release,
+    "nvcc_path": str(nvcc_path),
+    "nvcc_version_output": nvcc_text,
     "nvidia_smi": smi_text,
     "algorithms": algorithms,
     "flash_attention_4_importable": fa4_importable,
+    "flash_attention_4_import_error": fa4_import_error,
+    "flashinfer_importable": flashinfer_importable,
+    "flashinfer_import_error": flashinfer_import_error,
 }, ensure_ascii=False))
-""".replace("__PACKAGE_NAMES__", repr(list(PACKAGE_NAMES)))
+""".replace("__PACKAGE_NAMES__", repr(list(MODAL_PROBE_PACKAGE_NAMES)))
         probe_env = _child_env(
             baselines="dspark",
             model_paths=local_paths,
@@ -936,6 +1261,7 @@ print(json.dumps({
         if probe["returncode"] != 0:
             raise RuntimeError(f"runtime probe failed: {probe['output_tail']}")
         modal_environment = json.loads(probe["output_tail"].splitlines()[-1])
+        modal_environment["cuda_runtime_link"] = cuda_runtime_link
         pip_check = _run(
             [sys.executable, "-m", "pip", "check"],
             env=probe_env,
@@ -954,20 +1280,25 @@ print(json.dumps({
         logs["pip_freeze"] = (log_root / "pip_freeze.log").read_text(encoding="utf-8")
         modal_environment["pip_check_returncode"] = pip_check["returncode"]
         modal_environment["pip_check"] = logs["pip_check"]
+        modal_environment["pip_check_policy"] = classify_pip_check_output(
+            logs["pip_check"], modal_environment.get("packages") or {}
+        )
         modal_environment["pip_freeze_returncode"] = pip_freeze["returncode"]
         modal_environment["pip_freeze"] = logs["pip_freeze"]
 
         source_packages = source_environment.get("packages") or {}
         modal_packages = modal_environment.get("packages") or {}
         package_differences = {
-            name: {"source_venv": source_packages.get(name), "modal": modal_packages.get(name)}
+            name: {"requirements": source_packages.get(name), "modal": modal_packages.get(name)}
             for name in PACKAGE_NAMES
             if source_packages.get(name) != modal_packages.get(name)
         }
         preflight_issues: list[str] = []
-        if modal_environment.get("pip_check_returncode") != 0:
+        pip_check_policy = modal_environment.get("pip_check_policy") or {}
+        if pip_check_policy.get("errors"):
             preflight_issues.append(
-                f"pip check failed: {modal_environment.get('pip_check')}"
+                "pip check found non-requirements dependency errors: "
+                + " | ".join(pip_check_policy["errors"])
             )
         if modal_environment.get("pip_freeze_returncode") != 0:
             preflight_issues.append("could not capture the Modal package fingerprint")
@@ -978,19 +1309,51 @@ print(json.dumps({
             preflight_issues.append(
                 f"expected Torch CUDA 13.0, got {modal_environment.get('torch_cuda')}"
             )
-        if modal_environment.get("cuda_driver_api") != "13.0":
+        driver_api = str(modal_environment.get("cuda_driver_api") or "")
+        try:
+            driver_version = tuple(int(part) for part in driver_api.split(".")[:2])
+        except ValueError:
+            driver_version = ()
+        if driver_version < (13, 0):
             preflight_issues.append(
-                f"expected driver API 13.0, got {modal_environment.get('cuda_driver_api')}"
+                f"expected driver API >=13.0, got {driver_api or 'unknown'}"
             )
-        if "ERROR" in str(modal_environment.get("algorithms", {}).get("DSPARK", "")):
+        if modal_environment.get("nvcc_release") != "13.0":
             preflight_issues.append(
-                f"SGLang DSPARK parse failed: {modal_environment.get('algorithms')}"
+                "expected matched CUDA compiler release 13.0, got "
+                f"{modal_environment.get('nvcc_release') or 'unknown'} "
+                f"at {modal_environment.get('nvcc_path')}"
+            )
+        if not Path(cuda_runtime_link["link"]).is_file():
+            preflight_issues.append(
+                f"CUDA runtime linker alias is missing: {cuda_runtime_link['link']}"
+            )
+        algorithms = modal_environment.get("algorithms", {})
+        for algorithm in ("DFLASH", "DSPARK"):
+            if "ERROR" in str(algorithms.get(algorithm, "")):
+                preflight_issues.append(
+                    f"SGLang {algorithm} parse failed: {algorithms}"
+                )
+        if not modal_environment.get("flashinfer_importable"):
+            preflight_issues.append(
+                "FlashInfer import failed: "
+                f"{modal_environment.get('flashinfer_import_error')}"
+            )
+        if modal_packages.get("flashinfer-python") != modal_packages.get("flashinfer-cubin"):
+            preflight_issues.append(
+                "FlashInfer Python/cubin versions differ: "
+                f"{modal_packages.get('flashinfer-python')} vs "
+                f"{modal_packages.get('flashinfer-cubin')}"
             )
         preflight_issues.extend(
             modal_package_policy_issues(source_packages, modal_packages)
         )
+        preflight_issues.extend(modal_requirement_pin_issues(modal_packages))
         if not modal_environment.get("flash_attention_4_importable"):
-            preflight_issues.append("flash_attn.cute is not importable")
+            preflight_issues.append(
+                "FlashAttention-4 symbol import failed: "
+                f"{modal_environment.get('flash_attention_4_import_error')}"
+            )
         preflight_issues.extend(
             f"checkpoint {role} missing config or weights"
             for role, item in checkpoints.items()
@@ -1018,17 +1381,19 @@ print(json.dumps({
                     hf_home=hf_home,
                     run_root=run_root,
                     output_dir=stage_output,
+                    max_new_tokens=max_new_tokens,
+                    benchmark_mode=benchmark_mode,
                 )
                 command = [
                     sys.executable,
                     str(REMOTE_ROOT / "src" / "Benchmark" / "run_longbench_200.py"),
-                    "--mode", "smoke",
+                    "--mode", benchmark_mode,
                     "--baselines", ",".join(stage_baselines),
                     "--datasets", "vietnews",
                     "--data-dir", str(REMOTE_DATA),
                     "--output-dir", str(stage_output),
                     "--max-samples", "1",
-                    "--max-new-tokens", "8",
+                    "--max-new-tokens", str(max_new_tokens),
                     "--max-input-tokens", "4096",
                     "--warmup-runs", "1",
                     "--sample-retries", "0",
@@ -1114,6 +1479,8 @@ print(json.dumps({
     return {
         "run_id": run_id,
         "action": action,
+        "benchmark_mode": benchmark_mode,
+        "max_new_tokens": max_new_tokens,
         "status": overall_status,
         "gpu_requested": GPU,
         "modal_environment": modal_environment,
@@ -1145,13 +1512,13 @@ def main(
     dflash_model: str = DFLASH_MODEL,
     domino_model: str = DOMINO_MODEL,
     dspark_model: str = DSPARK_MODEL,
+    max_new_tokens: int = 8,
+    benchmark_mode: str = "smoke",
 ) -> None:
-    if not (LOCAL_VENV / "bin" / "python").is_file():
-        raise SystemExit(f"FAST_INFER_VENV interpreter does not exist: {LOCAL_VENV}")
     if action not in {"smoke", "debug"}:
         raise SystemExit("action must be smoke or debug")
     selected = parse_baselines(baselines or baseline) if action == "debug" else ["dspark"]
-    source_environment = capture_environment_fingerprint(LOCAL_VENV)
+    source_environment = capture_requirements_fingerprint()
     selected_run_id = run_id or (
         time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         + "-"
@@ -1168,6 +1535,8 @@ def main(
             dflash_model=dflash_model,
             domino_model=domino_model,
             dspark_model=dspark_model,
+            max_new_tokens=max_new_tokens,
+            benchmark_mode=benchmark_mode,
         )
     except Exception as exc:
         failure = {

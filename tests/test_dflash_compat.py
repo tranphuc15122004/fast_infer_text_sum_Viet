@@ -67,3 +67,30 @@ def test_dflash_normalizes_qwen_stop_ids_for_llama_vocab() -> None:
     }
     assert Config.bos_token_id == 128000
     assert Config.eos_token_id == 128001
+
+
+def test_dflash_warmup_calls_generation_before_measurement(monkeypatch) -> None:
+    from Benchmark import infer_dflash
+
+    calls = []
+
+    def record_generation(*args, **kwargs):
+        calls.append(kwargs)
+        return None, 0.0
+
+    monkeypatch.setattr(infer_dflash, "_run_generation", record_generation)
+    infer_dflash._warmup_generation(
+        dflash_generate=object(),
+        draft=object(),
+        target=object(),
+        input_ids=object(),
+        warmup_runs=2,
+        max_new_tokens=8,
+        temperature=0.0,
+        block_size=16,
+    )
+
+    assert calls == [
+        {"max_new_tokens": 8, "temperature": 0.0, "block_size": 16},
+        {"max_new_tokens": 8, "temperature": 0.0, "block_size": 16},
+    ]

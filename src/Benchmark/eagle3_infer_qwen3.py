@@ -42,25 +42,10 @@ from Benchmark.common.input_utils import truncate_input_ids  # noqa: E402
 from Benchmark.common.reproducibility import seed_everything  # noqa: E402
 
 
-EAGLE_LLAMA3_SYSTEM_PROMPT = (
-    "You are a helpful, respectful and honest assistant. Always answer as "
-    "helpfully as possible, while being safe.  Your answers should not include "
-    "any harmful, unethical, racist, sexist, toxic, dangerous, or illegal "
-    "content. Please ensure that your responses are socially unbiased and "
-    "positive in nature.\n\nIf a question does not make any sense, or is not "
-    "factually coherent, explain why instead of answering something not "
-    "correct. If you don't know the answer to a question, please don't share "
-    "false information."
-)
-
-
 def build_eagle_messages(prompt: str) -> list[dict[str, str]]:
-    """Use the system+user chat contract from upstream Llama-3 EAGLE."""
+    """Keep the same user-only message content used by other baselines."""
 
-    return [
-        {"role": "system", "content": EAGLE_LLAMA3_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
-    ]
+    return [{"role": "user", "content": prompt}]
 
 
 def resolve_eagle_tree_config(

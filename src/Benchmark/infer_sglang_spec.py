@@ -25,6 +25,7 @@ from Benchmark.common import io_util, metrics, rouge
 from Benchmark.common.benchmark_runtime import build_sample_record, runtime_metadata
 from Benchmark.common.data_loader import load_records
 from Benchmark.common.input_utils import truncate_input_ids
+from Benchmark.common.prompt_format import format_chat_prompt
 from Benchmark.common.reproducibility import seed_everything
 
 
@@ -237,9 +238,12 @@ def _load_request_tokenizer(model: str, *, local_files_only: bool):
 
 
 def _prepare_prompt(prompt: str, tokenizer: Any | None, max_input_tokens: int) -> str:
-    """Apply the shared head+tail input cap before SGLang tokenizes the text."""
+    """Chat-frame the prompt and apply the shared token cap before serving."""
 
-    if tokenizer is None or max_input_tokens <= 0:
+    if tokenizer is None:
+        return prompt
+    prompt = format_chat_prompt(tokenizer, prompt)
+    if max_input_tokens <= 0:
         return prompt
     encoded = tokenizer(
         prompt,

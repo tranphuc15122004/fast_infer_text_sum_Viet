@@ -702,6 +702,8 @@ def build_adapter_command(
             temperature,
             "--seed",
             seed,
+            "--warmup-runs",
+            warmup,
             "--output",
             str(output),
         ] + (["--smoke"] if smoke else [])

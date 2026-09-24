@@ -19,9 +19,13 @@ import torch
 from Benchmark.common import io_util, metrics, rouge, verify
 from Benchmark.common.data_loader import load_records
 from Benchmark.common.input_utils import truncate_input_ids
+from Benchmark.common.prompt_format import format_chat_prompt
 from Benchmark.common.paths import ROOT
 from Benchmark.common.reproducibility import seed_everything
-from Benchmark.dflash_compat import install_dflash_transformers_compat
+from Benchmark.dflash_compat import (
+    install_dflash_cache_crop_compat,
+    install_dflash_transformers_compat,
+)
 
 
 # DFlash is vendored rather than installed into the shared server Python.
@@ -128,30 +132,10 @@ def _dtype_and_attention() -> tuple[torch.dtype, str]:
     return dtype, requested
 
 
-def _chat_prompt(tokenizer, prompt: str) -> str:
-    if not getattr(tokenizer, "chat_template", None):
-        return prompt
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-    except TypeError:
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-
-
 def _format_prompt(tokenizer, sample: dict) -> str:
-    """Avoid applying a second chat template to rendered LongBench prompts."""
+    """Use the same target-model chat framing as the other benchmark adapters."""
 
-    raw = sample.get("raw") or {}
-    if raw.get("dataset") in _CANONICAL_LONGBENCH_DATASETS:
-        return sample["prompt"]
-    return _chat_prompt(tokenizer, sample["prompt"])
+    return format_chat_prompt(tokenizer, sample["prompt"])
 
 
 def _run_generation(dflash_generate, draft, target, input_ids, *, max_new_tokens,
@@ -181,6 +165,32 @@ def _timings(result, elapsed_s: float) -> tuple[float, float, float]:
     return prefill_ms, decode_ms, e2e_ms
 
 
+def _warmup_generation(
+    dflash_generate,
+    draft,
+    target,
+    input_ids,
+    *,
+    warmup_runs: int,
+    max_new_tokens: int,
+    temperature: float,
+    block_size: int,
+) -> None:
+    """Warm DFlash's first-generation kernels outside measured timings."""
+
+    warmup_new_tokens = max(1, min(int(max_new_tokens), 8))
+    for _ in range(max(int(warmup_runs), 0)):
+        _run_generation(
+            dflash_generate,
+            draft,
+            target,
+            input_ids,
+            max_new_tokens=warmup_new_tokens,
+            temperature=temperature,
+            block_size=block_size,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-model", required=True)
@@ -193,6 +203,7 @@ def main() -> None:
                         help="truncate each prompt to this many tokens before "
                              "generation (0 = no limit; use on T4 smoke runs)")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--warmup-runs", type=int, default=3)
     parser.add_argument(
         "--seed",
         type=int,
@@ -215,7 +226,11 @@ def main() -> None:
     dtype, attn_impl = _dtype_and_attention()
     install_dflash_transformers_compat()
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-    from dflash.model import DFlashDraftModel, dflash_generate
+    import dflash.model as dflash_model
+
+    install_dflash_cache_crop_compat(dflash_model)
+    DFlashDraftModel = dflash_model.DFlashDraftModel
+    dflash_generate = dflash_model.dflash_generate
 
     device = torch.device("cuda:0")
     tokenizer = AutoTokenizer.from_pretrained(args.target_model)
@@ -259,15 +274,38 @@ def main() -> None:
     block_size = args.block_size or int(draft.block_size)
     writer = io_util.JsonlWriter(Path(args.output))
     checks: list[tuple[bool, str]] = []
+    did_warmup = False
 
     for sample in prompts:
         prompt = _format_prompt(tokenizer, sample)
-        encoded = tokenizer(prompt, return_tensors="pt")
+        encoded = tokenizer(
+            prompt, return_tensors="pt", add_special_tokens=False
+        )
         input_ids = encoded.input_ids.to(device)
         if args.max_input_tokens and args.max_input_tokens > 0 \
                 and input_ids.shape[1] > args.max_input_tokens:
             input_ids = truncate_input_ids(input_ids, args.max_input_tokens).contiguous()
         input_len = int(input_ids.shape[1])
+
+        if not did_warmup:
+            warmup_new_tokens = max(1, min(int(args.max_new_tokens), 8))
+            _warmup_generation(
+                dflash_generate,
+                draft,
+                target,
+                input_ids,
+                warmup_runs=args.warmup_runs,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                block_size=block_size,
+            )
+            print(
+                "[dflash] warmup complete: "
+                f"runs={max(args.warmup_runs, 0)} "
+                f"max_new_tokens={warmup_new_tokens}",
+                flush=True,
+            )
+            did_warmup = True
 
         if args.skip_reference:
             baseline, baseline_elapsed = None, None
