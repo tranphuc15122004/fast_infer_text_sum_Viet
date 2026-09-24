@@ -179,3 +179,32 @@ def test_vanilla_fa_preflight_uses_fa4_on_blackwell_without_importing_fa2(
     assert result["requirements"]["flash_attention_4"]["available"] is True
     assert result["requirements"]["flash_attention_4"]["auto_selected_for_blackwell"]
     assert probed_modules == ["flash_attn.cute"]
+
+
+def test_vanilla_fa_preflight_classifies_fa4_import_failure_as_dependency_error(
+    monkeypatch,
+) -> None:
+    from Benchmark.common import longbench_adapter
+
+    fa4_error = (
+        "ImportError: /venv/site-packages/flash_attn_2_cuda.so: "
+        "undefined symbol: materialize_cow_storage"
+    )
+    monkeypatch.setattr(
+        longbench_adapter, "_local_requirement", lambda _path: (True, None)
+    )
+    monkeypatch.setattr(longbench_adapter, "_cuda_compute_capability", lambda: (10, 0))
+    monkeypatch.setattr(
+        longbench_adapter,
+        "_module_importable",
+        lambda name: (False, fa4_error) if name == "flash_attn.cute" else (True, None),
+    )
+
+    result = longbench_adapter.preflight_baseline(
+        "vanilla_fa",
+        {"model": "/models/Qwen3-4B"},
+        cuda_available=True,
+    )
+
+    assert result["status"] == "missing_dependency"
+    assert fa4_error in result["reason"]

@@ -8,8 +8,8 @@ temporary job filesystem, so this runner creates no persistent Volume.
 Example::
 
     FAST_INFER_VENV=/home/tuantb/fast_infer_text_sum/.venv \
-    MODAL_GPU='H100!' \
-    modal run scripts/modal_benchmark_debug.py
+    MODAL_GPU=B200 \
+    modal run scripts/modal_benchmark_debug.py --action smoke
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from typing import Any
@@ -29,7 +30,7 @@ import modal
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REMOTE_ROOT = Path("/workspace/repo")
 REMOTE_RUN_ROOT = Path("/tmp/fast-infer-modal-debug")
-GPU = os.environ.get("MODAL_GPU", "H100!")
+GPU = os.environ.get("MODAL_GPU", "B200")
 LOCAL_VENV = Path(
     os.environ.get("FAST_INFER_VENV", "/home/tuantb/fast_infer_text_sum/.venv")
 )
@@ -61,6 +62,24 @@ PACKAGE_NAMES = (
     "torch",
     "transformers",
     "tokenizers",
+    "accelerate",
+    "datasets",
+    "einops",
+    "huggingface_hub",
+    "numpy",
+    "protobuf",
+    "psutil",
+    "rouge_score",
+    "safetensors",
+    "sentencepiece",
+    "tqdm",
+    "regex",
+    "packaging",
+    "Jinja2",
+    "filelock",
+    "sympy",
+    "networkx",
+    "PyYAML",
     "sglang",
     "sglang-kernel",
     "flashinfer-python",
@@ -72,17 +91,67 @@ PACKAGE_NAMES = (
     "quack-kernels",
     "torch_c_dlpack_ext",
     "nvidia-cutlass-dsl",
+    "nvidia-cutlass-dsl-libs-base",
+    "nvidia-cutlass-dsl-libs-cu13",
+    "typing_extensions",
     "modal",
 )
-MODAL_REQUIRED_VERSIONS = {
-    # SGLang 0.5.19 pins Torch 2.13.0; the local venv's 2.11.0 cannot be retained.
-    "torch": "2.13.0",
+# Keep packages from the cloned B200 environment unchanged when they do not
+# conflict with the required speculative/B200 kernel stack.
+MODAL_COMPATIBLE_SOURCE_VERSIONS = {
     "transformers": "5.12.1",
     "tokenizers": "0.22.2",
+    "accelerate": "1.15.0",
+    "datasets": "5.0.1",
+    "einops": "0.8.2",
+    "huggingface_hub": "1.31.0",
+    "numpy": "2.2.6",
+    "protobuf": "6.33.6",
+    "psutil": "7.2.2",
+    "rouge_score": "0.1.2",
+    "safetensors": "0.8.0",
+    "sentencepiece": "0.2.2",
+    "tqdm": "4.70.1",
+    "regex": "2026.6.28",
+    "packaging": "26.2",
+    "Jinja2": "3.1.6",
+    "filelock": "3.29.4",
+    "sympy": "1.14.0",
+    "networkx": "3.6.1",
+    "PyYAML": "6.0.3",
+    "torch_c_dlpack_ext": "0.1.5",
+}
+# These explicit upgrades/additions reconcile the clone with SGLang 0.5.19
+# and the B200 FlashAttention-4 kernel stack.
+MODAL_REQUIRED_OVERRIDES = {
+    "torch": "2.13.0",
     "sglang": "0.5.19",
     "sglang-kernel": "0.4.6.post1",
     "flashinfer-python": "0.6.18",
+    "apache-tvm-ffi": "0.1.11",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "nvidia-cutlass-dsl-libs-base": "4.6.2",
+    "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+    "quack-kernels": "0.6.4",
+    "typing_extensions": "4.16.0",
     "flash-attn-4": "4.0.0b19",
+}
+MODAL_REQUIRED_OVERRIDE_REASONS = {
+    "torch": "SGLang 0.5.19 requires the Torch 2.13 runtime.",
+    "sglang": "Required by Domino and DSpark runtime adapters.",
+    "sglang-kernel": "Must match the SGLang 0.5.19 kernel contract.",
+    "flashinfer-python": "Selected by the SGLang cu13 extra.",
+    "apache-tvm-ffi": "Required by the pinned FlashAttention-4 package stack.",
+    "nvidia-cutlass-dsl": "Required by the pinned FlashAttention-4 package stack.",
+    "nvidia-cutlass-dsl-libs-base": "Required by the pinned FlashAttention-4 package stack.",
+    "nvidia-cutlass-dsl-libs-cu13": "Required by the pinned FlashAttention-4 package stack.",
+    "quack-kernels": "Required by the pinned FlashAttention-4 package stack.",
+    "typing_extensions": "Required by the pinned FlashAttention-4 package stack.",
+    "flash-attn-4": "Provides the Blackwell kernel required by vanilla_fa.",
+}
+MODAL_REQUIRED_VERSIONS = {
+    **MODAL_COMPATIBLE_SOURCE_VERSIONS,
+    **MODAL_REQUIRED_OVERRIDES,
 }
 
 
@@ -227,6 +296,67 @@ print(json.dumps({
     return fingerprint
 
 
+def modal_package_policy_issues(
+    source_packages: dict[str, Any],
+    modal_packages: dict[str, Any],
+) -> list[str]:
+    """Require clone-compatible pins while enforcing documented runtime overrides."""
+
+    issues: list[str] = []
+    for name, expected in MODAL_COMPATIBLE_SOURCE_VERSIONS.items():
+        source_actual = source_packages.get(name)
+        modal_actual = modal_packages.get(name)
+        if source_actual != expected:
+            issues.append(
+                f"source venv pin mismatch {name}: expected {expected}, got {source_actual}"
+            )
+        if modal_actual != source_actual:
+            issues.append(
+                f"clone-compatible package mismatch {name}: "
+                f"source venv {source_actual}, Modal {modal_actual}"
+            )
+    for name, expected in MODAL_REQUIRED_OVERRIDES.items():
+        actual = modal_packages.get(name)
+        if actual != expected:
+            issues.append(
+                f"required B200 runtime override mismatch {name}: "
+                f"expected {expected}, got {actual}"
+            )
+    return issues
+
+
+def modal_gpu_preflight_issues(
+    modal_environment: dict[str, Any],
+    *,
+    requested_gpu: str = GPU,
+) -> list[str]:
+    """Require an actual B200 with CUDA and Blackwell compute capability."""
+
+    issues: list[str] = []
+    if not modal_environment.get("cuda_available"):
+        issues.append(
+            "torch.cuda.is_available is false: "
+            f"{modal_environment.get('torch_error')}"
+        )
+    requested_type = requested_gpu.split(":", 1)[0].rstrip("!")
+    if requested_type != "B200":
+        issues.append(f"expected a B200 GPU request, got {requested_gpu}")
+    gpu_name = str(modal_environment.get("gpu") or "")
+    if "B200" not in gpu_name:
+        issues.append(f"expected Modal B200, got {gpu_name or 'no GPU'}")
+    capability = modal_environment.get("compute_capability")
+    if (
+        not isinstance(capability, (list, tuple))
+        or not capability
+        or int(capability[0]) < 10
+    ):
+        issues.append(
+            "expected Blackwell compute capability (SM100 or newer), "
+            f"got {capability}"
+        )
+    return issues
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -265,6 +395,7 @@ def _persist_local_outputs(result: dict[str, Any]) -> Path:
         "source_venv": result.get("source_environment"),
         "modal": result.get("modal_environment"),
         "package_differences": result.get("package_differences"),
+        "package_policy": result.get("package_policy"),
         "checkpoints": result.get("checkpoints"),
     }
     _write_json(output_dir / "environment.json", environment)
@@ -288,9 +419,15 @@ def _persist_local_outputs(result: dict[str, Any]) -> Path:
         f"{runtime.get('cuda_driver_api')}",
         f"- Venv nguồn: {(result.get('source_environment') or {}).get('venv_path')}",
         "",
-        "## Phiên bản Modal đã chạy",
+        "## Package pin và override",
         "",
+        "Các package tương thích được giữ theo venv clone; override bắt buộc:",
     ]
+    lines.extend(
+        f"- {name}=={version}: {MODAL_REQUIRED_OVERRIDE_REASONS[name]}"
+        for name, version in MODAL_REQUIRED_OVERRIDES.items()
+    )
+    lines.extend(["", "## Phiên bản Modal đã chạy", ""])
     lines.extend(f"- {name}=={version}" for name, version in packages.items())
     lines.extend(["", "## Checkpoint", ""])
     for role, item in (result.get("checkpoints") or {}).items():
@@ -316,8 +453,8 @@ def _persist_local_outputs(result: dict[str, Any]) -> Path:
             "Đây là smoke 1 mẫu, đầu ra tối đa 8 token: chỉ xác nhận đường chạy, "
             "coverage và metric audit; không dùng ROUGE hoặc timing để kết luận "
             "chất lượng/tốc độ.",
-            "Modal H100/H200 dùng Hopper, không xác nhận nhánh kernel SM100/B200. "
-            "Cần chạy smoke cuối trên B200.",
+            "Modal B200 xác nhận nhánh kernel Blackwell/SM100; smoke này không "
+            "thay thế lần chạy production với master config và cache offline trên server B200.",
             "Không tạo Modal Volume và không thay đổi môi trường server.",
             "",
             "Full log ở logs/; JSONL, manifest và audit ở benchmark/.",
@@ -331,27 +468,27 @@ app = modal.App("fast-infer-text-sum-viet-debug")
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
-        "torch==2.13.0",
-        "transformers==5.12.1",
-        "tokenizers==0.22.2",
-        "accelerate==1.14.0",
-        "datasets==5.0.0",
-        "einops==0.8.2",
-        "huggingface_hub==1.21.0",
-        "numpy==2.2.6",
-        "protobuf==6.33.6",
-        "psutil==7.2.2",
-        "rouge_score==0.1.2",
-        "safetensors==0.8.0",
-        "sentencepiece==0.2.1",
-        "tqdm==4.68.3",
-        "regex==2026.6.28",
-        "packaging==26.2",
-        "Jinja2==3.1.6",
-        "filelock==3.29.4",
-        "sympy==1.14.0",
-        "networkx==3.6.1",
-        "PyYAML==6.0.3",
+        f"torch=={MODAL_REQUIRED_OVERRIDES['torch']}",
+        f"transformers=={MODAL_COMPATIBLE_SOURCE_VERSIONS['transformers']}",
+        f"tokenizers=={MODAL_COMPATIBLE_SOURCE_VERSIONS['tokenizers']}",
+        f"accelerate=={MODAL_COMPATIBLE_SOURCE_VERSIONS['accelerate']}",
+        f"datasets=={MODAL_COMPATIBLE_SOURCE_VERSIONS['datasets']}",
+        f"einops=={MODAL_COMPATIBLE_SOURCE_VERSIONS['einops']}",
+        f"huggingface_hub=={MODAL_COMPATIBLE_SOURCE_VERSIONS['huggingface_hub']}",
+        f"numpy=={MODAL_COMPATIBLE_SOURCE_VERSIONS['numpy']}",
+        f"protobuf=={MODAL_COMPATIBLE_SOURCE_VERSIONS['protobuf']}",
+        f"psutil=={MODAL_COMPATIBLE_SOURCE_VERSIONS['psutil']}",
+        f"rouge_score=={MODAL_COMPATIBLE_SOURCE_VERSIONS['rouge_score']}",
+        f"safetensors=={MODAL_COMPATIBLE_SOURCE_VERSIONS['safetensors']}",
+        f"sentencepiece=={MODAL_COMPATIBLE_SOURCE_VERSIONS['sentencepiece']}",
+        f"tqdm=={MODAL_COMPATIBLE_SOURCE_VERSIONS['tqdm']}",
+        f"regex=={MODAL_COMPATIBLE_SOURCE_VERSIONS['regex']}",
+        f"packaging=={MODAL_COMPATIBLE_SOURCE_VERSIONS['packaging']}",
+        f"Jinja2=={MODAL_COMPATIBLE_SOURCE_VERSIONS['Jinja2']}",
+        f"filelock=={MODAL_COMPATIBLE_SOURCE_VERSIONS['filelock']}",
+        f"sympy=={MODAL_COMPATIBLE_SOURCE_VERSIONS['sympy']}",
+        f"networkx=={MODAL_COMPATIBLE_SOURCE_VERSIONS['networkx']}",
+        f"PyYAML=={MODAL_COMPATIBLE_SOURCE_VERSIONS['PyYAML']}",
     )
     .add_local_dir(str(PROJECT_ROOT / "src"), remote_path=str(REMOTE_ROOT / "src"), copy=True)
     .add_local_dir(
@@ -369,11 +506,11 @@ image = image.uv_pip_install(
     # SGLang 0.5.19's cu13 extra pins FlashInfer 0.6.18.  The configured
     # mirror does not publish a separate 0.6.18 cubin package, so let the
     # extra select the compatible CUDA artifacts.
-    "flashinfer-python[cu13]==0.6.18",
-    "sglang==0.5.19",
+    f"flashinfer-python[cu13]=={MODAL_REQUIRED_OVERRIDES['flashinfer-python']}",
+    f"sglang=={MODAL_REQUIRED_OVERRIDES['sglang']}",
     # sglang 0.5.19 declares this exact kernel build; 0.4.7 is used by a
     # newer server manifest and is incompatible with this SGLang release.
-    "sglang-kernel==0.4.6.post1",
+    f"sglang-kernel=={MODAL_REQUIRED_OVERRIDES['sglang-kernel']}",
 )
 # NVIDIA's pip CUDA 13 wheel keeps libcudart under ``lib`` while nvcc/JIT
 # build scripts conventionally link ``$CUDA_HOME/lib64``. Normalize that
@@ -387,14 +524,14 @@ image = image.run_commands(
 
 if os.environ.get("MODAL_INSTALL_FA4", "1").strip().lower() in {"1", "true", "yes"}:
     image = image.pip_install(
-        "apache-tvm-ffi==0.1.11",
-        "nvidia-cutlass-dsl==4.6.2",
-        "nvidia-cutlass-dsl-libs-base==4.6.2",
-        "nvidia-cutlass-dsl-libs-cu13==4.6.2",
-        "quack-kernels==0.6.4",
+        f"apache-tvm-ffi=={MODAL_REQUIRED_OVERRIDES['apache-tvm-ffi']}",
+        f"nvidia-cutlass-dsl=={MODAL_REQUIRED_OVERRIDES['nvidia-cutlass-dsl']}",
+        f"nvidia-cutlass-dsl-libs-base=={MODAL_REQUIRED_OVERRIDES['nvidia-cutlass-dsl-libs-base']}",
+        f"nvidia-cutlass-dsl-libs-cu13=={MODAL_REQUIRED_OVERRIDES['nvidia-cutlass-dsl-libs-cu13']}",
+        f"quack-kernels=={MODAL_REQUIRED_OVERRIDES['quack-kernels']}",
         "torch_c_dlpack_ext==0.1.5",
-        "typing_extensions==4.16.0",
-        "flash-attn-4==4.0.0b19",
+        f"typing_extensions=={MODAL_REQUIRED_OVERRIDES['typing_extensions']}",
+        f"flash-attn-4=={MODAL_REQUIRED_OVERRIDES['flash-attn-4']}",
         extra_options="--no-deps",
     )
 
@@ -552,20 +689,67 @@ def _download_checkpoints(
             "TRANSFORMERS_OFFLINE": "0",
             "HF_DATASETS_OFFLINE": "0",
             "HF_HUB_DISABLE_TELEMETRY": "1",
+            # Xet is enabled in huggingface_hub 1.x. High-performance mode
+            # uses the Modal host's available network/CPU for large public
+            # model files; a longer read timeout tolerates slow anonymous HF
+            # transfers while still surfacing stalled connections.
+            "HF_XET_HIGH_PERFORMANCE": "1",
+            "HF_HUB_DOWNLOAD_TIMEOUT": "60",
         }
     )
+
+    def cached_bytes() -> int:
+        total = 0
+        for root, _, filenames in os.walk(cache_dir):
+            for filename in filenames:
+                path = Path(root) / filename
+                try:
+                    if not path.is_symlink():
+                        total += path.stat().st_size
+                except OSError:
+                    pass
+        return total
+
     local_paths: dict[str, str] = {}
     checkpoints: dict[str, Any] = {}
     for role, repo_id in models.items():
         if not repo_id:
             raise ValueError(f"checkpoint is not configured for role {role}")
         print(f"[checkpoint] downloading/checking {role}: {repo_id}", flush=True)
-        snapshot = snapshot_download(
-            repo_id=repo_id,
-            cache_dir=str(cache_dir),
-            token=os.environ.get("HF_TOKEN") or None,
-            local_files_only=False,
+        progress_stop = threading.Event()
+        started = time.monotonic()
+        initial_bytes = cached_bytes()
+
+        def report_progress() -> None:
+            last_bytes = initial_bytes
+            while not progress_stop.wait(30):
+                current_bytes = cached_bytes()
+                print(
+                    f"[checkpoint-progress] role={role} "
+                    f"elapsed={time.monotonic() - started:.0f}s "
+                    f"cache_bytes={current_bytes} "
+                    f"delta_bytes={current_bytes - initial_bytes} "
+                    f"recent_delta_bytes={current_bytes - last_bytes}",
+                    flush=True,
+                )
+                last_bytes = current_bytes
+
+        progress_thread = threading.Thread(
+            target=report_progress,
+            name=f"checkpoint-progress-{role}",
+            daemon=True,
         )
+        progress_thread.start()
+        try:
+            snapshot = snapshot_download(
+                repo_id=repo_id,
+                cache_dir=str(cache_dir),
+                token=os.environ.get("HF_TOKEN") or None,
+                local_files_only=False,
+            )
+        finally:
+            progress_stop.set()
+            progress_thread.join(timeout=5)
         snapshot_path = Path(snapshot)
         config_ok = (snapshot_path / "config.json").is_file()
         weight_files = sorted(
@@ -617,7 +801,7 @@ def debug(
     domino_model: str = DOMINO_MODEL,
     dspark_model: str = DSPARK_MODEL,
 ) -> dict[str, Any]:
-    """Run focused DSpark first, then the six-baseline regression on one H100."""
+    """Run focused DSpark first, then the six-baseline regression on one B200."""
 
     if Path(run_id).name != run_id or not run_id:
         raise ValueError(f"unsafe run id: {run_id!r}")
@@ -787,13 +971,9 @@ print(json.dumps({
             )
         if modal_environment.get("pip_freeze_returncode") != 0:
             preflight_issues.append("could not capture the Modal package fingerprint")
-        if not modal_environment.get("cuda_available"):
-            preflight_issues.append(
-                f"torch.cuda.is_available is false: {modal_environment.get('torch_error')}"
-            )
-        gpu_name = str(modal_environment.get("gpu") or "")
-        if "H100" not in gpu_name and "H200" not in gpu_name:
-            preflight_issues.append(f"expected Modal H100/H200, got {gpu_name or 'no GPU'}")
+        preflight_issues.extend(
+            modal_gpu_preflight_issues(modal_environment, requested_gpu=GPU)
+        )
         if modal_environment.get("torch_cuda") != "13.0":
             preflight_issues.append(
                 f"expected Torch CUDA 13.0, got {modal_environment.get('torch_cuda')}"
@@ -806,11 +986,9 @@ print(json.dumps({
             preflight_issues.append(
                 f"SGLang DSPARK parse failed: {modal_environment.get('algorithms')}"
             )
-        required_versions = MODAL_REQUIRED_VERSIONS
-        for name, expected in required_versions.items():
-            actual = modal_packages.get(name)
-            if actual != expected:
-                preflight_issues.append(f"package mismatch {name}: expected {expected}, got {actual}")
+        preflight_issues.extend(
+            modal_package_policy_issues(source_packages, modal_packages)
+        )
         if not modal_environment.get("flash_attention_4_importable"):
             preflight_issues.append("flash_attn.cute is not importable")
         preflight_issues.extend(
@@ -941,6 +1119,11 @@ print(json.dumps({
         "modal_environment": modal_environment,
         "source_environment": source_environment,
         "package_differences": package_differences,
+        "package_policy": {
+            "clone_compatible_versions": MODAL_COMPATIBLE_SOURCE_VERSIONS,
+            "required_overrides": MODAL_REQUIRED_OVERRIDES,
+            "override_reasons": MODAL_REQUIRED_OVERRIDE_REASONS,
+        },
         "checkpoints": checkpoints,
         "stages": stages,
         "errors": errors,

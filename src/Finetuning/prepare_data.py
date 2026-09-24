@@ -1,21 +1,24 @@
-"""Prepare local document/summary JSONL for offline feature capture.
+"""Adapt local Vietnamese summarization JSONL for DFlash fine-tuning.
 
-The server-side DFlash corpus uses the compact ``{"input": ..., "output":
-...}`` JSONL format.  The trainer deliberately consumes the canonical
-``id/document/summary`` contract instead, so this module owns the streaming
-adapter and deterministic train/eval split.
+Supported sources use either ``input/output`` or ``id/text/summary`` fields.
+The output follows the canonical ``id/document/summary`` contract and receives
+a deterministic train/eval split without separating duplicate documents.
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
+import unicodedata
+from collections import Counter
 from collections.abc import Iterator
 from typing import Any
 
@@ -23,6 +26,10 @@ from .data import SummaryRecord, iter_summary_jsonl, render_summary_example
 
 
 LOGGER = logging.getLogger(__name__)
+_JSONL_SUFFIXES = (".jsonl", ".ndjson", ".json", ".txt")
+_MOJIBAKE_PATTERN = re.compile(
+    r"(?:Ã[\u0080-\u00bf]|[áÁ][º»]|Ä[\u0080-\u009f]|Æ[\u0080-\u00bf])"
+)
 
 
 def resolve_source_path(path_file: str | Path) -> Path:
@@ -51,6 +58,204 @@ def resolve_source_path(path_file: str | Path) -> Path:
     return source.resolve(strict=False)
 
 
+def discover_source_files(path: str | Path) -> list[Path]:
+    """Resolve a JSONL file or a directory containing JSONL shards.
+
+    Directory contents are sorted by relative path so IDs, split assignment,
+    and manifest output remain deterministic across runs.
+    """
+
+    source = Path(path).expanduser()
+    if source.is_file():
+        return [source]
+    if not source.is_dir():
+        raise FileNotFoundError(
+            f"fine-tuning source file or directory not found: {source}"
+        )
+
+    files = [
+        candidate
+        for candidate in source.rglob("*")
+        if candidate.is_file()
+        and not candidate.name.startswith(".")
+        and (
+            candidate.name.lower().endswith(_JSONL_SUFFIXES)
+            or candidate.name.lower().endswith((".jsonl.gz", ".ndjson.gz"))
+        )
+    ]
+    files.sort(key=lambda candidate: candidate.relative_to(source).as_posix())
+    if not files:
+        raise FileNotFoundError(
+            f"no JSONL/NDJSON source files found under directory: {source}"
+        )
+    return files
+
+
+def _open_jsonl(path: Path):
+    if path.name.lower().endswith((".jsonl.gz", ".ndjson.gz")):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open("r", encoding="utf-8")
+
+
+def _source_relative_path(source: Path, source_root: Path) -> str:
+    if source_root.is_dir():
+        return source.relative_to(source_root).as_posix()
+    return source.name
+
+
+def _canonical_text(value: str) -> tuple[str, bool]:
+    stripped = value.strip()
+    normalized = unicodedata.normalize("NFC", stripped)
+    return normalized, normalized != stripped
+
+
+def _iter_source_file(
+    source: Path,
+    *,
+    source_root: Path,
+    multi_file: bool,
+    max_samples: int | None,
+    already_yielded: int,
+    seen_ids: set[str],
+) -> Iterator[SummaryRecord]:
+    source_name = _source_relative_path(source, source_root)
+    emitted = already_yielded
+    with _open_jsonl(source) as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if max_samples is not None and emitted >= max_samples:
+                return
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"invalid fine-tuning JSONL at {source_name}:{line_number}: {exc.msg}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"fine-tuning JSONL at {source_name}:{line_number} must be a JSON object"
+                )
+
+            if "input" in payload or "output" in payload:
+                schema = "input_output"
+                document_key, summary_key = "input", "output"
+                required = (document_key, summary_key)
+            elif "text" in payload:
+                schema = "id_text_summary"
+                document_key, summary_key = "text", "summary"
+                required = (document_key, summary_key)
+            elif "document" in payload or "summary" in payload:
+                schema = "id_document_summary"
+                document_key, summary_key = "document", "summary"
+                required = (document_key, summary_key)
+            else:
+                raise ValueError(
+                    f"fine-tuning JSONL at {source_name}:{line_number} must use "
+                    "{input, output}, {id, text, summary}, or {id, document, summary}"
+                )
+
+            missing = [key for key in required if key not in payload]
+            if missing:
+                raise ValueError(
+                    f"fine-tuning JSONL at {source_name}:{line_number} missing fields {missing}"
+                )
+            raw_document = payload[document_key]
+            raw_summary = payload[summary_key]
+            if not isinstance(raw_document, str) or not isinstance(raw_summary, str):
+                raise ValueError(
+                    f"fine-tuning JSONL at {source_name}:{line_number} fields "
+                    f"{document_key}/{summary_key} must be strings"
+                )
+            document, document_nfc_changed = _canonical_text(raw_document)
+            summary, summary_nfc_changed = _canonical_text(raw_summary)
+            if not document or not summary:
+                empty = document_key if not document else summary_key
+                raise ValueError(
+                    f"fine-tuning JSONL at {source_name}:{line_number} has empty {empty}"
+                )
+
+            raw_id = payload.get("id")
+            if schema == "input_output" or raw_id is None:
+                base_id = f"finetune-{line_number:08d}"
+                if multi_file:
+                    file_tag = hashlib.sha256(
+                        source_name.encode("utf-8")
+                    ).hexdigest()[:8]
+                    base_id = f"finetune-{file_tag}-{line_number:08d}"
+            elif isinstance(raw_id, (str, int, float)) and not isinstance(
+                raw_id, bool
+            ):
+                base_id = str(raw_id).strip()
+                if not base_id:
+                    raise ValueError(
+                        f"fine-tuning JSONL at {source_name}:{line_number} has empty id"
+                    )
+            else:
+                raise ValueError(
+                    f"fine-tuning JSONL at {source_name}:{line_number} id must be "
+                    "a string or number"
+                )
+
+            record_id = base_id
+            if record_id in seen_ids:
+                record_id = f"{base_id}::{source_name}:{line_number}"
+                suffix = 2
+                while record_id in seen_ids:
+                    record_id = f"{base_id}::{source_name}:{line_number}:{suffix}"
+                    suffix += 1
+            seen_ids.add(record_id)
+
+            metadata: dict[str, Any] = {
+                "source_line": line_number,
+                "source_schema": schema,
+            }
+            if schema != "input_output" or multi_file:
+                metadata["source_file"] = source_name
+            if raw_id is not None:
+                metadata["source_id"] = str(raw_id)
+            if document_nfc_changed or summary_nfc_changed:
+                metadata["unicode_nfc_normalized"] = True
+            if _MOJIBAKE_PATTERN.search(document) or _MOJIBAKE_PATTERN.search(summary):
+                # Keep source characters intact. This flag makes suspicious
+                # samples visible in the manifest for human review.
+                metadata["suspected_mojibake"] = True
+
+            record = SummaryRecord(
+                id=record_id,
+                document=document,
+                summary=summary,
+                metadata=metadata,
+            )
+            emitted += 1
+            yield record
+
+
+def iter_finetune_jsonl(
+    path: str | Path,
+    max_samples: int | None = None,
+) -> Iterator[SummaryRecord]:
+    """Yield canonical records from supported JSONL schemas and directory shards."""
+
+    source_root = Path(path).expanduser()
+    if max_samples is not None and max_samples < 0:
+        raise ValueError("max_samples must be non-negative")
+    source_files = discover_source_files(source_root)
+    seen_ids: set[str] = set()
+    yielded = 0
+    for source in source_files:
+        for record in _iter_source_file(
+            source,
+            source_root=source_root,
+            multi_file=len(source_files) > 1,
+            max_samples=max_samples,
+            already_yielded=yielded,
+            seen_ids=seen_ids,
+        ):
+            yielded += 1
+            yield record
+
+
 def iter_input_output_jsonl(
     path: str | Path,
     max_samples: int | None = None,
@@ -63,57 +268,10 @@ def iter_input_output_jsonl(
     internal Vietnamese whitespace and Unicode content are preserved.
     """
 
-    source = Path(path).expanduser()
-    if not source.is_file():
-        raise FileNotFoundError(f"fine-tuning source JSONL not found: {source}")
-    if max_samples is not None and max_samples < 0:
-        raise ValueError("max_samples must be non-negative")
-
-    yielded = 0
-    with source.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if max_samples is not None and yielded >= max_samples:
-                break
-            if not line.strip():
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"invalid input/output JSONL at line {line_number}: {exc.msg}"
-                ) from exc
-            if not isinstance(payload, dict):
-                raise ValueError(
-                    f"input/output JSONL line {line_number} must be a JSON object"
-                )
-            missing = [key for key in ("input", "output") if key not in payload]
-            if missing:
-                raise ValueError(
-                    f"input/output JSONL line {line_number} missing fields {missing}"
-                )
-            document = payload["input"]
-            summary = payload["output"]
-            if not isinstance(document, str) or not isinstance(summary, str):
-                raise ValueError(
-                    f"input/output JSONL line {line_number} fields must be strings"
-                )
-            document = document.strip()
-            summary = summary.strip()
-            if not document or not summary:
-                empty = "input" if not document else "output"
-                raise ValueError(
-                    f"input/output JSONL line {line_number} has empty {empty}"
-                )
-            yielded += 1
-            yield SummaryRecord(
-                id=f"finetune-{line_number:08d}",
-                document=document,
-                summary=summary,
-                metadata={
-                    "source_line": line_number,
-                    "source_schema": "input_output",
-                },
-            )
+    for record in iter_finetune_jsonl(path, max_samples=max_samples):
+        if record.metadata.get("source_schema") != "input_output":
+            raise ValueError("source JSONL is not in input/output format")
+        yield record
 
 
 def _eval_assignment(
@@ -209,7 +367,7 @@ def prepare_finetune_dataset(
     progress_interval: int = 1000,
     force: bool = False,
 ) -> dict[str, int | float]:
-    """Normalize the server corpus into train/eval JSONL for DFlash.
+    """Normalize a JSONL file or directory of shards for DFlash.
 
     Outputs are written through a temporary staging directory and published
     only after the source has been read successfully.  Existing prepared files
@@ -218,8 +376,10 @@ def prepare_finetune_dataset(
 
     source = Path(source_path).expanduser()
     destination = Path(output_dir).expanduser()
-    if not source.is_file():
-        raise FileNotFoundError(f"fine-tuning source JSONL not found: {source}")
+    if not source.is_file() and not source.is_dir():
+        raise FileNotFoundError(
+            f"fine-tuning source file or directory not found: {source}"
+        )
     if not 0.0 <= eval_ratio < 1.0:
         raise ValueError("eval_ratio must satisfy 0 <= eval_ratio < 1")
     if max_samples is not None and max_samples < 0:
@@ -245,12 +405,29 @@ def prepare_finetune_dataset(
         total = 0
         train_count = 0
         eval_count = 0
+        source_schema_counts: Counter[str] = Counter()
+        source_file_counts: Counter[str] = Counter()
+        nfc_normalized_records = 0
+        suspected_mojibake_records = 0
+        source_files = discover_source_files(source)
         with (
             train_stage.open("w", encoding="utf-8") as train_handle,
             eval_stage.open("w", encoding="utf-8") as eval_handle,
         ):
-            for record in iter_input_output_jsonl(source, max_samples=max_samples):
+            for record in iter_finetune_jsonl(source, max_samples=max_samples):
                 total += 1
+                schema_name = str(record.metadata.get("source_schema", "unknown"))
+                file_name = str(
+                    record.metadata.get("source_file", source_files[0].name)
+                )
+                source_schema_counts[schema_name] += 1
+                source_file_counts[file_name] += 1
+                nfc_normalized_records += int(
+                    bool(record.metadata.get("unicode_nfc_normalized"))
+                )
+                suspected_mojibake_records += int(
+                    bool(record.metadata.get("suspected_mojibake"))
+                )
                 if _eval_assignment(
                     record.document,
                     eval_ratio=eval_ratio,
@@ -286,10 +463,27 @@ def prepare_finetune_dataset(
             "eval": eval_count,
             "eval_ratio": eval_ratio,
         }
+        if suspected_mojibake_records:
+            LOGGER.warning(
+                "%d records contain likely mojibake markers; source text was preserved "
+                "without automatic repair",
+                suspected_mojibake_records,
+            )
         manifest = {
             "schema": "dflash_summary_v1",
-            "source_schema": "input_output",
+            "source_schema": (
+                next(iter(source_schema_counts))
+                if len(source_schema_counts) == 1
+                else "mixed"
+            ),
             "source_path": str(source.resolve(strict=False)),
+            "source_files": [
+                _source_relative_path(path, source) for path in source_files
+            ],
+            "source_schema_counts": dict(sorted(source_schema_counts.items())),
+            "source_file_counts": dict(sorted(source_file_counts.items())),
+            "unicode_nfc_normalized_records": nfc_normalized_records,
+            "suspected_mojibake_records": suspected_mojibake_records,
             "split_seed": split_seed,
             "eval_ratio": eval_ratio,
             "max_samples": max_samples,
@@ -381,18 +575,18 @@ def prepare_summary_examples(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Normalize server input/output JSONL for DFlash fine-tuning"
+        description="Normalize Vietnamese summarization JSONL for DFlash fine-tuning"
     )
     source_group = parser.add_mutually_exclusive_group(required=True)
     source_group.add_argument(
         "--source",
         type=Path,
-        help="local input/output JSONL; useful for validating sample.txt",
+        help="JSONL file or directory of JSONL shards",
     )
     source_group.add_argument(
         "--source-path-file",
         type=Path,
-        help="text file containing the single server-side dataset path",
+        help="text file containing one server-side JSONL file or directory path",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--eval-ratio", type=float, default=0.02)
@@ -427,6 +621,8 @@ def main() -> None:
 
 
 __all__ = [
+    "discover_source_files",
+    "iter_finetune_jsonl",
     "iter_input_output_jsonl",
     "iter_summary_examples",
     "prepare_finetune_dataset",

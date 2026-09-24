@@ -319,7 +319,7 @@ def preflight_baseline(
             }
             if not fa4_installed and result["status"] == "ready":
                 result.update(
-                    status="unsupported_hardware",
+                    status="missing_dependency",
                     reason=(
                         "vanilla_fa requires an importable flash_attn.cute "
                         "FlashAttention-4 runtime on Blackwell/B200; no fallback "

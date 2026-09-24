@@ -18,12 +18,24 @@ Input gốc UTF-8 JSONL:
 
 ### Chuẩn hóa bộ dữ liệu 50k trên server
 
-Bộ dữ liệu fine-tune được cung cấp ở dạng JSONL mỗi dòng có hai trường
-`input` và `output`. File `outputs/sample_finetune_data_in_server/sample.txt`
-là mẫu 1000 dòng để kiểm tra; file `outputs/sample_finetune_data_in_server/path.txt`
-chứa đường dẫn tuyệt đối tới bộ 50k trên server. Adapter sẽ tạo ID theo số dòng,
-đổi sang contract `id/document/summary`, rồi chia train/eval deterministic theo
-nội dung document. Các bản ghi có cùng document luôn ở cùng một split.
+Bộ 50k được cung cấp dưới dạng thư mục chứa JSONL shard. Mỗi record có dạng:
+
+```json
+{"id":"44798.0","text":"văn bản nguồn","summary":"tóm tắt tham chiếu"}
+```
+
+Path đã cung cấp được lưu trong
+`outputs/finetune_data_viet_path.txt`. Adapter đọc file đơn hoặc quét đệ quy
+các file `.jsonl`, `.ndjson`, `.json`, `.txt` trong thư mục; shard được xử lý
+theo thứ tự tên ổn định. Adapter cũng tiếp tục nhận schema cũ `{input, output}`.
+Kết quả được đổi sang contract `id/document/summary`, chuẩn hóa Unicode NFC,
+rồi chia train/eval deterministic theo nội dung document. Các bản ghi có cùng
+document luôn ở cùng một split. ID nguồn được giữ lại; ID trùng được làm duy
+nhất và ID gốc ghi trong metadata.
+
+Adapter đánh dấu các record có dấu hiệu mojibake trong `manifest.json` và log,
+nhưng không tự sửa văn bản. Cần xem số lượng `suspected_mojibake_records` trước
+khi chạy teacher generation nếu trường này khác 0.
 
 Kiểm tra trước trên mẫu 1000 dòng, không đụng tới dữ liệu nguồn:
 
@@ -31,15 +43,24 @@ Kiểm tra trước trên mẫu 1000 dòng, không đụng tới dữ liệu ngu
 PYTHONPATH=src python3 -m Finetuning.prepare_data \
   --source outputs/sample_finetune_data_in_server/sample.txt \
   --output-dir /tmp/finetune_data_sample \
+  --max-samples 1000 \
   --eval-ratio 0.02 \
   --progress-interval 250
 ```
 
-Trên server, sau khi mẫu đã đạt kiểm tra:
+Trên server, chuẩn hóa thư mục 50k:
+
+`outputs/` bị Git bỏ qua. Nếu path file chưa được đồng bộ lên B200, tạo lại từ
+đường dẫn nguồn đã cung cấp:
+
+```bash
+printf '%s\n' '/workspace/storage-shared/nlp/dungdx4/bien_projects/LLM2Seq/src/eviseq_new/datasets/50k/' \
+  > outputs/finetune_data_viet_path.txt
+```
 
 ```bash
 PYTHONPATH=src python3 -m Finetuning.prepare_data \
-  --source-path-file outputs/sample_finetune_data_in_server/path.txt \
+  --source-path-file outputs/finetune_data_viet_path.txt \
   --output-dir /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/finetune_data_50k \
   --eval-ratio 0.02 \
   --progress-interval 1000

@@ -102,12 +102,59 @@ def test_run_persists_complete_output_log(tmp_path: Path) -> None:
 
 
 
-def test_modal_runtime_pins_match_sglang_019_runtime() -> None:
-    from modal_benchmark_debug import MODAL_REQUIRED_VERSIONS
+def test_modal_runtime_pins_separate_clone_versions_from_required_overrides() -> None:
+    from modal_benchmark_debug import (
+        MODAL_COMPATIBLE_SOURCE_VERSIONS,
+        MODAL_REQUIRED_OVERRIDES,
+        MODAL_REQUIRED_VERSIONS,
+    )
 
     assert MODAL_REQUIRED_VERSIONS["torch"] == "2.13.0"
     assert MODAL_REQUIRED_VERSIONS["sglang"] == "0.5.19"
     assert MODAL_REQUIRED_VERSIONS["sglang-kernel"] == "0.4.6.post1"
     assert MODAL_REQUIRED_VERSIONS["flashinfer-python"] == "0.6.18"
     assert MODAL_REQUIRED_VERSIONS["flash-attn-4"] == "4.0.0b19"
+    assert MODAL_COMPATIBLE_SOURCE_VERSIONS["transformers"] == "5.12.1"
+    assert MODAL_COMPATIBLE_SOURCE_VERSIONS["accelerate"] == "1.15.0"
+    assert MODAL_REQUIRED_OVERRIDES["torch"] == "2.13.0"
+
+
+def test_modal_package_policy_preserves_clone_pins_and_allows_required_overrides() -> None:
+    from modal_benchmark_debug import (
+        MODAL_COMPATIBLE_SOURCE_VERSIONS,
+        MODAL_REQUIRED_OVERRIDES,
+        modal_package_policy_issues,
+    )
+
+    source_packages = {
+        **MODAL_COMPATIBLE_SOURCE_VERSIONS,
+        "torch": "2.11.0",
+        "flashinfer-python": "0.6.12",
+    }
+    modal_packages = {
+        **MODAL_COMPATIBLE_SOURCE_VERSIONS,
+        **MODAL_REQUIRED_OVERRIDES,
+    }
+
+    assert modal_package_policy_issues(source_packages, modal_packages) == []
+
+    modal_packages["accelerate"] = "1.14.0"
+    issues = modal_package_policy_issues(source_packages, modal_packages)
+    assert any("accelerate" in issue for issue in issues)
+
+
+def test_modal_gpu_preflight_accepts_only_blackwell_b200() -> None:
+    from modal_benchmark_debug import modal_gpu_preflight_issues
+
+    assert modal_gpu_preflight_issues(
+        {"cuda_available": True, "gpu": "NVIDIA B200", "compute_capability": [10, 0]},
+        requested_gpu="B200",
+    ) == []
+
+    issues = modal_gpu_preflight_issues(
+        {"cuda_available": True, "gpu": "NVIDIA H200", "compute_capability": [9, 0]},
+        requested_gpu="B200",
+    )
+    assert any("B200" in issue for issue in issues)
+    assert any("Blackwell" in issue for issue in issues)
 
