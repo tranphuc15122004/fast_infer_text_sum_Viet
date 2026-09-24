@@ -92,6 +92,7 @@ def build_server_args(
     ]
     if attention_backend:
         command.extend(["--attention-backend", attention_backend])
+    graph_batch_sizes = [str(index) for index in range(1, batch_size + 1)]
     command.extend([
         "--tp-size",
         str(tp_size),
@@ -99,9 +100,9 @@ def build_server_args(
         str(mem_fraction_static),
         "--max-running-requests",
         str(batch_size),
-        "--cuda-graph-bs",
-        *[str(index) for index in range(1, batch_size + 1)],
-        "--cuda-graph-max-bs",
+        "--cuda-graph-bs-decode",
+        *graph_batch_sizes,
+        "--cuda-graph-max-bs-decode",
         str(batch_size),
         "--port",
         str(port),

@@ -309,37 +309,37 @@ def preflight_baseline(
     }
 
     if baseline == "vanilla_fa":
-        installed, import_reason = _module_importable("flash_attn")
-        result["requirements"]["flash_attn"] = {
-            "available": installed,
-            "reason": import_reason,
-        }
-        if not installed and result["status"] == "ready":
-            result.update(
-                status="missing_dependency",
-                reason=(
-                    "flash_attn is required by vanilla_fa; no fallback is allowed "
-                    f"({import_reason})"
-                ),
-            )
-        elif installed and result["status"] == "ready" and cuda_available:
-            capability = _cuda_compute_capability()
-            if capability is not None and capability[0] >= 10:
-                fa4_installed, fa4_reason = _module_importable("flash_attn.cute")
-                result["requirements"]["flash_attention_4"] = {
-                    "available": fa4_installed,
-                    "reason": fa4_reason,
-                    "auto_selected_for_blackwell": fa4_installed,
-                }
-                if not fa4_installed:
-                    result.update(
-                        status="unsupported_hardware",
-                        reason=(
-                            "vanilla_fa requests FlashAttention-2 on Blackwell/B200, "
-                            "but FA2 is unsupported and flash_attn.cute (FA4) is "
-                            "not installed"
-                        ),
-                    )
+        capability = _cuda_compute_capability() if cuda_available else None
+        if capability is not None and capability[0] >= 10:
+            fa4_installed, fa4_reason = _module_importable("flash_attn.cute")
+            result["requirements"]["flash_attention_4"] = {
+                "available": fa4_installed,
+                "reason": fa4_reason,
+                "auto_selected_for_blackwell": fa4_installed,
+            }
+            if not fa4_installed and result["status"] == "ready":
+                result.update(
+                    status="unsupported_hardware",
+                    reason=(
+                        "vanilla_fa requires an importable flash_attn.cute "
+                        "FlashAttention-4 runtime on Blackwell/B200; no fallback "
+                        f"is allowed ({fa4_reason})"
+                    ),
+                )
+        else:
+            installed, import_reason = _module_importable("flash_attn")
+            result["requirements"]["flash_attn"] = {
+                "available": installed,
+                "reason": import_reason,
+            }
+            if not installed and result["status"] == "ready":
+                result.update(
+                    status="missing_dependency",
+                    reason=(
+                        "flash_attn is required by vanilla_fa; no fallback is allowed "
+                        f"({import_reason})"
+                    ),
+                )
 
     if baseline == "eagle3":
         draft_ok, draft_reason = _local_requirement(

@@ -22,7 +22,14 @@ def test_sglang_server_args_keep_official_speculative_contract() -> None:
     )
     assert "--speculative-algorithm" in args
     assert "DFLASH" in args
-    assert args[args.index("--cuda-graph-bs") + 1 : args.index("--cuda-graph-max-bs")] == ["1", "2", "3", "4", "5", "6", "7", "8"]
+    batch_sizes = ["1", "2", "3", "4", "5", "6", "7", "8"]
+    decode_index = args.index("--cuda-graph-bs-decode")
+    assert args[decode_index + 1 : decode_index + 9] == batch_sizes
+    assert args[args.index("--cuda-graph-max-bs-decode") + 1] == "8"
+    assert "--cuda-graph-bs-prefill" not in args
+    assert "--cuda-graph-max-bs-prefill" not in args
+    assert "--cuda-graph-bs" not in args
+    assert "--cuda-graph-max-bs" not in args
     assert args[args.index("--speculative-draft-model-path") + 1] == "/models/Qwen3-4B-Domino"
     assert args[args.index("--tp-size") + 1] == "2"
 
@@ -139,3 +146,36 @@ def test_baseline_config_uses_attention_backend_separate_from_sglang() -> None:
     )
 
     assert config["attention_backend"] == "flash_attention_4"
+
+
+def test_vanilla_fa_preflight_uses_fa4_on_blackwell_without_importing_fa2(
+    monkeypatch,
+) -> None:
+    from Benchmark.common import longbench_adapter
+
+    probed_modules = []
+
+    def module_importable(name):
+        probed_modules.append(name)
+        if name == "flash_attn":
+            return False, "ImportError: undefined PyTorch C++ ABI symbol"
+        if name == "flash_attn.cute":
+            return True, None
+        raise AssertionError(f"unexpected module probe: {name}")
+
+    monkeypatch.setattr(
+        longbench_adapter, "_local_requirement", lambda _path: (True, None)
+    )
+    monkeypatch.setattr(longbench_adapter, "_cuda_compute_capability", lambda: (10, 0))
+    monkeypatch.setattr(longbench_adapter, "_module_importable", module_importable)
+
+    result = longbench_adapter.preflight_baseline(
+        "vanilla_fa",
+        {"model": "/models/Qwen3-4B"},
+        cuda_available=True,
+    )
+
+    assert result["status"] == "ready"
+    assert result["requirements"]["flash_attention_4"]["available"] is True
+    assert result["requirements"]["flash_attention_4"]["auto_selected_for_blackwell"]
+    assert probed_modules == ["flash_attn.cute"]
