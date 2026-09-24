@@ -125,3 +125,17 @@ def test_vanilla_fa_rejects_fa2_on_blackwell_without_fa4() -> None:
             compute_capability=(10, 0),
             flash_attention_4_available=False,
         )
+
+
+def test_baseline_config_uses_attention_backend_separate_from_sglang() -> None:
+    from Benchmark.common.longbench_adapter import baseline_config_from_env
+
+    config = baseline_config_from_env(
+        "vanilla_fa",
+        {
+            "LONG_BENCH_ATTENTION_BACKEND": "flash_attention_4",
+            "LONG_BENCH_SGLANG_ATTENTION_BACKEND": "triton",
+        },
+    )
+
+    assert config["attention_backend"] == "flash_attention_4"

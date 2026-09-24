@@ -933,8 +933,10 @@ def baseline_config_from_env(baseline: str, env: Mapping[str, str] | None = None
         "max_running_requests": max_running_requests,
         "tp_size": int(values.get("LONG_BENCH_TP_SIZE", "1")),
         "mem_fraction_static": float(values.get("LONG_BENCH_MEM_FRACTION_STATIC", "0.9")),
-        "attention_backend": values.get(
-            "LONG_BENCH_SGLANG_ATTENTION_BACKEND", "flashinfer"
+        "attention_backend": (
+            values.get("LONG_BENCH_ATTENTION_BACKEND", "flash_attention_2")
+            if baseline == "vanilla_fa"
+            else values.get("LONG_BENCH_SGLANG_ATTENTION_BACKEND", "flashinfer")
         ),
         "port": int(values.get("LONG_BENCH_SGLANG_PORT", "30000")),
         "longspec_target_model": values.get("LONG_BENCH_LONGSPEC_TARGET_MODEL") or values.get("MODEL_TARGET"),
