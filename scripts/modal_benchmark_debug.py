@@ -9,7 +9,8 @@ this runner creates no persistent Volume.
 
 Example::
 
-    MODAL_GPU=B200 modal run scripts/modal_benchmark_debug.py --action smoke
+    MODAL_GPU=H200 modal run scripts/modal_benchmark_debug.py --action debug \
+        --baselines dspark --benchmark-mode representative --max-new-tokens 2048
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ import modal
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REMOTE_ROOT = Path("/workspace/repo")
 REMOTE_RUN_ROOT = Path("/tmp/fast-infer-modal-debug")
-GPU = os.environ.get("MODAL_GPU", "B200")
+GPU = os.environ.get("MODAL_GPU", "H200")
 REQUIREMENTS_FILE = PROJECT_ROOT / "requirements.txt"
 if not REQUIREMENTS_FILE.is_file():
     REQUIREMENTS_FILE = REMOTE_ROOT / "requirements.txt"
@@ -412,6 +413,56 @@ def validate_smoke_result(
     }
 
 
+def compare_sglang_target_output(
+    speculative: dict[str, Any], target_only: dict[str, Any]
+) -> dict[str, Any]:
+    """Require exact greedy output parity with SGLang's target-only server."""
+
+    issues: list[str] = []
+    if speculative.get("status") != "success":
+        issues.append(f"speculative status={speculative.get('status')}")
+    if target_only.get("status") != "success":
+        issues.append(f"target-only status={target_only.get('status')}")
+    if speculative.get("sample_id") != target_only.get("sample_id"):
+        issues.append("sample_id_mismatch")
+    for field in ("input_tokens", "output_tokens"):
+        if speculative.get(field) != target_only.get(field):
+            issues.append(f"{field}_mismatch")
+    spec_text = speculative.get("text") or speculative.get("answer")
+    target_text = target_only.get("text") or target_only.get("answer")
+    text_matches = False
+    if not isinstance(spec_text, str) or not isinstance(target_text, str):
+        issues.append("output_text_missing")
+    elif spec_text != target_text:
+        issues.append("output_text_mismatch")
+    else:
+        text_matches = True
+    output_match = (
+        not any(issue not in {"positive_e2e_timing_missing"} for issue in issues)
+        and text_matches
+    )
+
+    speedup = None
+    try:
+        spec_e2e = float(speculative.get("e2e_ms"))
+        target_e2e = float(target_only.get("e2e_ms"))
+        if not issues and spec_e2e > 0 and target_e2e > 0:
+            speedup = round(target_e2e / spec_e2e, 4)
+    except (TypeError, ValueError):
+        pass
+    if not issues and speedup is None:
+        issues.append("positive_e2e_timing_missing")
+    return {
+        "status": "passed" if not issues else "failed",
+        "output_match": output_match,
+        "speedup_scope": "same_backend_sglang_target_only",
+        "target_only_e2e_ms": target_only.get("e2e_ms"),
+        "speculative_e2e_ms": speculative.get("e2e_ms"),
+        "same_backend_e2e_speedup": speedup,
+        "issues": issues,
+    }
+
+
 def capture_requirements_fingerprint(
     requirements_path: Path = REQUIREMENTS_FILE,
 ) -> dict[str, Any]:
@@ -509,7 +560,7 @@ def modal_package_policy_issues(
     source_packages: dict[str, Any],
     modal_packages: dict[str, Any],
 ) -> list[str]:
-    """Require requirements.txt application pins and B200 runtime stack pins."""
+    """Require requirements.txt application pins and selected runtime pins."""
 
     issues: list[str] = []
     from packaging.specifiers import SpecifierSet
@@ -542,7 +593,7 @@ def modal_package_policy_issues(
         actual = modal_packages.get(name)
         if not matches_pin(actual, expected):
             issues.append(
-                f"requirements B200 runtime pin mismatch {name}: "
+                f"requirements runtime pin mismatch {name}: "
                 f"expected {expected}, got {actual}"
             )
     for name, expected in MODAL_RUNTIME_ADDITIONS.items():
@@ -583,7 +634,7 @@ def modal_gpu_preflight_issues(
     *,
     requested_gpu: str = GPU,
 ) -> list[str]:
-    """Require an actual B200 with CUDA and Blackwell compute capability."""
+    """Require the requested supported Hopper/Blackwell GPU and CUDA."""
 
     issues: list[str] = []
     if not modal_environment.get("cuda_available"):
@@ -591,20 +642,27 @@ def modal_gpu_preflight_issues(
             "torch.cuda.is_available is false: "
             f"{modal_environment.get('torch_error')}"
         )
-    requested_type = requested_gpu.split(":", 1)[0].rstrip("!")
-    if requested_type != "B200":
-        issues.append(f"expected a B200 GPU request, got {requested_gpu}")
+    requested_type = requested_gpu.split(":", 1)[0].rstrip("!").upper()
+    minimum_compute_major = {"H200": 9, "B200": 10}.get(requested_type)
+    if minimum_compute_major is None:
+        issues.append(
+            f"unsupported Modal debug GPU {requested_gpu}; choose H200 or B200"
+        )
     gpu_name = str(modal_environment.get("gpu") or "")
-    if "B200" not in gpu_name:
-        issues.append(f"expected Modal B200, got {gpu_name or 'no GPU'}")
+    if requested_type in {"H200", "B200"} and requested_type not in gpu_name.upper():
+        issues.append(
+            f"expected Modal {requested_type}, got {gpu_name or 'no GPU'}"
+        )
     capability = modal_environment.get("compute_capability")
     if (
         not isinstance(capability, (list, tuple))
         or not capability
-        or int(capability[0]) < 10
+        or minimum_compute_major is None
+        or int(capability[0]) < minimum_compute_major
     ):
+        architecture = "Hopper SM90" if requested_type == "H200" else "Blackwell SM100"
         issues.append(
-            "expected Blackwell compute capability (SM100 or newer), "
+            f"expected {architecture} compute capability or newer, "
             f"got {capability}"
         )
     return issues
@@ -677,7 +735,7 @@ def _persist_local_outputs(result: dict[str, Any]) -> Path:
         "",
         "## Pin môi trường Modal",
         "",
-        "Các pin ứng dụng được giữ theo requirements.txt; nhóm CUDA/SGLang/FlashInfer/FA4 được cài theo pin runtime B200:",
+        "Các pin ứng dụng được giữ theo requirements.txt; nhóm CUDA/SGLang/FlashInfer/FA4 dùng các override tương thích CUDA 13 đã ghi rõ:",
     ]
     lines.extend(
         f"- {name}=={version}: {MODAL_REQUIRED_OVERRIDE_REASONS[name]}"
@@ -698,6 +756,25 @@ def _persist_local_outputs(result: dict[str, Any]) -> Path:
             lines.append(f"  - {issue}")
         if item.get("command"):
             lines.append(f"  - Lệnh: {' '.join(item['command'])}")
+    target_reference = (result.get("stages") or {}).get("target_only_reference") or {}
+    if target_reference.get("baselines"):
+        lines.extend(["", "## Đối chiếu greedy với target-only SGLang", ""])
+        for baseline, comparison in target_reference["baselines"].items():
+            match_text = (
+                "khớp chính xác output greedy"
+                if comparison.get("output_match")
+                else "output greedy không khớp"
+            )
+            speedup = comparison.get("same_backend_e2e_speedup")
+            speed_text = (
+                f", speedup E2E cùng backend {float(speedup):.4f}x"
+                if speedup is not None
+                else ""
+            )
+            lines.append(
+                f"- {baseline}: **{comparison.get('status')}**, {match_text}"
+                f"{speed_text}."
+            )
     if result.get("errors"):
         lines.extend(["", "## Lỗi", ""])
         lines.extend(f"- {error}" for error in result["errors"])
@@ -710,7 +787,7 @@ def _persist_local_outputs(result: dict[str, Any]) -> Path:
             f"đầu ra tối đa {result.get('max_new_tokens', 8)} token: "
             "chỉ xác nhận đường chạy, coverage và metric audit; không dùng ROUGE hoặc timing để kết luận "
             "chất lượng/tốc độ.",
-            "Modal B200 xác nhận nhánh kernel Blackwell/SM100; smoke này không "
+            f"Modal {GPU} xác nhận nhánh kernel theo phần cứng thực tế; smoke này không "
             "thay thế lần chạy production với master config và cache offline trên server B200.",
             "Không tạo Modal Volume và không thay đổi môi trường server.",
             "",
@@ -729,7 +806,7 @@ def _requirement_pin(name: str) -> str:
 
 app = modal.App("fast-infer-text-sum-viet-debug")
 
-# Install the cu130 PyTorch wheel explicitly for B200. The requirement uses the
+# Install the cu130 PyTorch wheel explicitly for the selected Hopper/Blackwell GPU. The requirement uses the
 # public version (2.13.0); PyTorch's CUDA index supplies its CUDA 13 build.
 image = modal.Image.debian_slim(python_version="3.12").pip_install(
     MODAL_TORCH_SPEC,
@@ -886,6 +963,9 @@ def _child_env(
             "LONG_BENCH_WARMUP_RUNS": "1",
             "LONG_BENCH_BATCH_SIZE": "1",
             "LONG_BENCH_MAX_RUNNING_REQUESTS": "1",
+            # Diagnose the suspected Qwen3 EAGLE target-forward mismatch in
+            # the same representative run. This check runs before timing.
+            "LONG_BENCH_EAGLE_CHECK_TARGET_PARITY": "1",
             "LONG_BENCH_MEM_FRACTION_STATIC": os.environ.get(
                 "MODAL_SGLANG_MEM_FRACTION_STATIC", "0.75"
             ),
@@ -1084,7 +1164,7 @@ def debug(
     max_new_tokens: int = 8,
     benchmark_mode: str = "smoke",
 ) -> dict[str, Any]:
-    """Run focused DSpark first, then the six-baseline regression on one B200."""
+    """Run focused DSpark first, then the selected baseline regression on one GPU."""
 
     if Path(run_id).name != run_id or not run_id:
         raise ValueError(f"unsafe run id: {run_id!r}")
@@ -1434,6 +1514,133 @@ print(json.dumps({
                     "manifest_path": str(manifest_path),
                 }
 
+            def run_sglang_target_diagnostic(
+                stage_name: str, stage_baselines: list[str]
+            ) -> dict[str, Any]:
+                sglang_baselines = [
+                    name for name in ("domino", "dspark")
+                    if name in stage_baselines
+                ]
+                if not sglang_baselines:
+                    return {"status": "skipped", "reason": "no SGLang speculative baseline"}
+
+                longbench_run_id = f"{stage_name}-{run_id}"
+                run_dir = benchmark_root / stage_name / longbench_run_id
+                input_path = run_dir / "inputs" / "vietnews.jsonl"
+                output_path = benchmark_root / "correctness" / (
+                    f"{stage_name}_sglang_target_only.jsonl"
+                )
+                diagnostic_name = f"{stage_name}_sglang_target_only"
+                if not input_path.is_file():
+                    issue = f"benchmark prompt file is missing: {input_path}"
+                    return {"status": "failed", "issues": [issue]}
+                env = _child_env(
+                    baselines="target_only",
+                    model_paths=local_paths,
+                    hf_home=hf_home,
+                    run_root=run_root,
+                    output_dir=output_path.parent,
+                    max_new_tokens=max_new_tokens,
+                    benchmark_mode=benchmark_mode,
+                )
+                env["LONG_BENCH_SGLANG_PORT"] = "30200"
+                command = [
+                    sys.executable,
+                    str(REMOTE_ROOT / "src" / "Benchmark" / "infer_sglang_spec.py"),
+                    "--method", "target_only",
+                    "--model", local_paths["target"],
+                    "--data-file", str(input_path),
+                    "--output", str(output_path),
+                    "--max-samples", "1",
+                    "--max-new-tokens", str(max_new_tokens),
+                    "--max-input-tokens", "4096",
+                    "--temperature", "0",
+                    "--seed", "42",
+                    "--batch-size", "1",
+                    "--tp-size", "1",
+                    "--mem-fraction-static", os.environ.get(
+                        "MODAL_SGLANG_MEM_FRACTION_STATIC", "0.75"
+                    ),
+                    "--attention-backend", os.environ.get(
+                        "MODAL_SGLANG_ATTENTION_BACKEND", "flashinfer"
+                    ),
+                    "--max-running-requests", "1",
+                    "--port", "30200",
+                    "--server-timeout", "900",
+                    "--request-timeout", "900",
+                    "--run-id", f"{diagnostic_name}-{run_id}",
+                    "--local-files-only",
+                ]
+                log_path = log_root / f"{diagnostic_name}.log"
+                command_result = _run(
+                    command,
+                    env=env,
+                    cwd=REMOTE_ROOT,
+                    log_path=log_path,
+                    timeout_seconds=1800,
+                )
+                logs[diagnostic_name] = log_path.read_text(encoding="utf-8")
+                issues: list[str] = []
+                if command_result["returncode"] != 0 or command_result["timed_out"]:
+                    issues.append(
+                        "target-only SGLang command failed: "
+                        f"returncode={command_result['returncode']}, "
+                        f"timed_out={command_result['timed_out']}"
+                    )
+                target_row = None
+                try:
+                    target_rows = [
+                        json.loads(line)
+                        for line in output_path.read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    ]
+                    target_row = next(
+                        row for row in target_rows
+                        if isinstance(row, dict) and row.get("type") != "summary"
+                    )
+                except (OSError, json.JSONDecodeError, StopIteration) as exc:
+                    issues.append(f"target-only SGLang output missing or invalid: {exc}")
+
+                comparisons: dict[str, Any] = {}
+                if target_row is not None:
+                    for baseline in sglang_baselines:
+                        spec_path = run_dir / baseline / "vietnews.jsonl"
+                        try:
+                            spec_rows = [
+                                json.loads(line)
+                                for line in spec_path.read_text(encoding="utf-8").splitlines()
+                                if line.strip()
+                            ]
+                            spec_row = next(
+                                row for row in spec_rows
+                                if isinstance(row, dict) and row.get("type") != "summary"
+                            )
+                            comparison = compare_sglang_target_output(spec_row, target_row)
+                        except (OSError, json.JSONDecodeError, StopIteration) as exc:
+                            comparison = {
+                                "status": "failed",
+                                "issues": [f"speculative output missing or invalid: {exc}"],
+                            }
+                        comparisons[baseline] = comparison
+                        issues.extend(
+                            f"{baseline}: {issue}"
+                            for issue in comparison.get("issues", [])
+                        )
+                return {
+                    "status": "passed" if not issues else "failed",
+                    "issues": issues,
+                    "baselines": comparisons,
+                    "target_only": {
+                        key: target_row.get(key)
+                        for key in ("sample_id", "input_tokens", "output_tokens", "e2e_ms", "throughput_tok_s", "text")
+                    } if target_row else None,
+                    "command": command,
+                    "returncode": command_result["returncode"],
+                    "timed_out": command_result["timed_out"],
+                    "elapsed_seconds": command_result["elapsed_seconds"],
+                    "output_path": str(output_path),
+                }
+
             if action == "smoke":
                 focus = run_benchmarks("dspark_focus", ["dspark"], 1800)
                 stages["dspark_focus"] = focus
@@ -1452,6 +1659,13 @@ print(json.dumps({
                     stages["regression"] = matrix
                     overall_status = matrix["status"]
                     errors.extend(matrix["issues"])
+                    target_check = run_sglang_target_diagnostic(
+                        "regression", list(BASELINES)
+                    )
+                    stages["target_only_reference"] = target_check
+                    if target_check["status"] == "failed":
+                        overall_status = "failed"
+                        errors.extend(target_check["issues"])
                 else:
                     overall_status = "failed"
                     errors.extend(focus["issues"])
@@ -1460,6 +1674,13 @@ print(json.dumps({
                 stages["targeted"] = focused
                 overall_status = focused["status"]
                 errors.extend(focused["issues"])
+                target_check = run_sglang_target_diagnostic(
+                    "targeted", selected_baselines
+                )
+                stages["target_only_reference"] = target_check
+                if target_check["status"] == "failed":
+                    overall_status = "failed"
+                    errors.extend(target_check["issues"])
     except Exception as exc:
         overall_status = "failed"
         errors.append(f"{type(exc).__name__}: {exc}")

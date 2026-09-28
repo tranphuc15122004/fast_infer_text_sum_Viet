@@ -25,6 +25,7 @@ from Benchmark.common.benchmark_runtime import (
 from Benchmark.common.data_loader import load_records
 from Benchmark.common.input_utils import truncate_input_ids
 from Benchmark.common.prompt_format import format_chat_prompt
+from Benchmark.common.paired_reference import build_v2_record_fields
 from Benchmark.common.quality_guard import is_degenerate_output
 from Benchmark.common.reproducibility import seed_everything
 
@@ -289,6 +290,21 @@ def _warmup_args(args: argparse.Namespace, *, max_new_tokens: int = 8) -> argpar
     return argparse.Namespace(**values)
 
 
+def _warmup_sample(
+    model: Any,
+    input_ids: torch.Tensor,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> None:
+    """Warm generation kernels on the first real prompt before timing it."""
+
+    warmup_args = _warmup_args(args)
+    for _ in range(max(int(args.warmup_runs), 0)):
+        _generate(model, input_ids, warmup_args)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def _next_token(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     scores = logits[:, -1, :]
     if temperature > 0:
@@ -467,6 +483,8 @@ def _timed_generate(
         if past is None:
             past = static_cache
         next_token = _next_token(prefill.logits, args.temperature)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         generated = [next_token]
         eos_id = tokenizer.eos_token_id
 
@@ -650,26 +668,32 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         },
     }
 
-    with torch.inference_mode():
-        seed_everything(args.seed)
-        warmup_ids = _prompt_batch(tokenizer, "Hello", max_input_tokens=0).to(device)
-        warmup_args = _warmup_args(args)
-        for _ in range(max(args.warmup_runs, 0)):
-            _generate(model, warmup_ids, warmup_args)
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
     writer = io_util.JsonlWriter(Path(args.output))
     successful = 0
+    did_warmup = False
     for sample in records:
-        seed_everything(args.seed)
-        input_ids = _prompt_batch(
+        if not did_warmup:
+            warmup_ids = _prompt_batch(
+                tokenizer,
+                sample["prompt"],
+                max_input_tokens=max(args.max_input_tokens, 0),
+            ).to(device)
+            with torch.inference_mode():
+                seed_everything(args.seed)
+                _warmup_sample(model, warmup_ids, args, device)
+            did_warmup = True
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        request_start = time.perf_counter()
+        prompt_ids = _prompt_batch(
             tokenizer,
             sample["prompt"],
             max_input_tokens=max(args.max_input_tokens, 0),
-        ).to(device)
+        )
+        input_ids = prompt_ids.to(device)
         input_tokens = int(input_ids.shape[1])
         with torch.inference_mode():
+            seed_everything(args.seed)
             output_ids, timing = _timed_generate(
                 model, input_ids, tokenizer, args, device
             )
@@ -680,6 +704,10 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        request_wall_ms = (time.perf_counter() - request_start) * 1000.0
+        prompt_token_ids = prompt_ids[0].tolist()
         timing["model_load_ms"] = model_load_ms
         record = build_sample_record(
             method=method,
@@ -701,6 +729,42 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             },
             text=text,
             reference_output=sample.get("reference"),
+        )
+        special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+        visible_tokens = sum(1 for token in new_ids.tolist() if int(token) not in special_ids)
+        strict_decode_ms = timing.get("decode_ms")
+        record.update(
+            build_v2_record_fields(
+                prompt_token_ids=prompt_token_ids,
+                generation_config={
+                    "temperature": args.temperature,
+                    "max_new_tokens": args.max_new_tokens,
+                    "seed": args.seed,
+                    "stop_token_ids": getattr(tokenizer, "eos_token_id", None),
+                },
+                hardware={
+                    "gpu_name": metadata.get("gpu_name"),
+                    "gpu_capability": metadata.get("gpu_capability"),
+                    "cuda_version": metadata.get("cuda_version"),
+                },
+                request_wall_ms=request_wall_ms,
+                native_elapsed_ms=timing.get("e2e_ms"),
+                native_timing_scope="generation",
+                timed_generated_tokens=output_tokens,
+                visible_output_tokens=visible_tokens,
+                decode_active_ms=strict_decode_ms,
+                decode_token_count=max(output_tokens - 1, 0),
+                decode_phase_definition="after_first_token_committed_to_final_token",
+                decode_phase_verified=strict_decode_ms is not None,
+                timing_source="vanilla_manual_prefill_decode_clock",
+                target_revision=str(args.model),
+                tokenizer_revision=str(getattr(tokenizer, "name_or_path", args.model)),
+                gpu_count=1,
+                tp_size=1,
+                batch_size=1,
+                concurrency=1,
+                cache_policy="no_cross_request_prefix_reuse",
+            )
         )
         record["output_quality_guard"] = {
             "degenerate_repetition": is_degenerate_output(text),

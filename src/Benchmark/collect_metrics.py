@@ -16,7 +16,8 @@ Metric tốc độ (mean/median/p90/std của từng key schema §13):
   + retained_ratio, compression_ratio (suy ra) + key speculative (nếu có).
 
 Paired speedup (ratio of means, dense/reference divided by method):
-  ESR (end-to-end), DSR (decode), prefill_speedup, ttft_speedup.
+  ESR (end-to-end), DSR (decode time), decode throughput normalized by
+  output length, prefill_speedup, ttft_speedup.
   These are emitted only when both sides of the timing pair are present.
 
 Metric semantic (mean, theo từng text key có trong record):
@@ -388,27 +389,68 @@ def compute_group(records: list[dict], data_index: dict) -> dict:
         group["speed"] = speed
     if spec:
         group["speculative"] = spec
+    paired_fidelity = metrics.aggregate_paired_reference_fidelity(records)
+    if paired_fidelity:
+        group["paired_reference_fidelity"] = paired_fidelity
     speedup = metrics.aggregate_speedup(records)
     if speedup:
         group["speedup"] = speedup
-        scopes = sorted(
-            {
-                str(record["speedup_scope"])
-                for record in records
-                if record.get("speedup_scope")
-            }
-        )
+        scopes = set()
+        for record in records:
+            if (
+                record.get("method") == "eagle3"
+                and record.get("speedup_reference_method") is None
+                and record.get("paired_speedup_valid") is True
+            ):
+                scopes.add("paired_eagle_target_greedy")
+            if record.get("speedup_valid") is True and record.get("speedup_scope"):
+                scopes.add(str(record["speedup_scope"]))
+        scopes = sorted(scopes)
         if scopes:
             group["speedup_scope"] = scopes[0] if len(scopes) == 1 else scopes
-        references = sorted(
-            {
-                str(record["external_reference_baseline"])
-                for record in records
-                if record.get("external_reference_baseline")
-            }
+    references = sorted(
+        {
+            str(record["external_reference_baseline"])
+            for record in records
+            if record.get("external_speedup_valid") is True
+            and record.get("external_reference_baseline")
+        }
+    )
+    if references:
+        group["external_reference_baselines"] = references
+    external_decode_pairs = [
+        (float(record["external_reference_decode_ms"]), float(record["decode_ms"]))
+        for record in records
+        if record.get("external_speedup_valid") is True
+        and record.get("external_reference_decode_ms") is not None
+        and record.get("decode_ms") is not None
+        and float(record["external_reference_decode_ms"]) > 0
+        and float(record["decode_ms"]) > 0
+    ]
+    external_e2e_pairs = [
+        (float(record["external_reference_e2e_ms"]), float(record["e2e_ms"]))
+        for record in records
+        if record.get("external_speedup_valid") is True
+        and record.get("external_reference_e2e_ms") is not None
+        and record.get("e2e_ms") is not None
+        and float(record["external_reference_e2e_ms"]) > 0
+        and float(record["e2e_ms"]) > 0
+    ]
+    external_speedup = {}
+    if external_decode_pairs:
+        external_speedup["dsr"] = round(
+            sum(reference for reference, _ in external_decode_pairs)
+            / sum(method for _, method in external_decode_pairs),
+            4,
         )
-        if references:
-            group["external_reference_baselines"] = references
+    if external_e2e_pairs:
+        external_speedup["esr"] = round(
+            sum(reference for reference, _ in external_e2e_pairs)
+            / sum(method for _, method in external_e2e_pairs),
+            4,
+        )
+    if external_speedup:
+        group["external_speedup"] = external_speedup
     if semantic:
         group["semantic"] = semantic
     code_completion = metrics.aggregate_code_completion(records)
@@ -468,6 +510,8 @@ def main() -> None:
     parser.add_argument("--csv", type=Path, default=None, help="bảng CSV")
     parser.add_argument("--md", type=Path, default=None, help="báo cáo markdown")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--paper-speedup", action="store_true",
+                        help="rebuild contract-v2 paired speedup/audit artifacts from raw JSONL")
     parser.add_argument(
         "--strict", action="store_true",
         help="fail before writing reports when the expected matrix is incomplete",
@@ -570,6 +614,18 @@ def main() -> None:
     write_csv(csv_path, result, datasets)
     md_path = Path(args.md) if args.md else outputs_dir / "metrics_summary.md"
     write_markdown(md_path, result, datasets)
+    manifest_path = outputs_dir / "run_manifest.json"
+    paper_enabled = args.paper_speedup
+    if manifest_path.is_file():
+        try:
+            paper_enabled = paper_enabled or bool(json.loads(manifest_path.read_text(encoding="utf-8")).get("paper_speedup"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    if paper_enabled:
+        from Benchmark.common.paired_reference import write_paper_report
+
+        paths = write_paper_report(outputs_dir)
+        print(f"Saved contract-v2 paper report: {paths['markdown']}")
 
     print("\nTóm tắt (mean):")
     print(f"{'method':<22}{'dataset':<14}{'e2e_ms':>10}{'tok/s':>9}{'rouge2':>8}{'bleu2':>8}{'n':>5}")

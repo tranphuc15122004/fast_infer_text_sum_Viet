@@ -18,6 +18,9 @@ import torch
 
 from Benchmark.common import io_util, metrics, rouge, verify
 from Benchmark.common.data_loader import load_records
+from Benchmark.common.benchmark_runtime import runtime_metadata
+from Benchmark.common.paired_reference import build_v2_record_fields
+from Benchmark.dflash_timing_patch import apply_dflash_timing_patch
 from Benchmark.common.input_utils import truncate_input_ids
 from Benchmark.common.prompt_format import format_chat_prompt
 from Benchmark.common.paths import ROOT
@@ -55,34 +58,37 @@ def round_optional(value: float | None, digits: int = 3) -> float | None:
 
 
 def summarize_acceptance(
-    acceptance_lengths: list[int], *, block_size: int
-) -> dict[str, float | None]:
-    """Normalize DFlash block acceptance telemetry for the shared schema."""
+    acceptance_lengths: list[int],
+    *,
+    block_size: int,
+    draft_tokens_accepted: int | None = None,
+    draft_tokens_proposed: int | None = None,
+) -> dict[str, int | float | str | None]:
+    """Normalize DFlash trace and candidate counters to the shared schema."""
+    from Benchmark.common.speculative_metrics import normalize_speculative_acceptance
 
-    if not acceptance_lengths:
-        return {
-            "avg_accept_length": None,
-            "acceptance_rate": None,
-            "rejected_draft_ratio": None,
-        }
-    average = sum(float(value) for value in acceptance_lengths) / len(acceptance_lengths)
+    steps = len(acceptance_lengths)
+    accepted = draft_tokens_accepted
+    proposed = draft_tokens_proposed
     if block_size <= 1:
-        acceptance_rate = None
-        rejected_ratio = None
-    else:
-        proposed = len(acceptance_lengths) * (block_size - 1)
-        accepted_draft = sum(max(0, int(value) - 1) for value in acceptance_lengths)
-        acceptance_rate = round(accepted_draft / proposed, 4) if proposed else None
-        rejected_ratio = (
-            round(1.0 - acceptance_rate, 4)
-            if acceptance_rate is not None
-            else None
-        )
-    return {
-        "avg_accept_length": round(average, 4),
-        "acceptance_rate": acceptance_rate,
-        "rejected_draft_ratio": rejected_ratio,
-    }
+        accepted = None
+        proposed = None
+    elif accepted is None and proposed is None and steps:
+        proposed = steps * (block_size - 1)
+        accepted = sum(max(0, int(value) - 1) for value in acceptance_lengths)
+
+    trace_average = (
+        sum(float(value) for value in acceptance_lengths) / steps
+        if steps
+        else None
+    )
+    normalized = normalize_speculative_acceptance(
+        verification_steps=steps,
+        draft_tokens_accepted=accepted,
+        draft_tokens_proposed=proposed,
+        fallback_avg_accept_length=trace_average,
+    )
+    return {**normalized, "draft_proposal_unit": "linear_draft_slot"}
 
 
 def normalize_generation_token_ids(config, tokenizer) -> dict[str, tuple[int, int]]:
@@ -224,6 +230,7 @@ def main() -> None:
         args.max_new_tokens = min(args.max_new_tokens, 32)
 
     dtype, attn_impl = _dtype_and_attention()
+    dflash_timing_patch = apply_dflash_timing_patch(ROOT)
     install_dflash_transformers_compat()
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     import dflash.model as dflash_model
@@ -271,6 +278,15 @@ def main() -> None:
     else:
         prompts = [{"id": "prompt", "prompt": args.prompt, "reference": None}]
 
+    runtime = runtime_metadata()
+    hardware = {
+        "gpu_name": runtime.get("gpu_name"),
+        "gpu_capability": runtime.get("gpu_capability"),
+        "cuda_version": runtime.get("cuda_version"),
+    }
+    stop_token_ids = target_config.eos_token_id
+    if isinstance(stop_token_ids, int):
+        stop_token_ids = [stop_token_ids]
     block_size = args.block_size or int(draft.block_size)
     writer = io_util.JsonlWriter(Path(args.output))
     checks: list[tuple[bool, str]] = []
@@ -317,6 +333,19 @@ def main() -> None:
                 temperature=args.temperature,
                 block_size=1,
             )
+        torch.cuda.synchronize(device)
+        request_start = time.perf_counter()
+        # Recreate prompt IDs inside the timed request boundary. The preceding
+        # encoding is used only for warmup and the same-runtime reference.
+        prompt = _format_prompt(tokenizer, sample)
+        encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        input_ids = encoded.input_ids
+        if args.max_input_tokens and args.max_input_tokens > 0 \
+                and input_ids.shape[1] > args.max_input_tokens:
+            input_ids = truncate_input_ids(input_ids, args.max_input_tokens).contiguous()
+        prompt_token_ids = input_ids[0].tolist()
+        input_ids = input_ids.to(device)
+        input_len = int(input_ids.shape[1])
         seed_everything(args.seed)
         torch.cuda.reset_peak_memory_stats(device)
         result, elapsed = _run_generation(
@@ -327,14 +356,16 @@ def main() -> None:
         )
 
         output_ids = result.output_ids[0, input_len:]
-        baseline_ids = (
-            baseline.output_ids[0, input_len:] if baseline is not None else None
-        )
         text = tokenizer.decode(
             output_ids,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         ).strip()
+        torch.cuda.synchronize(device)
+        request_wall_ms = (time.perf_counter() - request_start) * 1000.0
+        baseline_ids = (
+            baseline.output_ids[0, input_len:] if baseline is not None else None
+        )
         baseline_text = None
         if baseline_ids is not None:
             baseline_text = tokenizer.decode(
@@ -402,14 +433,114 @@ def main() -> None:
             "draft_tokens_proposed": getattr(result, "draft_tokens_proposed", None),
             "draft_tokens_accepted": getattr(result, "draft_tokens_accepted", None),
             **summarize_acceptance(
-                list(result.acceptance_lengths), block_size=block_size
+                list(result.acceptance_lengths),
+                block_size=block_size,
+                draft_tokens_accepted=getattr(
+                    result, "draft_tokens_accepted", None
+                ),
+                draft_tokens_proposed=getattr(
+                    result, "draft_tokens_proposed", None
+                ),
             ),
-            "speedup_scope": "paired_dflash_block_size_1" if baseline is not None else None,
-            "speedup_valid": (
-                baseline is not None
-                and baseline_n_tok == n_tok
+            "speedup_scope": (
+                "paired_target_only"
+                if baseline is not None
+                else None
+            ),
+            "speedup_reference_method": (
+                "dflash_block_size_1" if baseline is not None else None
+            ),
+            "paired_output_exact_match": (
+                text == baseline_text if baseline_text is not None else None
+            ),
+            "paired_output_token_ids_match": (
+                torch.equal(output_ids, baseline_ids)
+                if baseline_ids is not None
+                else None
+            ),
+            "paired_output_token_count_match": (
+                baseline_n_tok == n_tok if baseline_n_tok is not None else None
+            ),
+            "paired_output_token_ratio": (
+                round(n_tok / baseline_n_tok, 4)
+                if baseline_n_tok is not None and baseline_n_tok > 0
+                else None
             ),
         }
+        visible_tokens = sum(
+            1 for token in output_ids.tolist()
+            if int(token) not in set(getattr(tokenizer, "all_special_ids", []) or [])
+        )
+        record.update(
+            build_v2_record_fields(
+                prompt_token_ids=prompt_token_ids,
+                generation_config={
+                    "temperature": args.temperature,
+                    "max_new_tokens": args.max_new_tokens,
+                    "seed": args.seed,
+                    "stop_token_ids": stop_token_ids,
+                },
+                hardware=hardware,
+                request_wall_ms=request_wall_ms,
+                native_elapsed_ms=e2e_ms,
+                native_timing_scope="generation",
+                timed_generated_tokens=n_tok,
+                visible_output_tokens=visible_tokens,
+                decode_active_ms=getattr(result, "strict_decode_active_ms", None),
+                decode_token_count=getattr(result, "strict_decode_token_count", None),
+                decode_phase_definition=getattr(result, "strict_decode_phase_definition", None),
+                decode_phase_verified=getattr(result, "strict_decode_phase_verified", False) is True,
+                timing_source=f"{dflash_timing_patch['patch_version']}:{dflash_timing_patch['patched_source_sha256']}",
+                target_revision=str(args.target_model),
+                tokenizer_revision=str(getattr(tokenizer, "name_or_path", args.target_model)),
+                gpu_count=1,
+                tp_size=1,
+                batch_size=1,
+                concurrency=1,
+                cache_policy="no_cross_request_prefix_reuse",
+            )
+        )
+        if baseline is not None and baseline_elapsed is not None:
+            baseline_visible_tokens = sum(
+                1 for token in baseline_ids.tolist()
+                if int(token) not in set(getattr(tokenizer, "all_special_ids", []) or [])
+            )
+            record["native_reference"] = {
+                **build_v2_record_fields(
+                    prompt_token_ids=prompt_token_ids,
+                    generation_config={
+                        "temperature": args.temperature,
+                        "max_new_tokens": args.max_new_tokens,
+                        "seed": args.seed,
+                        "stop_token_ids": stop_token_ids,
+                    },
+                    hardware=hardware,
+                    native_elapsed_ms=base_e2e_ms,
+                    native_timing_scope="generation",
+                    timed_generated_tokens=baseline_n_tok,
+                    visible_output_tokens=baseline_visible_tokens,
+                    decode_active_ms=getattr(baseline, "strict_decode_active_ms", None),
+                    decode_token_count=getattr(baseline, "strict_decode_token_count", None),
+                    decode_phase_definition=getattr(baseline, "strict_decode_phase_definition", None),
+                    decode_phase_verified=getattr(baseline, "strict_decode_phase_verified", False) is True,
+                    timing_source=f"{dflash_timing_patch['patch_version']}:{dflash_timing_patch['patched_source_sha256']}",
+                    target_revision=str(args.target_model),
+                    tokenizer_revision=str(getattr(tokenizer, "name_or_path", args.target_model)),
+                    gpu_count=1,
+                    tp_size=1,
+                    batch_size=1,
+                    concurrency=1,
+                    cache_policy="no_cross_request_prefix_reuse",
+                ),
+                "sample_id": sample["id"],
+                "dataset": sample.get("raw", {}).get("dataset", Path(args.data_file).stem if args.data_file else "prompt"),
+                "method": "dflash_block_size_1",
+                "status": "success",
+                "text": baseline_text,
+                "output_tokens": baseline_n_tok,
+            }
+        record["dflash_timing_patch"] = dflash_timing_patch
+        record["speedup_valid"] = metrics.has_valid_paired_speedup(record)
         if record["task_type"] == "code_completion":
             metrics.add_code_completion(record, text, sample.get("reference"))
         else:
@@ -441,7 +572,14 @@ def main() -> None:
         "method": "dflash",
         "num_samples": len(prompts),
         "block_size": block_size,
+        "speedup_scope": (
+            "paired_target_only" if not args.skip_reference else None
+        ),
+        "speedup_reference_method": (
+            "dflash_block_size_1" if not args.skip_reference else None
+        ),
         "speedup": metrics.aggregate_speedup(writer.records),
+        **metrics.aggregate_paired_reference_fidelity(writer.records),
         **quality,
     }
     writer.finalize(summary)

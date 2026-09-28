@@ -371,3 +371,32 @@ def test_metric_collector_ignores_retry_attempt_artifacts(tmp_path) -> None:
 
     assert len(loaded["records"]) == 1
     assert loaded["records"][0]["e2e_ms"] == 1.0
+
+
+def test_anchor_drift_requires_all_six_baselines_and_three_samples():
+    from Benchmark.common.paired_reference import PAPER_BASELINES
+    from Benchmark.run_longbench_200 import _anchor_drift
+
+    start = {
+        "observations": {
+            baseline: {"short": 100.0, "medium": 200.0, "long": 300.0}
+            for baseline in PAPER_BASELINES
+        }
+    }
+    within_threshold = {
+        "observations": {
+            baseline: {"short": 109.0, "medium": 190.0, "long": 303.0}
+            for baseline in PAPER_BASELINES
+        }
+    }
+    result = _anchor_drift(start, within_threshold)
+    assert result["status"] == "pass"
+    assert abs(result["maximum_absolute_drift_percent"] - 9.0) < 1e-9
+
+    over_threshold = {"observations": {key: dict(value) for key, value in within_threshold["observations"].items()}}
+    over_threshold["observations"][PAPER_BASELINES[0]]["long"] = 334.0
+    assert _anchor_drift(start, over_threshold)["status"] == "failed"
+
+    incomplete = {"observations": {key: dict(value) for key, value in start["observations"].items()}}
+    del incomplete["observations"][PAPER_BASELINES[-1]]["medium"]
+    assert _anchor_drift(start, incomplete)["status"] == "failed"

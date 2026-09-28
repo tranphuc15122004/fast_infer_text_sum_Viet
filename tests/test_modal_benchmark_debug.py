@@ -83,6 +83,32 @@ def test_validate_smoke_result_rejects_missing_dependency_even_on_zero_exit() ->
     assert any("missing_dependency" in issue for issue in result["issues"])
 
 
+def test_compare_sglang_target_output_requires_exact_greedy_match() -> None:
+    from modal_benchmark_debug import compare_sglang_target_output
+
+    target = {
+        "status": "success",
+        "sample_id": "vietnews-1",
+        "input_tokens": 238,
+        "output_tokens": 94,
+        "e2e_ms": 400.0,
+        "text": "summary exact",
+    }
+    speculative = {**target, "e2e_ms": 300.0}
+
+    result = compare_sglang_target_output(speculative, target)
+    assert result["status"] == "passed"
+    assert result["output_match"] is True
+    assert result["same_backend_e2e_speedup"] == 1.3333
+
+    result = compare_sglang_target_output(
+        {**speculative, "text": "different text"}, target
+    )
+    assert result["status"] == "failed"
+    assert result["output_match"] is False
+    assert "output_text_mismatch" in result["issues"]
+
+
 def test_run_persists_complete_output_log(tmp_path: Path) -> None:
     from modal_benchmark_debug import _run
 
@@ -270,6 +296,15 @@ def test_modal_gpu_preflight_accepts_only_blackwell_b200() -> None:
     )
     assert any("B200" in issue for issue in issues)
     assert any("Blackwell" in issue for issue in issues)
+
+
+def test_modal_gpu_preflight_accepts_cost_optimized_h200_neighbor() -> None:
+    from modal_benchmark_debug import modal_gpu_preflight_issues
+
+    assert modal_gpu_preflight_issues(
+        {"cuda_available": True, "gpu": "NVIDIA H200", "compute_capability": [9, 0]},
+        requested_gpu="H200",
+    ) == []
 
 
 

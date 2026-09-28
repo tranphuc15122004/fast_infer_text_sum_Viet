@@ -44,6 +44,12 @@ from Benchmark.common.metric_audit import (  # noqa: E402
     audit_output_file,
     format_audit_log,
 )
+from Benchmark.common.quality_guard import is_degenerate_output  # noqa: E402
+from Benchmark.common.paired_reference import (  # noqa: E402
+    PAPER_BASELINES,
+    build_v2_record_fields,
+    write_paper_report,
+)
 from Benchmark.common.longbench_adapter import (  # noqa: E402
     BASELINES,
     DISABLED_MATRIX_BASELINES,
@@ -96,39 +102,14 @@ def _filter_matrix_baselines(values: Sequence[str]) -> tuple[list[str], list[str
     return selected, skipped
 
 
-def _reference_quality_error(path: Path) -> str | None:
-    """Reject a dense reference with a known degenerate output."""
-
-    try:
-        rows = [
-            json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-    except (OSError, json.JSONDecodeError) as exc:
-        return f"reference is not readable JSONL: {exc}"
-    bad_samples: list[Any] = []
-    for row in rows:
-        if row.get("type") == "summary":
-            continue
-        guard = row.get("output_quality_guard")
-        if row.get("degenerate_repetition") or (
-            isinstance(guard, Mapping) and guard.get("degenerate_repetition")
-        ):
-            bad_samples.append(row.get("sample_id"))
-    if bad_samples:
-        return f"degenerate output on samples {bad_samples[:5]}"
-    return None
-
-
 def _select_external_reference(
     run_dir: Path, dataset: str, baselines: Sequence[str]
 ) -> Path | None:
     """Select an already-computed batch-1 Vanilla record file.
 
-    FlashAttention is preferred because it is the closest target-only
-    reference for the speculative paths; Vanilla HF remains a deterministic
-    fallback when FA was not requested or failed before writing output.
+    FlashAttention is preferred for the supplemental external Vanilla
+    comparison; Vanilla HF is the fallback when FA was not requested or failed.
+    Speculative adapters record their own paired target-only reference timings.
     """
 
     preferred = os.environ.get("LONG_BENCH_REFERENCE_BASELINE", "vanilla_fa")
@@ -163,7 +144,6 @@ def _select_external_reference(
             candidate.is_file()
             and candidate.stat().st_size > 0
             and usable(candidate)
-            and _reference_quality_error(candidate) is None
         ):
             return candidate
     return None
@@ -175,13 +155,11 @@ def _attach_external_reference_metrics(
     *,
     reference_baseline: str,
 ) -> int:
-    """Join Vanilla timing onto speculative records without another infer.
+    """Join an external Vanilla pass without replacing a method-owned pair.
 
-    The join is by ``sample_id``.  Existing paired fields are preserved; this
-    function adds explicit ``external_*`` fields and uses the common
-    ``dense_*`` aliases so the collector can aggregate DSR/ESR consistently.
+    Timing availability controls whether a ratio exists. Output agreement,
+    output length, and degeneracy are recorded as separate fidelity signals.
     """
-
     if not path.is_file() or not reference_path.is_file():
         return 0
     rows = [
@@ -199,6 +177,13 @@ def _attach_external_reference_metrics(
         if row.get("type") != "summary" and row.get("sample_id") is not None
     }
 
+    def positive(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
+
     attached = 0
     decode_pairs: list[tuple[float, float]] = []
     e2e_pairs: list[tuple[float, float]] = []
@@ -210,81 +195,108 @@ def _attach_external_reference_metrics(
             continue
 
         row["external_reference_baseline"] = reference_baseline
-        row["speedup_scope"] = "external_reference"
+        row["external_speedup_scope"] = "external_reference"
+        method_scope = str(row.get("speedup_scope") or "")
+        has_method_owned_pair = method_scope.startswith("paired_")
         for source, target in (
             ("prefill_ms", "dense_prefill_ms"),
             ("ttft_ms", "dense_ttft_ms"),
             ("decode_ms", "dense_decode_ms"),
             ("e2e_ms", "dense_e2e_ms"),
         ):
-            if row.get(target) is None and reference.get(source) is not None:
-                row[target] = reference[source]
-            if reference.get(source) is not None:
-                row[f"external_reference_{source}"] = reference[source]
+            reference_value = reference.get(source)
+            if reference_value is not None:
+                row[f"external_reference_{source}"] = reference_value
+                if not has_method_owned_pair and row.get(target) is None:
+                    row[target] = reference_value
 
-        # A throughput ratio is meaningful only when both methods generated
-        # the same number of public output tokens.  FAFO can expose draft /
-        # lookahead tokens and older smoke runs compared 32 FAFO tokens with
-        # 8 Vanilla tokens, which produces a plausible but invalid speedup.
         method_tokens = row.get("output_tokens")
         reference_tokens = reference.get("output_tokens")
         try:
             method_tokens_int = int(method_tokens)
             reference_tokens_int = int(reference_tokens)
         except (TypeError, ValueError):
-            same_output_budget = False
+            token_count_match = None
+            token_ratio = None
         else:
-            same_output_budget = (
-                method_tokens_int > 0
-                and reference_tokens_int > 0
-                and method_tokens_int == reference_tokens_int
+            token_count_match = method_tokens_int == reference_tokens_int
+            token_ratio = (
+                round(method_tokens_int / reference_tokens_int, 4)
+                if reference_tokens_int > 0
+                else None
             )
-        row["speedup_valid"] = same_output_budget
-        if not same_output_budget:
-            row["speedup_invalid_reason"] = (
-                "output_token_count_mismatch_or_missing"
-            )
+        method_text = row.get("text") or row.get("answer")
+        reference_text = reference.get("text") or reference.get("answer")
+        row["external_reference_output_tokens"] = reference_tokens
+        row["external_reference_output_token_count_match"] = token_count_match
+        row["external_reference_output_token_ratio"] = token_ratio
+        row["external_reference_output_exact_match"] = (
+            method_text == reference_text
+            if isinstance(method_text, str) and isinstance(reference_text, str)
+            else None
+        )
+        guard = row.get("output_quality_guard")
+        row["output_degenerate"] = bool(
+            row.get("degenerate_repetition")
+            or (isinstance(guard, Mapping) and guard.get("degenerate_repetition"))
+            or is_degenerate_output(str(row.get("text") or row.get("answer") or ""))
+        )
 
-        spec_decode = row.get("decode_ms")
-        ref_decode = reference.get("decode_ms")
-        if (
-            same_output_budget
-            and spec_decode
-            and ref_decode
-            and float(spec_decode) > 0
+        external_valid = False
+        both_successful = (
+            row.get("status", "success") == "success"
+            and reference.get("status", "success") == "success"
+        )
+        for timing_name, row_key, reference_key, pairs in (
+            ("decode", "decode_ms", "decode_ms", decode_pairs),
+            ("e2e", "e2e_ms", "e2e_ms", e2e_pairs),
         ):
-            value = round(float(ref_decode) / float(spec_decode), 4)
-            row["external_decode_speedup"] = value
-            decode_pairs.append((float(ref_decode), float(spec_decode)))
-        spec_e2e = row.get("e2e_ms")
-        ref_e2e = reference.get("e2e_ms")
-        if (
-            same_output_budget
-            and spec_e2e
-            and ref_e2e
-            and float(spec_e2e) > 0
-        ):
-            value = round(float(ref_e2e) / float(spec_e2e), 4)
-            row["external_e2e_speedup"] = value
-            e2e_pairs.append((float(ref_e2e), float(spec_e2e)))
+            method_time = positive(row.get(row_key)) if both_successful else None
+            reference_time = positive(reference.get(reference_key)) if both_successful else None
+            if method_time is None or reference_time is None:
+                continue
+            external_valid = True
+            row[f"external_{timing_name}_speedup"] = round(
+                reference_time / method_time, 4
+            )
+            pairs.append((reference_time, method_time))
+
+        row["external_speedup_valid"] = external_valid
+        if not has_method_owned_pair:
+            row["speedup_scope"] = "external_reference"
+            row["speedup_valid"] = external_valid
+            row["speedup"] = (
+                row.get("external_e2e_speedup")
+                or row.get("external_decode_speedup")
+            )
+            if not external_valid:
+                row["speedup_invalid_reason"] = "paired_timing_missing_or_invalid"
+            else:
+                row.pop("speedup_invalid_reason", None)
         attached += 1
 
     for row in rows:
         if row.get("type") != "summary":
             continue
-        row["speedup_scope"] = "external_reference"
         row["external_reference_baseline"] = reference_baseline
+        row.setdefault("speedup_scope", "external_reference")
+        row["external_speedup_valid"] = bool(decode_pairs or e2e_pairs)
         if decode_pairs:
             row["external_decode_speedup"] = round(
-                sum(ref for ref, _ in decode_pairs)
-                / sum(spec for _, spec in decode_pairs),
+                sum(reference_time for reference_time, _ in decode_pairs)
+                / sum(method_time for _, method_time in decode_pairs),
                 4,
             )
         if e2e_pairs:
             row["external_e2e_speedup"] = round(
-                sum(ref for ref, _ in e2e_pairs)
-                / sum(spec for _, spec in e2e_pairs),
+                sum(reference_time for reference_time, _ in e2e_pairs)
+                / sum(method_time for _, method_time in e2e_pairs),
                 4,
+            )
+        if not str(row.get("speedup_scope") or "").startswith("paired_"):
+            row["speedup"] = (
+                row.get("external_e2e_speedup")
+                or row.get("external_decode_speedup")
             )
 
     path.write_text(
@@ -387,6 +399,44 @@ def _effective_cuda_available() -> bool:
     if requested.startswith("cpu"):
         return False
     return _cuda_available()
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _paper_code_fingerprint() -> str:
+    tracked_sources = (
+        "src/Benchmark/run_longbench_200.py",
+        "src/Benchmark/collect_metrics.py",
+        "src/Benchmark/common/paired_reference.py",
+        "src/Benchmark/common/benchmark_runtime.py",
+        "src/Benchmark/common/benchmark_data.py",
+        "src/Benchmark/common/data_loader.py",
+        "src/Benchmark/common/io_util.py",
+        "src/Benchmark/common/metric_audit.py",
+        "src/Benchmark/common/metrics.py",
+        "src/Benchmark/common/quality_guard.py",
+        "src/Benchmark/common/rouge.py",
+        "src/Benchmark/common/speculative_metrics.py",
+        "src/Benchmark/common/longbench_adapter.py",
+        "src/Benchmark/common/vanilla_inference.py",
+        "src/Benchmark/eagle_compat.py",
+        "src/Benchmark/infer_dflash.py",
+        "src/Benchmark/dflash_timing_patch.py",
+        "src/Benchmark/eagle3_infer_qwen3.py",
+        "src/Benchmark/eagle_timing_patch.py",
+        "src/Benchmark/infer_sglang_spec.py",
+    )
+    digest = hashlib.sha256()
+    for relative in tracked_sources:
+        path = ROOT / relative
+        digest.update(relative.encode("utf-8") + b"\0")
+        digest.update(path.read_bytes() if path.is_file() else b"<missing>")
+    return digest.hexdigest()
 
 
 def _source_manifest_hash(data_dir: Path) -> str | None:
@@ -1607,6 +1657,7 @@ def _run_collector(
     expected_samples: int,
     strict: bool,
     timeout_seconds: int,
+    paper_speedup: bool = False,
 ) -> dict[str, Any]:
     """Run the metric collector over a finished run directory.
 
@@ -1634,6 +1685,8 @@ def _run_collector(
         "--md",
         str(run_dir / "metrics_summary.md"),
     ]
+    if paper_speedup:
+        command.append("--paper-speedup")
     if strict:
         command += [
             "--strict",
@@ -2173,6 +2226,7 @@ def _normalize_child_output(
     if not rows:
         return 0
     by_id = {str(row["id"]): row for row in source_records if row.get("id") is not None}
+    sample_order = {str(row["id"]): index for index, row in enumerate(source_records) if row.get("id") is not None}
     normalized_rows: list[dict[str, Any]] = []
     observations = 0
     for original in rows:
@@ -2206,6 +2260,12 @@ def _normalize_child_output(
             row["output_tokens"] = row["new_tokens"]
         if row.get("text") is None and isinstance(row.get("answer"), str):
             row["text"] = row["answer"]
+        generated_text = str(row.get("text") or "")
+        prior_guard = row.get("output_quality_guard")
+        quality_guard = dict(prior_guard) if isinstance(prior_guard, Mapping) else {}
+        quality_guard["degenerate_repetition"] = is_degenerate_output(generated_text)
+        quality_guard["action"] = "invalidate_metric_contract"
+        row["output_quality_guard"] = quality_guard
         if row.get("decode_ms") is None and row.get("eagle_time") is not None:
             row["decode_ms"] = round(float(row["eagle_time"]) * 1000.0, 3)
         if row.get("throughput_tok_s") is None and row.get("eagle_tok_s") is not None:
@@ -2227,6 +2287,7 @@ def _normalize_child_output(
         sample_id = row.get("sample_id")
         source = by_id.get(str(sample_id)) if sample_id is not None else None
         if source:
+            row.setdefault("sample_order", sample_order.get(str(sample_id)))
             row.setdefault("reference_output", source.get("reference_output"))
             row.setdefault("task_type", source.get("task_type"))
         if row.get("task_type") is None and source_records:
@@ -2523,6 +2584,353 @@ def print_gpu_inventory(report: Mapping[str, Any]) -> None:
         print("\nNote: no CUDA device is visible to torch -> inference will run on CPU.")
 
 
+def _pin_paper_baselines(values: Sequence[str], common_reference: str) -> list[str]:
+    requested = list(values)
+    if len(requested) != len(set(requested)) or set(requested) != set(PAPER_BASELINES):
+        raise SystemExit("--paper-speedup requires exactly these six baselines: " + ", ".join(PAPER_BASELINES))
+    if common_reference not in PAPER_BASELINES:
+        raise SystemExit(f"unsupported common reference: {common_reference}")
+    return [common_reference] + [baseline for baseline in PAPER_BASELINES if baseline != common_reference]
+
+
+def _validate_paper_smoke_audit(
+    path: Path, *, common_reference: str, model: str | None,
+    temperature: float | None = None, seed: int | None = None,
+    max_input_tokens: int | None = None,
+    effective_configs: Mapping[str, Any] | None = None,
+    target_revision: str | None = None,
+    tokenizer_revision: str | None = None,
+    dataset_sha256: Mapping[str, str | None] | None = None,
+) -> dict[str, Any]:
+    candidate = Path(path)
+    audit_path = candidate / "audit_v2.json" if candidate.is_dir() else candidate
+    try:
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot read paper smoke audit {audit_path}: {exc}") from exc
+    gate = audit.get("paper_gate") or {}
+    if gate.get("status") != "smoke_pass":
+        raise SystemExit(f"paper smoke audit gate did not pass: {gate.get('status')!r} ({gate.get('reason')})")
+    if audit.get("common_reference") != common_reference:
+        raise SystemExit("paper smoke and full run must use the same common reference")
+    manifest_path = audit_path.parent / "run_manifest.json"
+    try:
+        smoke_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"paper smoke run manifest is missing or invalid: {manifest_path}") from exc
+    if set(smoke_manifest.get("baselines") or []) != set(PAPER_BASELINES):
+        raise SystemExit("paper smoke audit does not cover all six baselines")
+    if set(smoke_manifest.get("datasets") or []) != set(DATASETS):
+        raise SystemExit("paper smoke audit does not cover all four datasets")
+    smoke_model = smoke_manifest.get("model")
+    if model and smoke_model and str(model) != str(smoke_model):
+        raise SystemExit("paper smoke and full run target models differ")
+    for key, expected in (("target_revision", target_revision), ("tokenizer_revision", tokenizer_revision)):
+        observed = smoke_manifest.get(key)
+        if expected is not None and observed != expected:
+            raise SystemExit(f"paper smoke and full run differ in {key}")
+    expected_hashes = dict(dataset_sha256 or {})
+    if expected_hashes:
+        smoke_hashes = smoke_manifest.get("dataset_sha256") or {}
+        for dataset, expected in expected_hashes.items():
+            if smoke_hashes.get(dataset) != expected:
+                raise SystemExit(f"paper smoke and full run dataset content differs: {dataset}")
+    smoke_generation = smoke_manifest.get("generation_config") or {}
+    for key, expected in (("temperature", temperature), ("seed", seed), ("max_input_tokens", max_input_tokens)):
+        if expected is not None and key in smoke_generation and smoke_generation[key] != expected:
+            raise SystemExit(f"paper smoke and full run differ in {key}")
+    smoke_configs = smoke_manifest.get("baseline_effective_configs") or {}
+    for baseline, expected_config in (effective_configs or {}).items():
+        prior_config = smoke_configs.get(baseline) or {}
+        for key in (
+            "model", "dtype", "batch_size", "max_running_requests", "tp_size",
+            "attention_backend", "mem_fraction_static", "warmup_runs",
+            "max_input_tokens", "temperature", "seed",
+        ):
+            if key in prior_config and prior_config.get(key) != expected_config.get(key):
+                raise SystemExit(f"paper smoke and full run differ in {baseline}.{key}")
+    smoke_algorithms = smoke_manifest.get("speculative_algorithms") or {}
+    if smoke_algorithms and smoke_algorithms != {
+        "eagle3": "EAGLE3", "dflash": "DFlash block-size-1 native reference plus speculative block size",
+        "domino": os.environ.get("LONG_BENCH_DOMINO_ALGORITHM", "DFLASH"),
+        "dspark": os.environ.get("LONG_BENCH_DSPARK_ALGORITHM", "DSPARK"),
+    }:
+        raise SystemExit("paper smoke and full run speculative algorithm settings differ")
+    return {"audit": str(audit_path), "run_manifest": str(manifest_path), "run_id": smoke_manifest.get("run_id")}
+
+
+def _create_shared_sglang_reference(
+    *,
+    dataset: str,
+    source_rows: Sequence[Mapping[str, Any]],
+    normalized: Sequence[Mapping[str, Any]],
+    run_dir: Path,
+    subset_path: Path,
+    run_id: str,
+    model: str | None,
+    temperature: float,
+    warmup_runs: int,
+    max_input_tokens: int,
+    seed: int,
+    max_new_tokens: int,
+    timeout_seconds: int,
+    vram: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Create exactly one no-prefix-cache SGLang target-only sidecar per dataset."""
+    output_path = run_dir / "references" / "sglang_target_only" / f"{dataset}.jsonl"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg = baseline_config_from_env("domino")
+    cfg.update(
+        model=model or cfg.get("model"),
+        device="cuda",
+        temperature=temperature,
+        warmup_runs=warmup_runs,
+        max_input_tokens=max_input_tokens,
+        seed=seed,
+        smoke=False,
+        max_new_tokens=max_new_tokens,
+        batch_size=1,
+        max_running_requests=1,
+        paper_speedup=True,
+        disable_radix_cache=True,
+        target_only_reference_file=None,
+        skip_reference=False,
+    )
+    child = _execute_cell_once(
+        baseline="target_only",
+        dataset=dataset,
+        source_rows=source_rows,
+        normalized=normalized,
+        run_dir=run_dir,
+        subset_path=subset_path,
+        output_path=output_path,
+        cfg=cfg,
+        dp_enabled=False,
+        dp_groups=[],
+        timeout_seconds=timeout_seconds,
+        run_id=run_id,
+        processes_per_gpu=1,
+        vram=vram,
+        max_new_tokens=max_new_tokens,
+    )
+    result = dict(child)
+    result.update(path=str(output_path), expected_samples=len(normalized), success_samples=0)
+    if child.get("status") != "success" or not output_path.is_file():
+        result["status"] = "failed"
+        result["reason"] = child.get("reason") or "SGLang target-only child did not complete"
+        return result
+    try:
+        _normalize_child_output(
+            output_path,
+            baseline="target_only",
+            dataset=dataset,
+            source_records=normalized,
+            config=cfg,
+            run_id=run_id,
+        )
+        rows = _jsonl_rows(output_path)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        result["status"] = "failed"
+        result["reason"] = f"could not normalize target-only sidecar: {type(exc).__name__}: {exc}"
+        return result
+    observations = [row for row in rows if row.get("type") != "summary"]
+    expected_ids = [str(row["id"]) for row in normalized]
+    observed_ids = [str(row.get("sample_id")) for row in observations if row.get("sample_id") is not None]
+    if len(observations) != len(expected_ids) or len(observed_ids) != len(set(observed_ids)) or set(observed_ids) != set(expected_ids):
+        result["status"] = "failed"
+        result["reason"] = "target-only sidecar sample coverage is incomplete or duplicated"
+        result["observed_sample_ids"] = observed_ids
+        return result
+    invalid = [
+        str(row.get("sample_id")) for row in observations
+        if row.get("status", "success") != "success"
+        or row.get("contract_version") != 2
+        or not row.get("prompt_token_sha256")
+        or not row.get("generation_config_sha256")
+        or not row.get("hardware_fingerprint")
+        or row.get("prompt_token_count_match") is not True
+    ]
+    if invalid:
+        result["status"] = "failed"
+        result["reason"] = "target-only sidecar has failed, mismatched prompt-token counts, or incomplete v2 rows"
+        result["invalid_sample_ids"] = invalid
+        return result
+    result.update(
+        status="success",
+        success_samples=len(observations),
+        prompt_token_count_mismatches=sum(row.get("prompt_token_count_match") is False for row in observations),
+        output_sha256=_sha256_file(output_path),
+    )
+    return result
+
+
+def _select_anchor_rows(data_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    """Choose stable short, median, and long prompts from the canonical matrix."""
+    candidates: list[tuple[int, str, int, dict[str, Any], dict[str, Any]]] = []
+    for dataset in DATASETS:
+        rows = read_jsonl(Path(data_dir) / f"{dataset}_100.jsonl")
+        for index, raw in enumerate(rows):
+            normalized = normalize(raw, index)
+            candidates.append((len(str(normalized.get("prompt") or "").split()), dataset, index, raw, normalized))
+    if len(candidates) < 3:
+        raise ValueError("at least three canonical rows are required for anchor calibration")
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    positions = (0, len(candidates) // 2, len(candidates) - 1)
+    labels = ("short", "medium", "long")
+    selected: list[tuple[str, tuple[int, str, int, dict[str, Any], dict[str, Any]]]] = []
+    used: set[tuple[str, int]] = set()
+    for label, position in zip(labels, positions):
+        item = candidates[position]
+        if (item[1], item[2]) in used:
+            item = next(candidate for candidate in candidates if (candidate[1], candidate[2]) not in used)
+        used.add((item[1], item[2]))
+        selected.append((label, item))
+    source_rows: list[dict[str, Any]] = []
+    normalized_rows: list[dict[str, Any]] = []
+    word_counts: dict[str, int] = {}
+    for index, (label, item) in enumerate(selected):
+        count, dataset, source_index, raw, normalized = item
+        sample_id = f"anchor_{label}"
+        source = dict(raw)
+        source["id"] = sample_id
+        source["dataset"] = dataset
+        normalized_row = dict(normalized)
+        normalized_row["id"] = sample_id
+        normalized_row["raw"] = source
+        normalized_row["dataset"] = dataset
+        normalized_row["sample_order"] = index
+        source_rows.append(source)
+        normalized_rows.append(normalized_row)
+        word_counts[label] = count
+    return source_rows, normalized_rows, word_counts
+
+
+def _run_anchor_phase(
+    *,
+    phase: str,
+    baselines: Sequence[str],
+    source_rows: Sequence[Mapping[str, Any]],
+    normalized: Sequence[Mapping[str, Any]],
+    run_dir: Path,
+    run_id: str,
+    model: str | None,
+    temperature: float,
+    warmup_runs: int,
+    max_input_tokens: int,
+    seed: int,
+    max_new_tokens: int,
+    timeout_seconds: int,
+    vram: Mapping[str, Any],
+    cuda_available: bool,
+) -> dict[str, Any]:
+    """Measure all baselines on identical anchors at one end of the run."""
+    phase_name = f"anchor_{phase}"
+    subset_path = run_dir / "anchors" / f"{phase_name}_input.jsonl"
+    _write_jsonl(subset_path, source_rows)
+    observations: dict[str, dict[str, float]] = {}
+    native_reference = None
+    for baseline in baselines:
+        cfg = baseline_config_from_env(baseline)
+        cfg.update(
+            model=model or cfg.get("model"), device="cuda", temperature=temperature,
+            warmup_runs=warmup_runs, max_input_tokens=max_input_tokens, seed=seed,
+            smoke=False, max_new_tokens=max_new_tokens, batch_size=1,
+            max_running_requests=1, skip_reference=False,
+        )
+        if baseline in {"domino", "dspark"}:
+            cfg.update(paper_speedup=True, disable_radix_cache=True)
+        check = preflight_baseline(baseline, config=cfg, cuda_available=cuda_available)
+        if check.get("status") != "ready":
+            return {"status": "failed", "phase": phase, "baseline": baseline,
+                    "reason": f"anchor preflight failed: {check.get('reason')}", "observations": observations}
+        if baseline in {"domino", "dspark"}:
+            cfg.update(paper_speedup=True, disable_radix_cache=True)
+            if native_reference is None:
+                native_reference = _create_shared_sglang_reference(
+                    dataset=phase_name, source_rows=source_rows, normalized=normalized,
+                    run_dir=run_dir, subset_path=subset_path, run_id=run_id,
+                    model=model or cfg.get("model"), temperature=temperature,
+                    warmup_runs=warmup_runs, max_input_tokens=max_input_tokens, seed=seed,
+                    max_new_tokens=max_new_tokens, timeout_seconds=timeout_seconds, vram=vram,
+                )
+            if native_reference.get("status") != "success":
+                return {"status": "failed", "phase": phase, "baseline": baseline,
+                        "reason": f"anchor target-only preflight failed: {native_reference.get('reason')}",
+                        "observations": observations}
+            cfg["target_only_reference_file"] = native_reference["path"]
+        output_path = run_dir / "anchors" / phase_name / f"{baseline}.jsonl"
+        child = _execute_cell_once(
+            baseline=baseline, dataset=phase_name, source_rows=source_rows,
+            normalized=normalized, run_dir=run_dir, subset_path=subset_path,
+            output_path=output_path, cfg=cfg, dp_enabled=False, dp_groups=[],
+            timeout_seconds=timeout_seconds, run_id=run_id, processes_per_gpu=1,
+            vram=vram, max_new_tokens=max_new_tokens,
+        )
+        if child.get("status") != "success" or not output_path.is_file():
+            return {"status": "failed", "phase": phase, "baseline": baseline,
+                    "reason": child.get("reason") or "anchor baseline run failed",
+                    "observations": observations}
+        try:
+            _normalize_child_output(
+                output_path, baseline=baseline, dataset=phase_name,
+                source_records=normalized, config=cfg, run_id=run_id,
+            )
+            rows = [row for row in _jsonl_rows(output_path) if row.get("type") != "summary"]
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            return {"status": "failed", "phase": phase, "baseline": baseline,
+                    "reason": f"anchor output normalization failed: {type(exc).__name__}: {exc}",
+                    "observations": observations}
+        if len(rows) != len(normalized):
+            return {"status": "failed", "phase": phase, "baseline": baseline,
+                    "reason": "anchor run did not return all three samples", "observations": observations}
+        by_id: dict[str, float] = {}
+        for row in rows:
+            sample_id = str(row.get("sample_id"))
+            timing = row.get("request_wall_ms")
+            try:
+                elapsed = float(timing)
+            except (TypeError, ValueError, OverflowError):
+                elapsed = 0.0
+            if (row.get("status", "success") != "success" or row.get("contract_version") != 2
+                    or not row.get("prompt_token_sha256") or not row.get("generation_config_sha256")
+                    or not math.isfinite(elapsed) or elapsed <= 0):
+                return {"status": "failed", "phase": phase, "baseline": baseline,
+                        "reason": f"invalid v2 anchor observation for {sample_id}", "observations": observations}
+            if baseline in {"domino", "dspark"} and row.get("prompt_token_count_match") is not True:
+                return {"status": "failed", "phase": phase, "baseline": baseline,
+                        "reason": f"SGLang prompt token count mismatch for anchor {sample_id}",
+                        "observations": observations}
+            by_id[sample_id] = elapsed
+        observations[baseline] = by_id
+    return {"status": "success", "phase": phase, "observations": observations,
+            "native_reference": native_reference}
+
+
+def _anchor_drift(start: Mapping[str, Any], end: Mapping[str, Any], *, threshold_percent: float = 10.0) -> dict[str, Any]:
+    start_observations = start.get("observations") or {}
+    end_observations = end.get("observations") or {}
+    details: dict[str, Any] = {}
+    drifts: list[float] = []
+    for baseline in sorted(set(start_observations) & set(end_observations)):
+        by_anchor = {}
+        for sample_id in sorted(set(start_observations[baseline]) & set(end_observations[baseline])):
+            first = float(start_observations[baseline][sample_id])
+            last = float(end_observations[baseline][sample_id])
+            drift = abs(last / first - 1.0) * 100.0 if first > 0 else math.inf
+            by_anchor[sample_id] = {"start_request_wall_ms": first, "end_request_wall_ms": last,
+                                    "absolute_drift_percent": drift}
+            drifts.append(drift)
+        details[baseline] = by_anchor
+    complete = len(details) == len(PAPER_BASELINES) and all(
+        len(values) == 3 for values in details.values()
+    )
+    passed = complete and bool(drifts) and all(value <= threshold_percent for value in drifts)
+    return {"status": "pass" if passed else "failed", "threshold_percent": threshold_percent,
+            "maximum_absolute_drift_percent": max(drifts) if drifts else None,
+            "measurements": details,
+            "reason": None if passed else "anchor coverage incomplete or at least one anchor drift exceeded threshold"}
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["smoke", "representative", "full"], default=os.environ.get("LONG_BENCH_MODE", "smoke"))
@@ -2545,6 +2953,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--run-id", default=None)
+    parser.add_argument("--paper-speedup", action="store_true",
+                        help="run the pinned six-baseline, paired contract-v2 latency profile")
+    parser.add_argument("--common-reference", choices=("vanilla_fa", "vanilla_hf"), default="vanilla_fa",
+                        help="one common Vanilla reference pinned for the complete paper run")
+    parser.add_argument("--smoke-audit-run", type=Path, default=None,
+                        help="passing one-sample paper smoke run directory/audit required before full paper run")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--allow-unsupported", action="store_true")
     parser.add_argument(
@@ -2843,6 +3257,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--retry-backoff-seconds must be >= 0")
     if processes_per_gpu < 1:
         raise SystemExit("--dp-processes-per-gpu must be >= 1")
+    if args.paper_speedup:
+        if not cuda_available and not args.preflight_only:
+            raise SystemExit("--paper-speedup inference requires B200-class CUDA; this host is CPU-only")
+        if args.mode not in {"smoke", "full"}:
+            raise SystemExit("--paper-speedup supports only --mode smoke or --mode full")
+        if args.data_parallel or processes_per_gpu != 1:
+            raise SystemExit("--paper-speedup requires --no-data-parallel and --dp-processes-per-gpu 1")
+        if args.allow_unsupported:
+            raise SystemExit("--paper-speedup cannot record unsupported baselines as benchmark results")
+        if not args.strict:
+            raise SystemExit("--paper-speedup requires --strict")
+        args.retry_failed_samples = False
+        sample_retries = 0
+        oom_retries = 0
     if vram_budget_gb > 0 and vram_headroom_gb >= vram_budget_gb:
         raise SystemExit(
             f"--vram-headroom-gb {vram_headroom_gb} must be smaller than "
@@ -3000,6 +3428,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if unknown_baselines:
         raise SystemExit(f"Unknown baseline(s): {', '.join(unknown_baselines)}")
     baselines, skipped_baselines = _filter_matrix_baselines(requested_baselines)
+    if args.paper_speedup:
+        baselines = _pin_paper_baselines(baselines, args.common_reference)
+        if skipped_baselines:
+            raise SystemExit("--paper-speedup does not allow skipped baselines")
     if skipped_baselines:
         print(
             "[matrix] skipping disabled/non-comparable baseline(s): "
@@ -3011,6 +3443,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit(f"Unknown dataset(s): {', '.join(unknown_datasets)}")
     if not baselines or not datasets:
         raise SystemExit("At least one baseline and dataset are required")
+    if args.paper_speedup:
+        if set(datasets) != set(DATASETS) or len(datasets) != len(DATASETS):
+            raise SystemExit("--paper-speedup requires all four canonical datasets exactly once")
+        datasets = list(DATASETS)
 
     if args.mode == "representative" and args.datasets == " ".join(DATASETS):
         configured = _split(os.environ.get("LONG_BENCH_REPRESENTATIVE_DATASETS", " ".join(DATASETS)))
@@ -3025,6 +3461,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     # 100 rows.  Explicit --max-samples remains authoritative for smaller
     # smoke/representative subsets or for controlled ablations.
     sample_count = args.max_samples or min(default_sample_count, dataset_profile_count)
+    if args.paper_speedup:
+        required_count = 1 if args.mode == "smoke" else dataset_profile_count
+        if args.max_samples is not None and args.max_samples != required_count:
+            raise SystemExit(f"--paper-speedup {args.mode} requires exactly {required_count} sample(s) per dataset")
+        if args.mode == "full" and not args.preflight_only and args.smoke_audit_run is None:
+            raise SystemExit("full --paper-speedup requires --smoke-audit-run pointing to a passing paper smoke")
+        sample_count = required_count
     max_new_tokens = args.max_new_tokens or {
         "smoke": _env_int("LONG_BENCH_SMOKE_MAX_NEW_TOKENS", 8),
         "representative": _env_int("LONG_BENCH_MAX_NEW_TOKENS", 2048),
@@ -3034,6 +3477,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     temperature = args.temperature if args.temperature is not None else float(os.environ.get("LONG_BENCH_TEMPERATURE", "0"))
     warmup_runs = args.warmup_runs if args.warmup_runs is not None else _env_int("LONG_BENCH_WARMUP_RUNS", 3)
     max_input_tokens = resolve_max_input_tokens(args.mode, args.max_input_tokens)
+    if args.paper_speedup and args.mode == "smoke" and args.max_input_tokens is None:
+        max_input_tokens = _env_int("LONG_BENCH_MAX_INPUT_TOKENS", 0)
+    if args.paper_speedup:
+        if temperature != 0:
+            raise SystemExit("--paper-speedup requires greedy temperature=0")
+        configured_tp = _env_int("LONG_BENCH_TP_SIZE", 1)
+        if configured_tp != 1:
+            raise SystemExit("--paper-speedup requires TP=1 across all six baselines for equal GPU footprint")
+    smoke_gate = None
+    if args.paper_speedup and args.mode == "full" and not args.preflight_only:
+        smoke_gate = _validate_paper_smoke_audit(
+            args.smoke_audit_run, common_reference=args.common_reference, model=args.model,
+            temperature=temperature, seed=seed, max_input_tokens=max_input_tokens,
+            effective_configs={
+                baseline: {
+                    **baseline_config_from_env(baseline),
+                    "model": args.model or baseline_config_from_env(baseline).get("model"),
+                    "dtype": os.environ.get("LONG_BENCH_DTYPE", "bfloat16"),
+                    "batch_size": 1, "max_running_requests": 1, "tp_size": 1,
+                    "warmup_runs": warmup_runs, "max_input_tokens": max_input_tokens,
+                    "temperature": temperature, "seed": seed,
+                }
+                for baseline in baselines
+            },
+            target_revision=os.environ.get("LONG_BENCH_TARGET_REVISION") or args.model,
+            tokenizer_revision=os.environ.get("LONG_BENCH_TOKENIZER_REVISION") or args.model,
+            dataset_sha256={
+                dataset: _sha256_file(data_dir / f"{dataset}_100.jsonl")
+                for dataset in datasets
+            },
+        )
     min_free_gb = (
         args.min_free_gb
         if args.min_free_gb is not None
@@ -3051,9 +3525,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid()}-{uuid.uuid4().hex[:6]}"
     run_dir = output_root / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
+    anchor_source_rows: list[dict[str, Any]] = []
+    anchor_normalized: list[dict[str, Any]] = []
+    anchor_word_counts: dict[str, int] = {}
+    if args.paper_speedup and args.mode == "full" and not args.preflight_only:
+        anchor_source_rows, anchor_normalized, anchor_word_counts = _select_anchor_rows(data_dir)
 
+    baseline_configs = {}
+    for baseline in baselines:
+        effective = baseline_config_from_env(baseline)
+        effective.update(
+            model=args.model or effective.get("model"), temperature=temperature,
+            warmup_runs=warmup_runs, max_input_tokens=max_input_tokens, seed=seed,
+            max_new_tokens=max_new_tokens, batch_size=1, max_running_requests=1,
+        )
+        if baseline in {"domino", "dspark"}:
+            effective.update(paper_speedup=bool(args.paper_speedup), disable_radix_cache=bool(args.paper_speedup))
+        baseline_configs[baseline] = effective
     manifest: dict[str, Any] = {
-        "schema_version": "longbench-run-v1",
+        "schema_version": "longbench-run-v2" if args.paper_speedup else "longbench-run-v1",
+        "contract_version": 2 if args.paper_speedup else None,
+        "paper_speedup": bool(args.paper_speedup),
+        "common_reference": args.common_reference if args.paper_speedup else None,
+        "smoke_gate": smoke_gate,
+        "bootstrap_resamples": 10_000,
+        "dataset_sha256": {
+            dataset: _sha256_file(data_dir / f"{dataset}_100.jsonl")
+            for dataset in datasets
+        },
+        "sample_order": {},
+        "baseline_effective_configs": baseline_configs,
+        "target_revision": os.environ.get("LONG_BENCH_TARGET_REVISION") or args.model,
+        "tokenizer_revision": os.environ.get("LONG_BENCH_TOKENIZER_REVISION") or args.model,
+        "generation_config": {
+            "temperature": temperature,
+            "max_new_tokens": max_new_tokens,
+            "seed": seed,
+            "max_input_tokens": max_input_tokens,
+            "stop_token_ids": "adapter-resolved target EOS IDs; hash stored per observation",
+        },
+        "speculative_algorithms": {
+            "eagle3": "EAGLE3",
+            "dflash": "DFlash block-size-1 native reference plus speculative block size",
+            "domino": os.environ.get("LONG_BENCH_DOMINO_ALGORITHM", "DFLASH"),
+            "dspark": os.environ.get("LONG_BENCH_DSPARK_ALGORITHM", "DSPARK"),
+        },
+        "cache_policy": "no_cross_request_prefix_reuse",
+        "paper_retries_disabled": bool(args.paper_speedup),
+        "code_fingerprint_sha256": _paper_code_fingerprint() if args.paper_speedup else None,
         "run_id": run_id,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "mode": args.mode,
@@ -3100,6 +3619,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "oom_retries": oom_retries,
         },
         "runtime": runtime_metadata(),
+        "native_references": {},
+        "anchor_calibration": {"status": "pending", "word_counts": anchor_word_counts,
+                               "threshold_percent": 10.0} if args.paper_speedup and args.mode == "full" else
+                              {"status": "not_required_for_smoke"} if args.paper_speedup else None,
         "cells": [],
     }
     _write_json(run_dir / "run_manifest.json", manifest)
@@ -3116,15 +3639,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_json(run_dir / "run_manifest.json", manifest)
 
     failures = 0
+    anchor_start = None
+    if args.paper_speedup and args.mode == "full" and not args.preflight_only:
+        anchor_start = _run_anchor_phase(
+            phase="start", baselines=baselines, source_rows=anchor_source_rows,
+            normalized=anchor_normalized, run_dir=run_dir, run_id=run_id,
+            model=args.model, temperature=temperature, warmup_runs=warmup_runs,
+            max_input_tokens=max_input_tokens, seed=seed, max_new_tokens=max_new_tokens,
+            timeout_seconds=timeout_seconds, vram=vram_cfg, cuda_available=cuda_available,
+        )
+        manifest["anchor_calibration"]["start"] = anchor_start
+        manifest["anchor_calibration"]["status"] = "running" if anchor_start.get("status") == "success" else "failed"
+        _write_json(run_dir / "run_manifest.json", manifest)
+        if anchor_start.get("status") != "success":
+            manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+            manifest["failure_count"] = 1
+            manifest["anchor_calibration"]["reason"] = anchor_start.get("reason")
+            _write_json(run_dir / "run_manifest.json", manifest)
+            print(f"[anchors/start] failed before full cells: {anchor_start.get('reason')}", file=sys.stderr)
+            return 1
     for dataset in datasets:
         source_rows, normalized = _load_selected(data_dir, dataset, sample_count, seed=seed)
         subset_path = run_dir / "inputs" / f"{dataset}.jsonl"
         _write_jsonl(subset_path, source_rows)
+        if args.paper_speedup:
+            manifest["sample_order"][dataset] = [str(row["id"]) for row in normalized]
+            manifest.setdefault("selected_dataset_sha256", {})[dataset] = _sha256_file(subset_path)
+            _write_json(run_dir / "run_manifest.json", manifest)
         for baseline in baselines:
             output_path = run_dir / baseline / f"{dataset}.jsonl"
             external_reference_path = None
             external_reference_baseline = None
-            if baseline in EXTERNAL_REFERENCE_BASELINES:
+            if baseline in EXTERNAL_REFERENCE_BASELINES and not args.paper_speedup:
                 external_reference_path = _select_external_reference(
                     run_dir, dataset, baselines
                 )
@@ -3142,6 +3688,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_new_tokens=max_new_tokens,
             )
             cfg["skip_reference"] = external_reference_path is not None
+            if args.paper_speedup:
+                cfg.update(
+                    batch_size=1,
+                    max_running_requests=1,
+                    paper_speedup=baseline in {"domino", "dspark"},
+                    disable_radix_cache=baseline in {"domino", "dspark"},
+                    skip_reference=False,
+                )
             try:
                 check = preflight_baseline(
                     baseline,
@@ -3240,6 +3794,50 @@ def main(argv: Sequence[str] | None = None) -> int:
                     flush=True,
                 )
                 continue
+
+            if args.paper_speedup and baseline in {"domino", "dspark"}:
+                native_references = manifest.setdefault("native_references", {})
+                reference_status = native_references.get(dataset)
+                if reference_status is None:
+                    reference_status = _create_shared_sglang_reference(
+                        dataset=dataset,
+                        source_rows=source_rows,
+                        normalized=normalized,
+                        run_dir=run_dir,
+                        subset_path=subset_path,
+                        run_id=run_id,
+                        model=args.model or cfg.get("model"),
+                        temperature=temperature,
+                        warmup_runs=warmup_runs,
+                        max_input_tokens=max_input_tokens,
+                        seed=seed,
+                        max_new_tokens=max_new_tokens,
+                        timeout_seconds=timeout_seconds,
+                        vram=vram_cfg,
+                    )
+                    native_references[dataset] = reference_status
+                    _write_json(run_dir / "run_manifest.json", manifest)
+                if reference_status.get("status") != "success":
+                    reason = "shared SGLang target-only reference failed: " + str(reference_status.get("reason"))
+                    _write_status_file(
+                        output_path,
+                        baseline=baseline,
+                        dataset=dataset,
+                        records=normalized,
+                        status="failed",
+                        reason=reason,
+                        model=cfg.get("model"),
+                        config=cfg,
+                        run_id=run_id,
+                    )
+                    cell.update(status="native_reference_failed", reason=reason)
+                    cell["native_reference"] = reference_status
+                    failures += 1
+                    _append_cell(cell)
+                    print(f"[{baseline}/{dataset}] native reference failed; skipping method", file=sys.stderr, flush=True)
+                    continue
+                cfg["target_only_reference_file"] = reference_status["path"]
+                cell["native_reference"] = reference_status["path"]
 
             try:
                 child = _execute_cell_once(
@@ -3483,6 +4081,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 flush=True,
             )
 
+    if args.paper_speedup and args.mode == "full" and not args.preflight_only and anchor_start is not None:
+        anchor_end = _run_anchor_phase(
+            phase="end", baselines=baselines, source_rows=anchor_source_rows,
+            normalized=anchor_normalized, run_dir=run_dir, run_id=run_id,
+            model=args.model, temperature=temperature, warmup_runs=warmup_runs,
+            max_input_tokens=max_input_tokens, seed=seed, max_new_tokens=max_new_tokens,
+            timeout_seconds=timeout_seconds, vram=vram_cfg, cuda_available=cuda_available,
+        )
+        calibration = _anchor_drift(anchor_start, anchor_end)
+        calibration["start_status"] = anchor_start.get("status")
+        calibration["end_status"] = anchor_end.get("status")
+        calibration["start_native_reference"] = anchor_start.get("native_reference")
+        calibration["end_native_reference"] = anchor_end.get("native_reference")
+        if anchor_end.get("status") != "success":
+            calibration["status"] = "failed"
+            calibration["reason"] = anchor_end.get("reason") or calibration["reason"]
+        manifest["anchor_calibration"] = calibration
+        _write_json(run_dir / "run_manifest.json", manifest)
     manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
     manifest["failure_count"] = failures
     manifest["cell_count"] = len(manifest["cells"])
@@ -3505,6 +4121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_samples=sample_count,
             strict=bool(args.strict) and clean_cells,
             timeout_seconds=timeout_seconds,
+            paper_speedup=bool(args.paper_speedup),
         )
         if aggregate["status"] == "success":
             print(
@@ -3530,6 +4147,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             "reason": "metric collection disabled with --no-collect",
         }
     manifest["aggregate"] = aggregate
+    if args.paper_speedup and not args.preflight_only:
+        try:
+            paper_paths = write_paper_report(run_dir)
+            paper_audit = json.loads(paper_paths["audit"].read_text(encoding="utf-8"))
+            manifest["paper_report"] = {
+                "status": "success",
+                "audit": str(paper_paths["audit"]),
+                "csv": str(paper_paths["csv"]),
+                "markdown": str(paper_paths["markdown"]),
+                "gate_status": (paper_audit.get("paper_gate") or {}).get("status"),
+            }
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            manifest["paper_report"] = {"status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
     _write_json(run_dir / "run_manifest.json", manifest)
     print(f"Run manifest: {run_dir / 'run_manifest.json'}", flush=True)
     strict_aggregate_failed = (

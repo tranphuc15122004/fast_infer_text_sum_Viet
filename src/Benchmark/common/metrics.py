@@ -54,6 +54,8 @@ SPEED_KEYS = [
 SPEC_KEYS = [
     "avg_accept_length",
     "acceptance_rate",
+    "acceptance_rate_percent",
+    "accepted_draft_tokens_per_step",
     "draft_latency_ms",
     "verification_latency_ms",
     "rejected_draft_ratio",
@@ -369,24 +371,106 @@ def _first_positive(record: Mapping, keys: Sequence[str]) -> Optional[float]:
     return None
 
 
+def has_valid_paired_speedup(record: Mapping) -> bool:
+    """Return whether a successful record has at least one positive timing pair.
+
+    Output text and token-count agreement are fidelity signals. They do not
+    determine whether same-sample timing ratios are available.
+    """
+    if record.get("status", "success") != "success":
+        return False
+    return any(
+        _first_positive(record, (dense_key,)) is not None
+        and _first_positive(record, method_keys) is not None
+        for dense_key, method_keys in SPEEDUP_TIMINGS.values()
+    )
+
+
+def aggregate_paired_reference_fidelity(
+    records: Sequence[Mapping],
+) -> dict[str, Any]:
+    """Summarize paired-reference output agreement without filtering timings."""
+    paired = [
+        record for record in records
+        if record.get("speedup_reference_method") is not None
+        and record.get("status", "success") == "success"
+    ]
+    if not paired:
+        return {}
+    exact_observed = [
+        record.get("paired_output_exact_match")
+        for record in paired
+        if isinstance(record.get("paired_output_exact_match"), bool)
+    ]
+    length_observed = [
+        record.get("paired_output_token_count_match")
+        for record in paired
+        if isinstance(record.get("paired_output_token_count_match"), bool)
+    ]
+    baseline_lengths = [
+        int(record["baseline_output_tokens"])
+        for record in paired
+        if record.get("baseline_output_tokens") is not None
+    ]
+    method_lengths = [
+        int(record["output_tokens"])
+        for record in paired
+        if record.get("output_tokens") is not None
+    ]
+    return {
+        "paired_reference_samples": len(paired),
+        "paired_output_exact_match_observed": len(exact_observed),
+        "paired_output_exact_match_samples": sum(value is True for value in exact_observed),
+        "paired_output_exact_match_rate": (
+            round(sum(value is True for value in exact_observed) / len(exact_observed), 4)
+            if exact_observed
+            else None
+        ),
+        "paired_output_token_count_match_observed": len(length_observed),
+        "paired_output_token_count_match_samples": sum(value is True for value in length_observed),
+        "paired_output_token_count_match_rate": (
+            round(sum(value is True for value in length_observed) / len(length_observed), 4)
+            if length_observed
+            else None
+        ),
+        "mean_method_output_tokens": round(
+            sum(method_lengths) / len(method_lengths), 3
+        ) if method_lengths else None,
+        "mean_baseline_output_tokens": round(
+            sum(baseline_lengths) / len(baseline_lengths), 3
+        ) if baseline_lengths else None,
+    }
+
+
 def aggregate_speedup(records: Sequence[Mapping]) -> dict:
     """Calculate paired speedups as ``mean(dense) / mean(method)``.
 
-    Only records carrying both sides of a timing pair contribute.  Returning
-    a scalar ratio (rather than averaging per-record ratios) makes the report
+    Only records carrying both sides of a timing pair contribute. Output
+    agreement is reported separately and does not gate these ratios. ``dsr`` is
+    the decode-time ratio; ``decode_throughput_speedup`` normalizes for output
+    token counts. Returning a scalar ratio (rather than averaging per-record ratios)
+    makes the report
     agree with the benchmark-level definition and avoids tiny samples with
     unusually short requests dominating the result.
 
     The result contains only metrics with at least one complete positive pair;
     a missing timing is therefore reported as unavailable instead of being
-    treated as zero.
+    treated as zero. Legacy EAGLE outputs that predate the shared paired
+    fields retain their separate target-greedy aggregate for compatibility.
     """
     out: dict = {}
+    reference_decode_tokens: list[float] = []
+    method_decode_tokens: list[float] = []
+    reference_decode_times: list[float] = []
+    method_decode_times: list[float] = []
     for name, (dense_key, method_keys) in SPEEDUP_TIMINGS.items():
         dense_values: list[float] = []
         method_values: list[float] = []
         for record in records:
-            if record.get("speedup_valid") is False:
+            if (
+                record.get("status", "success") != "success"
+                or record.get("speedup_valid") is False
+            ):
                 continue
             dense = _first_positive(record, (dense_key,))
             method = _first_positive(record, method_keys)
@@ -394,6 +478,43 @@ def aggregate_speedup(records: Sequence[Mapping]) -> dict:
                 continue
             dense_values.append(dense)
             method_values.append(method)
+            if name == "dsr":
+                reference_tokens = _first_positive(record, ("baseline_output_tokens",))
+                method_tokens = _first_positive(record, ("output_tokens",))
+                if reference_tokens is not None and method_tokens is not None:
+                    reference_decode_tokens.append(reference_tokens)
+                    method_decode_tokens.append(method_tokens)
+                    reference_decode_times.append(dense)
+                    method_decode_times.append(method)
         if method_values:
             out[name] = round(mean(dense_values) / mean(method_values), 4)
+
+    if reference_decode_times and method_decode_times:
+        reference_throughput = sum(reference_decode_tokens) / sum(reference_decode_times)
+        method_throughput = sum(method_decode_tokens) / sum(method_decode_times)
+        if reference_throughput > 0:
+            out["decode_throughput_speedup"] = round(
+                method_throughput / reference_throughput, 4
+            )
+
+    eagle_dense_times: list[float] = []
+    eagle_speculative_times: list[float] = []
+    for record in records:
+        if (
+            record.get("status", "success") != "success"
+            or record.get("method") != "eagle3"
+            or record.get("speedup_reference_method") is not None
+            or record.get("paired_speedup_valid") is not True
+        ):
+            continue
+        naive_time = _first_positive(record, ("naive_time",))
+        eagle_time = _first_positive(record, ("eagle_time",))
+        if naive_time is None or eagle_time is None:
+            continue
+        eagle_dense_times.append(naive_time)
+        eagle_speculative_times.append(eagle_time)
+    if eagle_speculative_times:
+        out["paired_eagle_speedup"] = round(
+            mean(eagle_dense_times) / mean(eagle_speculative_times), 4
+        )
     return out

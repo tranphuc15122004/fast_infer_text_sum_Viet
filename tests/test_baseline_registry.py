@@ -76,6 +76,27 @@ def test_dflash_command_propagates_warmup_runs() -> None:
     assert command[warmup_flag + 1] == "1"
 
 
+def test_eagle3_keeps_internal_naive_pair_even_with_external_reference() -> None:
+    from Benchmark.common.longbench_adapter import build_adapter_command
+
+    command = build_adapter_command(
+        "eagle3",
+        config={
+            "model": "/models/Qwen3-4B",
+            "eagle_model": "/models/Qwen3-4B-Eagle3",
+            "skip_reference": True,
+            "temperature": 0,
+        },
+        data_file=ROOT / "datasets/eval_100/vietnews_100.jsonl",
+        output=ROOT / "outputs/test.jsonl",
+        max_samples=1,
+        max_new_tokens=128,
+    )
+
+    assert command is not None
+    assert "--skip-naive" not in command
+
+
 def test_reference_selection_ignores_vanilla_status_records(tmp_path) -> None:
     from Benchmark.run_longbench_200 import _select_external_reference
 
@@ -96,3 +117,185 @@ def test_reference_selection_ignores_vanilla_status_records(tmp_path) -> None:
         ["vanilla_hf", "vanilla_fa", "eagle3"],
     )
     assert selected == tmp_path / "vanilla_hf" / "vietnews.jsonl"
+
+
+def test_target_only_is_an_internal_sglang_adapter_command():
+    from Benchmark.common.longbench_adapter import build_adapter_command
+
+    command = build_adapter_command(
+        "target_only",
+        config={
+            "model": "/models/Qwen3-4B",
+            "batch_size": 1,
+            "max_running_requests": 1,
+            "paper_speedup": True,
+            "disable_radix_cache": True,
+        },
+        data_file=ROOT / "datasets/eval_100/vietnews_100.jsonl",
+        output=ROOT / "outputs/target_only.jsonl",
+        max_samples=1,
+        max_new_tokens=8,
+    )
+
+    assert command is not None
+    assert "--method" in command
+    assert command[command.index("--method") + 1] == "target_only"
+    assert "--paper-speedup" in command
+    assert "--disable-radix-cache" in command
+
+
+def test_speculative_paper_command_uses_shared_target_only_sidecar():
+    from Benchmark.common.longbench_adapter import build_adapter_command
+
+    command = build_adapter_command(
+        "domino",
+        config={
+            "model": "/models/Qwen3-4B",
+            "domino_model": "/models/Qwen3-4B-Domino",
+            "batch_size": 1,
+            "max_running_requests": 1,
+            "paper_speedup": True,
+            "target_only_reference_file": "/run/references/target_only.jsonl",
+        },
+        data_file=ROOT / "datasets/eval_100/vietnews_100.jsonl",
+        output=ROOT / "outputs/domino.jsonl",
+        max_samples=1,
+        max_new_tokens=8,
+    )
+
+    assert command is not None
+    assert command[command.index("--target-only-reference-file") + 1] == "/run/references/target_only.jsonl"
+    assert command.count("--disable-radix-cache") == 1
+
+
+def test_paper_matrix_pins_one_reference_first():
+    import pytest
+
+    from Benchmark.common.longbench_adapter import BASELINES
+    from Benchmark.run_longbench_200 import _pin_paper_baselines
+
+    pinned = _pin_paper_baselines(list(reversed(BASELINES)), "vanilla_hf")
+
+    assert pinned[0] == "vanilla_hf"
+    assert set(pinned) == set(BASELINES)
+    with pytest.raises(SystemExit, match="exactly these six"):
+        _pin_paper_baselines(["vanilla_fa", "dflash"], "vanilla_fa")
+
+
+def test_full_paper_run_requires_passing_smoke_gate(tmp_path):
+    import json
+    import pytest
+
+    from Benchmark.common.longbench_adapter import BASELINES
+    from Benchmark.run_longbench_200 import _validate_paper_smoke_audit
+
+    smoke_dir = tmp_path / "smoke"
+    smoke_dir.mkdir()
+    (smoke_dir / "run_manifest.json").write_text(json.dumps({
+        "run_id": "smoke-1", "baselines": list(BASELINES),
+        "datasets": ["vietnews", "wikilingua", "vims", "vlsp"],
+        "model": "/models/Qwen3-4B",
+    }), encoding="utf-8")
+    (smoke_dir / "audit_v2.json").write_text(json.dumps({
+        "common_reference": "vanilla_fa",
+        "paper_gate": {"status": "smoke_pass"},
+    }), encoding="utf-8")
+
+    result = _validate_paper_smoke_audit(
+        smoke_dir, common_reference="vanilla_fa", model="/models/Qwen3-4B"
+    )
+    assert result["run_id"] == "smoke-1"
+    with pytest.raises(SystemExit, match="same common reference"):
+        _validate_paper_smoke_audit(
+            smoke_dir, common_reference="vanilla_hf", model="/models/Qwen3-4B"
+        )
+
+
+def test_shared_sglang_reference_helper_normalizes_one_v2_sidecar(tmp_path, monkeypatch):
+    import json
+
+    from Benchmark import run_longbench_200 as runner
+
+    source = [{"id": "sample-1", "prompt": "hello", "reference_output": "gold"}]
+    output = tmp_path / "references" / "sglang_target_only" / "vietnews.jsonl"
+    captured = {}
+
+    def fake_execute(**kwargs):
+        captured.update(kwargs)
+        path = kwargs["output_path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "sample_id": "sample-1", "status": "success", "contract_version": 2,
+            "prompt_token_sha256": "prompt", "generation_config_sha256": "generation",
+            "hardware_fingerprint": "gpu", "prompt_token_count_match": True,
+            "request_wall_ms": 12.0, "native_elapsed_ms": 12.0, "text": "answer",
+        }
+        path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        return {"status": "success", "returncode": 0}
+
+    monkeypatch.setattr(runner, "_execute_cell_once", fake_execute)
+    result = runner._create_shared_sglang_reference(
+        dataset="vietnews", source_rows=source, normalized=source, run_dir=tmp_path,
+        subset_path=tmp_path / "inputs.jsonl", run_id="r1", model="/models/Qwen3-4B",
+        temperature=0.0, warmup_runs=1, max_input_tokens=0, seed=42,
+        max_new_tokens=8, timeout_seconds=60, vram={},
+    )
+
+    assert result["status"] == "success"
+    assert result["success_samples"] == 1
+    assert captured["baseline"] == "target_only"
+    assert captured["cfg"]["batch_size"] == 1
+    assert captured["cfg"]["disable_radix_cache"] is True
+    saved = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    assert saved["sample_order"] == 0
+    assert saved["dataset"] == "vietnews"
+
+
+def test_paper_preflight_rejects_unpinned_sglang(monkeypatch):
+    from Benchmark.common import longbench_adapter as adapter
+
+    monkeypatch.setattr(adapter, "_module_importable", lambda name: (True, None))
+    monkeypatch.setattr(adapter, "_sglang_algorithm_supported", lambda algorithm: (True, None))
+    monkeypatch.setattr(adapter.importlib_metadata, "version", lambda name: "0.5.19")
+
+    result = adapter.preflight_baseline(
+        "domino",
+        config={
+            "model": "org/target",
+            "domino_model": "org/draft",
+            "paper_speedup": True,
+        },
+        cuda_available=True,
+    )
+
+    assert result["status"] == "missing_dependency"
+    assert "requires SGLang 0.5.20" in result["reason"]
+    assert result["requirements"]["sglang_version"]["installed"] == "0.5.19"
+
+
+def test_full_paper_smoke_gate_rejects_changed_dataset_hash(tmp_path):
+    import json
+    import pytest
+
+    from Benchmark.common.longbench_adapter import BASELINES
+    from Benchmark.run_longbench_200 import _validate_paper_smoke_audit
+
+    smoke_dir = tmp_path / "smoke"
+    smoke_dir.mkdir()
+    (smoke_dir / "run_manifest.json").write_text(json.dumps({
+        "run_id": "smoke-2", "baselines": list(BASELINES),
+        "datasets": ["vietnews", "wikilingua", "vims", "vlsp"],
+        "model": "/models/Qwen3-4B", "target_revision": "rev-a",
+        "tokenizer_revision": "tok-a", "dataset_sha256": {"vietnews": "hash-a"},
+    }), encoding="utf-8")
+    (smoke_dir / "audit_v2.json").write_text(json.dumps({
+        "common_reference": "vanilla_fa",
+        "paper_gate": {"status": "smoke_pass"},
+    }), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="dataset content differs"):
+        _validate_paper_smoke_audit(
+            smoke_dir, common_reference="vanilla_fa", model="/models/Qwen3-4B",
+            target_revision="rev-a", tokenizer_revision="tok-a",
+            dataset_sha256={"vietnews": "hash-b"},
+        )

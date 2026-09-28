@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import math
+from importlib import metadata as importlib_metadata
 import os
 from pathlib import Path
 import signal
@@ -22,7 +24,11 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from Benchmark.common import io_util, metrics, rouge
-from Benchmark.common.benchmark_runtime import build_sample_record, runtime_metadata
+from Benchmark.common.benchmark_runtime import (
+    build_sample_record,
+    runtime_metadata,
+)
+from Benchmark.common.paired_reference import build_v2_record_fields, read_jsonl, token_ids_sha256
 from Benchmark.common.data_loader import load_records
 from Benchmark.common.input_utils import truncate_input_ids
 from Benchmark.common.prompt_format import format_chat_prompt
@@ -35,6 +41,45 @@ def _algorithm(method: str) -> str:
         "dflash": os.environ.get("LONG_BENCH_DFLASH_ALGORITHM", "DFLASH"),
         "dspark": os.environ.get("LONG_BENCH_DSPARK_ALGORITHM", "DSPARK"),
     }[method]
+
+
+def resolve_stop_token_ids(tokenizer: Any) -> list[int]:
+    """Return the target tokenizer's EOS ids for explicit SGLang stopping."""
+
+    eos_ids = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(eos_ids, int) and not isinstance(eos_ids, bool):
+        values = [eos_ids]
+    elif isinstance(eos_ids, (list, tuple)):
+        values = list(eos_ids)
+    else:
+        values = []
+    normalized: list[int] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"invalid tokenizer EOS token id: {value!r}")
+        if value not in normalized:
+            normalized.append(value)
+    if not normalized:
+        raise ValueError("target tokenizer does not expose a valid EOS token id")
+    return normalized
+
+
+def build_sampling_params(
+    *, temperature: float, max_new_tokens: int, stop_token_ids: list[int]
+) -> dict[str, Any]:
+    """Build deterministic generation parameters with target EOS stopping."""
+
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
+    if not stop_token_ids:
+        raise ValueError("stop_token_ids must include the target EOS token")
+    return {
+        "temperature": float(temperature),
+        "top_p": 1.0,
+        "max_new_tokens": int(max_new_tokens),
+        "stop_token_ids": list(dict.fromkeys(int(value) for value in stop_token_ids)),
+        "ignore_eos": False,
+    }
 
 
 def resolve_batch_size(requested: str | int, *, total_memory_gb: float | None = None) -> int:
@@ -76,23 +121,30 @@ def build_server_args(
     tp_size: int,
     mem_fraction_static: float,
     attention_backend: str | None = None,
+    random_seed: int = 42,
+    disable_radix_cache: bool = False,
 ) -> list[str]:
     """Build only official SGLang CLI flags; no algorithm is reimplemented."""
 
-    if method not in {"domino", "dflash", "dspark"}:
+    if method not in {"target_only", "domino", "dflash", "dspark"}:
         raise ValueError(f"unsupported SGLang speculative method: {method}")
     command = [
         sys.executable,
         "-m",
         "sglang.launch_server",
+        "--enable-metrics",
         "--model-path",
         model,
         "--trust-remote-code",
         "--dtype",
         os.environ.get("LONG_BENCH_DTYPE", "bfloat16"),
+        "--random-seed",
+        str(random_seed),
     ]
     if attention_backend:
         command.extend(["--attention-backend", attention_backend])
+    if disable_radix_cache:
+        command.append("--disable-radix-cache")
     graph_batch_sizes = [str(index) for index in range(1, batch_size + 1)]
     command.extend([
         "--tp-size",
@@ -107,16 +159,25 @@ def build_server_args(
         str(batch_size),
         "--port",
         str(port),
-        "--speculative-algorithm",
-        _algorithm(method),
-        "--speculative-draft-model-path",
-        draft_model,
     ])
+    if method != "target_only":
+        if not draft_model:
+            raise ValueError(f"{method} requires a speculative draft model")
+        command.extend([
+            "--speculative-algorithm",
+            _algorithm(method),
+            "--speculative-draft-model-path",
+            draft_model,
+        ])
     return command
 
 
-def extract_response_metrics(payload: dict[str, Any], *, request_elapsed_ms: float) -> dict[str, Any]:
-    """Extract raw SGLang metadata without inventing unavailable timings."""
+def extract_response_metrics(
+    payload: dict[str, Any], *, request_elapsed_ms: float
+) -> dict[str, Any]:
+    """Extract SGLang metadata and normalize acceptance counters."""
+
+    from Benchmark.common.speculative_metrics import normalize_speculative_acceptance
 
     meta = payload.get("meta_info") or {}
 
@@ -135,37 +196,95 @@ def extract_response_metrics(payload: dict[str, Any], *, request_elapsed_ms: flo
 
     prefill_ms = duration_ms("prompt_latency")
     decode_ms = duration_ms("completion_latency")
-    acceptance_histogram = meta.get("spec_accept_histogram")
+    completion_tokens = meta.get("completion_tokens")
+    decode_throughput = meta.get("decode_throughput")
+    strict_decode_ms = None
+    strict_decode_tokens = None
+    strict_decode_verified = False
+    if completion_tokens is not None:
+        try:
+            strict_decode_tokens = max(int(completion_tokens) - 1, 0)
+            throughput = float(decode_throughput)
+        except (TypeError, ValueError, OverflowError):
+            throughput = 0.0
+        if strict_decode_tokens > 0 and throughput > 0 and math.isfinite(throughput):
+            # In pinned SGLang 0.5.20, APIServerReqTimeStats computes
+            # decode_throughput=(completion_tokens-1)/(finished_time-first_token_time).
+            # Reconstructing the interval from that returned value uses the
+            # same server-side first-token and finish timestamps.
+            strict_decode_ms = strict_decode_tokens / throughput * 1000.0
+            strict_decode_verified = math.isfinite(strict_decode_ms) and strict_decode_ms > 0
+            if not strict_decode_verified:
+                strict_decode_ms = None
+    acceptance_histogram = meta.get(
+        "spec_accept_histogram",
+        meta.get("spec_correct_drafts_histogram"),
+    )
     if isinstance(acceptance_histogram, (list, tuple)):
         acceptance_histogram = [int(value) for value in acceptance_histogram]
     else:
         acceptance_histogram = None
 
+    accepted = meta.get(
+        "spec_num_correct_drafts", meta.get("spec_accepted_drafts")
+    )
+    proposed = meta.get(
+        "spec_num_proposed_drafts", meta.get("spec_proposed_drafts")
+    )
+    runtime_acceptance_rate = meta.get(
+        "spec_acceptance_rate", meta.get("spec_accept_rate")
+    )
+    acceptance = normalize_speculative_acceptance(
+        verification_steps=meta.get("spec_verify_ct"),
+        draft_tokens_accepted=accepted,
+        draft_tokens_proposed=proposed,
+        fallback_acceptance_rate=runtime_acceptance_rate,
+        fallback_avg_accept_length=meta.get("spec_accept_length"),
+    )
+
     return {
-        "input_tokens": int(meta["prompt_tokens"]) if meta.get("prompt_tokens") is not None else None,
-        "output_tokens": int(meta["completion_tokens"]) if meta.get("completion_tokens") is not None else None,
-        "queue_wait_ms": duration_ms("queue_wait_ms", "queue_wait_time", "queue_time"),
-        "batch_wait_ms": duration_ms("batch_wait_ms", "batch_wait_time", "batch_time"),
+        "input_tokens": int(meta["prompt_tokens"])
+        if meta.get("prompt_tokens") is not None
+        else None,
+        "output_tokens": int(meta["completion_tokens"])
+        if meta.get("completion_tokens") is not None
+        else None,
+        "queue_wait_ms": duration_ms(
+            "queue_wait_ms", "queue_wait_time", "queue_time"
+        ),
+        "batch_wait_ms": duration_ms(
+            "batch_wait_ms", "batch_wait_time", "batch_time"
+        ),
         "prefill_ms": prefill_ms,
         "ttft_ms": prefill_ms,
         "decode_ms": decode_ms,
         "draft_latency_ms": duration_ms("spec_draft_time", "draft_latency"),
-        "verification_latency_ms": duration_ms("spec_verify_time", "verification_latency"),
-        "server_reported_e2e_ms": duration_ms("e2e_latency", "request_time"),
+        "verification_latency_ms": duration_ms(
+            "spec_verify_time", "verification_latency"
+        ),
+        "server_reported_e2e_ms": duration_ms(
+            "e2e_latency", "request_time"
+        ),
         "e2e_ms": round(float(request_elapsed_ms), 3),
+        "request_wall_ms": round(float(request_elapsed_ms), 3),
+        "server_reported_completion_latency_ms": decode_ms,
+        "strict_decode_active_ms": strict_decode_ms,
+        "strict_decode_token_count": strict_decode_tokens,
+        "strict_decode_phase_definition": (
+            "after_first_token_committed_to_final_token"
+        ),
+        "strict_decode_phase_verified": strict_decode_verified,
         "measurement_scope": (
-            "full_e2e" if prefill_ms is not None and decode_ms is not None else "e2e_only"
+            "full_e2e"
+            if prefill_ms is not None and decode_ms is not None
+            else "e2e_only"
         ),
-        "avg_accept_length": meta.get("spec_accept_length"),
-        "acceptance_rate": meta.get(
-            "spec_acceptance_rate", meta.get("spec_accept_rate")
-        ),
-        # This is a histogram indexed by accepted draft-token count, not a
-        # per-iteration list.  Keep it separate from EAGLE/DFlash's
-        # ``acceptance_lengths`` field to avoid fabricating trace data.
+        # acceptance length/rate/counters use the shared normalization.
+        **acceptance,
+        "draft_proposal_unit": "runtime_draft_candidate",
+        # Histogram bins are indexed by accepted draft-token count; preserve
+        # them instead of fabricating a per-verification trace.
         "acceptance_histogram": acceptance_histogram,
-        "verification_steps": meta.get("spec_verify_ct"),
-        "rejected_draft_ratio": meta.get("spec_rejected_draft_ratio"),
     }
 
 
@@ -261,35 +380,178 @@ def _prepare_prompt(prompt: str, tokenizer: Any | None, max_input_tokens: int) -
     )
 
 
+def _prompt_token_ids(prompt: str, tokenizer: Any, args: argparse.Namespace) -> tuple[str, list[int]]:
+    prepared = _prepare_prompt(prompt, tokenizer, args.max_input_tokens)
+    encoded = tokenizer(prepared, return_tensors="pt", add_special_tokens=False)
+    return prepared, [int(value) for value in encoded.input_ids[0].tolist()]
+
+
+def _generation_config(args: argparse.Namespace, stop_token_ids: list[int]) -> dict[str, Any]:
+    return {
+        "temperature": float(args.temperature),
+        "max_new_tokens": int(args.max_new_tokens),
+        "seed": int(args.seed),
+        "stop_token_ids": list(stop_token_ids),
+    }
+
+
+def load_target_only_reference(
+    path: Path,
+    *,
+    expected_sample_ids: list[str],
+    expected_identity_by_id: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Load a complete, fingerprint-matching SGLang target-only sidecar."""
+    rows = read_jsonl(path)
+    indexed: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        sample_id = row.get("sample_id")
+        if sample_id is None:
+            raise ValueError(f"target-only sidecar row has no sample_id: {path}")
+        sid = str(sample_id)
+        if sid in indexed:
+            raise ValueError(f"duplicate sample_id {sid} in target-only sidecar: {path}")
+        indexed[sid] = row
+    expected = [str(value) for value in expected_sample_ids]
+    missing = sorted(set(expected) - set(indexed))
+    extra = sorted(set(indexed) - set(expected))
+    if missing or extra:
+        raise ValueError(f"target-only sidecar sample coverage mismatch: missing={missing}, extra={extra}")
+    identity_fields = (
+        "prompt_token_sha256", "generation_config_sha256", "hardware_fingerprint",
+        "runtime_config_sha256", "target_revision", "tokenizer_revision", "gpu_count", "tp_size",
+        "batch_size", "concurrency", "cache_policy", "actual_input_tokens",
+    )
+    for sid in expected:
+        row = indexed[sid]
+        if row.get("contract_version") != 2:
+            raise ValueError(f"target-only sidecar {sid} is not contract_version=2")
+        if row.get("status", "success") != "success":
+            raise ValueError(f"target-only sidecar {sid} status is {row.get('status')!r}")
+        expected_identity = expected_identity_by_id[sid]
+        for key in identity_fields:
+            wanted = expected_identity.get(key)
+            observed = row.get(key)
+            if wanted is not None and observed != wanted:
+                raise ValueError(
+                    f"target-only sidecar fingerprint mismatch for sample {sid}: "
+                    f"{key} expected {wanted!r}, observed {observed!r}"
+                )
+    return indexed
+
+
 def _request_one(
     base_url: str,
     sample: dict[str, Any],
     args: argparse.Namespace,
     tokenizer: Any | None,
+    stop_token_ids: list[int],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     start = time.perf_counter()
+    prepared_prompt = _prepare_prompt(sample["prompt"], tokenizer, args.max_input_tokens)
+    local_ids: list[int] | None = None
+    if tokenizer is not None:
+        encoded = tokenizer(prepared_prompt, return_tensors="pt", add_special_tokens=False)
+        local_ids = [int(value) for value in encoded.input_ids[0].tolist()]
+    request_body = {
+        "sampling_params": build_sampling_params(
+            temperature=args.temperature,
+            max_new_tokens=args.max_new_tokens,
+            stop_token_ids=stop_token_ids,
+        ),
+    }
+    if getattr(args, "paper_speedup", False) and local_ids is not None:
+        # SGLang's GenerateReqInput accepts token IDs directly. This preserves
+        # the exact post-template/post-truncation tokens used by the v2 hash.
+        request_body["input_ids"] = local_ids
+    else:
+        request_body["text"] = prepared_prompt
     payload = _http_json(
         base_url + "/generate",
-        {
-            "text": _prepare_prompt(sample["prompt"], tokenizer, args.max_input_tokens),
-            "sampling_params": {
-                "temperature": args.temperature,
-                "top_p": 1.0,
-                "max_new_tokens": args.max_new_tokens,
-            },
-        },
+        request_body,
         timeout=args.request_timeout,
     )
     elapsed_ms = (time.perf_counter() - start) * 1000.0
-    metrics = extract_response_metrics(payload, request_elapsed_ms=elapsed_ms)
-    return sample, {"payload": payload, "metrics": metrics}
+    request_metrics = extract_response_metrics(payload, request_elapsed_ms=elapsed_ms)
+    if local_ids is not None:
+        request_metrics["prompt_token_sha256"] = token_ids_sha256(local_ids)
+        request_metrics["client_prompt_tokens"] = len(local_ids)
+        server_tokens = request_metrics.get("input_tokens")
+        request_metrics["prompt_token_count_match"] = (
+            int(server_tokens) == len(local_ids) if server_tokens is not None else None
+        )
+    request_metrics["prompt_token_ids"] = local_ids
+    return sample, {"payload": payload, "metrics": request_metrics}
+
+def _run_server_phase(
+    *,
+    phase_method: str,
+    records: list[dict[str, Any]],
+    args: argparse.Namespace,
+    tokenizer: Any,
+    stop_token_ids: list[int],
+) -> dict[str, dict[str, Any]]:
+    """Run one SGLang mode over a fixed sample set and key results by ID."""
+    command = build_server_args(
+        method=phase_method,
+        model=args.model,
+        draft_model=args.draft_model if phase_method != "target_only" else None,
+        port=args.port,
+        batch_size=args.max_running_requests,
+        tp_size=args.tp_size,
+        mem_fraction_static=args.mem_fraction_static,
+        attention_backend=args.attention_backend,
+        random_seed=args.seed,
+        disable_radix_cache=bool(getattr(args, "disable_radix_cache", False)),
+    )
+    print(
+        f"[{phase_method}] launching official SGLang: {' '.join(command)}",
+        flush=True,
+    )
+    server_url = f"http://127.0.0.1:{args.port}"
+    server_start = time.perf_counter()
+    process = subprocess.Popen(command, stdout=None, stderr=None, start_new_session=True)
+    try:
+        _wait_ready(server_url, process, args.server_timeout)
+        server_startup_ms = round((time.perf_counter() - server_start) * 1000.0, 3)
+        results: dict[str, dict[str, Any]] = {}
+        if getattr(args, "paper_speedup", False) and records:
+            warmup_args = argparse.Namespace(**vars(args))
+            warmup_args.max_new_tokens = min(int(args.max_new_tokens), 8)
+            _request_one(server_url, records[0], warmup_args, tokenizer, stop_token_ids)
+        with ThreadPoolExecutor(max_workers=args.batch_size) as executor:
+            futures = [
+                executor.submit(
+                    _request_one,
+                    server_url,
+                    sample,
+                    args,
+                    tokenizer,
+                    stop_token_ids,
+                )
+                for sample in records
+            ]
+            for future in as_completed(futures):
+                sample, result = future.result()
+                sample_id = str(sample["id"])
+                if sample_id in results:
+                    raise ValueError(f"duplicate sample id in benchmark input: {sample_id}")
+                result["metrics"]["server_startup_ms"] = server_startup_ms
+                results[sample_id] = result
+        return results
+    finally:
+        _stop_process_group(process)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--method", choices=["domino", "dflash", "dspark"], required=True)
+    parser.add_argument(
+        "--method",
+        choices=["target_only", "domino", "dflash", "dspark"],
+        required=True,
+    )
     parser.add_argument("--model", required=True)
-    parser.add_argument("--draft-model", required=True)
+    parser.add_argument("--draft-model")
     parser.add_argument("--data-file", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -310,12 +572,22 @@ def _parser() -> argparse.ArgumentParser:
         default=os.environ.get("LONG_BENCH_LOCAL_FILES_ONLY", "1") == "1",
     )
     parser.add_argument("--max-running-requests", type=int, default=None)
+    parser.add_argument("--target-only-reference-file", default=None)
+    parser.add_argument("--paper-speedup", action="store_true")
+    parser.add_argument("--disable-radix-cache", action="store_true")
     parser.add_argument("--port", type=int, default=int(os.environ.get("LONG_BENCH_SGLANG_PORT", "30000")))
     parser.add_argument("--server-timeout", type=float, default=float(os.environ.get("LONG_BENCH_SERVER_TIMEOUT_SECONDS", "900")))
     parser.add_argument("--request-timeout", type=float, default=float(os.environ.get("LONG_BENCH_REQUEST_TIMEOUT_SECONDS", "900")))
     parser.add_argument("--run-id", default=os.environ.get("LONG_BENCH_RUN_ID"))
     parser.add_argument("--smoke", action="store_true")
     return parser
+
+
+def _sglang_version() -> str | None:
+    try:
+        return importlib_metadata.version("sglang")
+    except importlib_metadata.PackageNotFoundError:
+        return None
 
 
 def main() -> int:
@@ -328,108 +600,308 @@ def main() -> int:
         raise SystemExit("batch size and tp size must be positive")
     if args.max_running_requests is None:
         args.max_running_requests = args.batch_size
+    if args.paper_speedup:
+        installed_sglang = _sglang_version()
+        if installed_sglang != "0.5.20":
+            raise SystemExit(f"--paper-speedup requires pinned SGLang 0.5.20 for strict decode timing; found {installed_sglang!r}")
+        if args.batch_size != 1 or args.max_running_requests != 1:
+            raise SystemExit("--paper-speedup requires --batch-size 1 and --max-running-requests 1")
+        if args.temperature != 0:
+            raise SystemExit("--paper-speedup requires greedy temperature=0")
+        if not args.disable_radix_cache:
+            raise SystemExit("--paper-speedup requires --disable-radix-cache")
+        if args.method in {"domino", "dspark"} and not args.target_only_reference_file:
+            raise SystemExit("--paper-speedup Domino/DSpark require --target-only-reference-file")
     seed_everything(args.seed)
     records = load_records(Path(args.data_file), args.max_samples)
-    request_tokenizer = None
-    if args.max_input_tokens > 0:
-        request_tokenizer = _load_request_tokenizer(
-            args.model,
-            local_files_only=args.local_files_only,
-        )
-    server_url = f"http://127.0.0.1:{args.port}"
-    command = build_server_args(
-        method=args.method,
-        model=args.model,
-        draft_model=args.draft_model,
-        port=args.port,
-        batch_size=args.max_running_requests,
-        tp_size=args.tp_size,
-        mem_fraction_static=args.mem_fraction_static,
-        attention_backend=args.attention_backend,
+    request_tokenizer = _load_request_tokenizer(
+        args.model,
+        local_files_only=args.local_files_only,
     )
-    print(f"[{args.method}] launching official SGLang: {' '.join(command)}", flush=True)
-    server_start = time.perf_counter()
-    process = subprocess.Popen(command, stdout=None, stderr=None, start_new_session=True)
-    try:
-        _wait_ready(server_url, process, args.server_timeout)
-        server_startup_ms = round((time.perf_counter() - server_start) * 1000.0, 3)
-        writer = io_util.JsonlWriter(Path(args.output))
-        successful = 0
-        with ThreadPoolExecutor(max_workers=args.batch_size) as executor:
-            futures = [
-                executor.submit(
-                    _request_one,
-                    server_url,
-                    sample,
-                    args,
-                    request_tokenizer,
-                )
-                for sample in records
-            ]
-            for future in as_completed(futures):
-                sample, result = future.result()
-                payload = result["payload"]
-                timing = result["metrics"]
-                timing["server_startup_ms"] = server_startup_ms
-                text = str(payload.get("text") or payload.get("output") or "")
-                input_tokens = int(timing.get("input_tokens") or 0)
-                output_tokens = int(timing.get("output_tokens") or 0)
-                record = build_sample_record(
-                    method=args.method,
-                    dataset=sample.get("raw", {}).get("dataset", Path(args.data_file).stem),
-                    sample_id=sample["id"],
-                    model=args.model,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    timing=timing,
-                    config={
-                        "device": "cuda",
-                        "dtype": os.environ.get("LONG_BENCH_DTYPE", "bfloat16"),
-                        "attention_backend": args.attention_backend,
-                        "seed": args.seed,
-                        "temperature": args.temperature,
-                        "max_new_tokens": args.max_new_tokens,
-                        "batch_size": args.batch_size,
-                        "measurement_scope": timing.get("measurement_scope", "e2e_only"),
-                        "extra_metrics": {
-                            "server_startup_ms": server_startup_ms,
-                            "tp_size": args.tp_size,
-                            "max_running_requests": args.max_running_requests,
-                            "verification_steps": timing.get("verification_steps"),
-                            "acceptance_histogram": timing.get("acceptance_histogram"),
-                            "server_reported_e2e_ms": timing.get("server_reported_e2e_ms"),
-                        },
-                    },
-                    text=text,
-                    reference_output=sample.get("reference"),
-                )
-                rouge.add_rouge(record, text, sample.get("reference"))
-                metrics.add_semantic(record, text, sample.get("reference"))
-                record["run_id"] = args.run_id
-                record["raw_response_meta"] = payload.get("meta_info", {})
-                writer.add(record)
-                successful += 1
-        records_written = list(writer.records)
-        summary = {
-            "type": "summary",
-            "method": args.method,
-            "dataset": Path(args.data_file).stem.replace("_100", ""),
-            "run_id": args.run_id,
-            "status": "success" if successful == len(records) else "failed",
-            "num_samples": len(records),
-            "successful_samples": successful,
-            "model": args.model,
-            "batch_size": args.batch_size,
-            "tp_size": args.tp_size,
-            "server_startup_ms": server_startup_ms,
-            "runtime": runtime_metadata(),
-            **rouge.aggregate_rouge(records_written),
-            **metrics.aggregate_semantic(records_written),
+    stop_token_ids = resolve_stop_token_ids(request_tokenizer)
+    generation_config = _generation_config(args, stop_token_ids)
+    runtime = runtime_metadata()
+    hardware = {
+        "gpu_name": runtime.get("gpu_name"),
+        "gpu_capability": runtime.get("gpu_capability"),
+        "cuda_version": runtime.get("cuda_version"),
+    }
+    cache_policy = (
+        "no_cross_request_prefix_reuse"
+        if args.disable_radix_cache
+        else "runtime_default_unverified"
+    )
+    runtime_config = {
+        "engine": "sglang-0.5.20",
+        "dtype": os.environ.get("LONG_BENCH_DTYPE", "bfloat16"),
+        "attention_backend": args.attention_backend,
+        "mem_fraction_static": args.mem_fraction_static,
+        "cache_policy": cache_policy,
+        "tp_size": args.tp_size,
+        "batch_size": args.batch_size,
+        "concurrency": args.max_running_requests,
+    }
+    expected_identity_by_id: dict[str, dict[str, Any]] = {}
+    for sample in records:
+        sample_id = str(sample["id"])
+        _, token_ids = _prompt_token_ids(sample["prompt"], request_tokenizer, args)
+        fields = build_v2_record_fields(
+            prompt_token_ids=token_ids,
+            generation_config=generation_config,
+            hardware=hardware,
+            target_revision=str(args.model),
+            tokenizer_revision=str(getattr(request_tokenizer, "name_or_path", args.model)),
+            gpu_count=args.tp_size,
+            tp_size=args.tp_size,
+            batch_size=args.batch_size,
+            concurrency=args.max_running_requests,
+            cache_policy=cache_policy,
+            runtime_config=runtime_config,
+        )
+        expected_identity_by_id[sample_id] = {
+            key: fields.get(key) for key in (
+                "prompt_token_sha256", "generation_config_sha256", "hardware_fingerprint",
+                "target_revision", "tokenizer_revision", "runtime_config_sha256", "gpu_count", "tp_size",
+                "batch_size", "concurrency", "cache_policy", "actual_input_tokens",
+            )
         }
-        writer.finalize(summary)
-        return 0 if successful == len(records) else 1
-    finally:
-        _stop_process_group(process)
+    needs_target_only_reference = args.method in {"domino", "dspark"}
+    reference_results: dict[str, dict[str, Any]] = {}
+    if needs_target_only_reference and args.target_only_reference_file:
+        reference_rows = load_target_only_reference(
+            Path(args.target_only_reference_file),
+            expected_sample_ids=[str(sample["id"]) for sample in records],
+            expected_identity_by_id=expected_identity_by_id,
+        )
+        for sample_id, row in reference_rows.items():
+            ref_wall = row.get("request_wall_ms")
+            reference_results[sample_id] = {
+                "record": row,
+                "payload": {
+                    "text": row.get("text"),
+                    "meta_info": row.get("raw_response_meta", {}),
+                },
+                "metrics": {
+                    key: row.get(key)
+                    for key in (
+                        "input_tokens", "output_tokens", "prefill_ms", "ttft_ms",
+                        "decode_ms", "e2e_ms", "server_startup_ms",
+                        "strict_decode_active_ms", "strict_decode_token_count",
+                        "strict_decode_phase_definition", "strict_decode_phase_verified",
+                    )
+                } | {"request_wall_ms": ref_wall, "e2e_ms": ref_wall},
+            }
+    elif needs_target_only_reference:
+        print(f"[{args.method}] collecting paired target-only reference timings", flush=True)
+        reference_results = _run_server_phase(
+            phase_method="target_only",
+            records=records,
+            args=args,
+            tokenizer=request_tokenizer,
+            stop_token_ids=stop_token_ids,
+        )
+
+    method_results = _run_server_phase(
+        phase_method=args.method,
+        records=records,
+        args=args,
+        tokenizer=request_tokenizer,
+        stop_token_ids=stop_token_ids,
+    )
+    writer = io_util.JsonlWriter(Path(args.output))
+    successful = 0
+    for sample in records:
+        sample_id = str(sample["id"])
+        result = method_results[sample_id]
+        payload = result["payload"]
+        timing = result["metrics"]
+        prompt_token_ids = timing.get("prompt_token_ids")
+        server_startup_ms = timing.get("server_startup_ms")
+        text = str(payload.get("text") or payload.get("output") or "")
+        input_tokens = int(timing.get("input_tokens") or 0)
+        output_tokens = int(timing.get("output_tokens") or 0)
+        record = build_sample_record(
+            method=args.method,
+            dataset=sample.get("raw", {}).get("dataset", Path(args.data_file).stem),
+            sample_id=sample["id"],
+            model=args.model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            timing=timing,
+            config={
+                "device": "cuda",
+                "dtype": os.environ.get("LONG_BENCH_DTYPE", "bfloat16"),
+                "attention_backend": args.attention_backend,
+                "seed": args.seed,
+                "temperature": args.temperature,
+                "max_new_tokens": args.max_new_tokens,
+                "batch_size": args.batch_size,
+                "measurement_scope": timing.get("measurement_scope", "e2e_only"),
+                "stop_token_ids": stop_token_ids,
+                "extra_metrics": {
+                    "server_startup_ms": server_startup_ms,
+                    "tp_size": args.tp_size,
+                    "max_running_requests": args.max_running_requests,
+                    "verification_steps": timing.get("verification_steps"),
+                    "acceptance_histogram": timing.get("acceptance_histogram"),
+                    "server_reported_e2e_ms": timing.get("server_reported_e2e_ms"),
+                },
+            },
+            text=text,
+            reference_output=sample.get("reference"),
+        )
+        record["acceptance_histogram"] = timing.get("acceptance_histogram")
+        record["draft_tokens_accepted"] = timing.get("draft_tokens_accepted")
+        record["draft_tokens_proposed"] = timing.get("draft_tokens_proposed")
+        record["draft_proposal_unit"] = timing.get("draft_proposal_unit")
+        record["accepted_draft_tokens_per_step"] = timing.get(
+            "accepted_draft_tokens_per_step"
+        )
+        record["acceptance_rate_percent"] = timing.get("acceptance_rate_percent")
+        local_prompt_tokens = timing.get("client_prompt_tokens")
+        server_prompt_tokens = timing.get("input_tokens")
+        text_token_count = len(request_tokenizer(text, add_special_tokens=False).input_ids[0])
+        record.update(
+            build_v2_record_fields(
+                prompt_token_ids=prompt_token_ids or [],
+                generation_config=generation_config,
+                hardware=hardware,
+                request_wall_ms=timing.get("request_wall_ms"),
+                native_elapsed_ms=timing.get("request_wall_ms"),
+                native_timing_scope="sglang_client_request_wall",
+                timed_generated_tokens=output_tokens,
+                visible_output_tokens=text_token_count,
+                decode_active_ms=timing.get("strict_decode_active_ms"),
+                decode_token_count=timing.get("strict_decode_token_count"),
+                decode_phase_definition=timing.get("strict_decode_phase_definition"),
+                decode_phase_verified=timing.get("strict_decode_phase_verified") is True,
+                timing_source="sglang_0.5.20_api_server_request_time_stats",
+                target_revision=str(args.model),
+                tokenizer_revision=str(getattr(request_tokenizer, "name_or_path", args.model)),
+                gpu_count=args.tp_size,
+                tp_size=args.tp_size,
+                batch_size=args.batch_size,
+                concurrency=args.max_running_requests,
+                cache_policy=cache_policy,
+                runtime_config=runtime_config,
+            )
+        )
+        record["prompt_token_count_match"] = timing.get("prompt_token_count_match")
+        record["client_prompt_tokens"] = local_prompt_tokens
+        record["server_prompt_tokens"] = server_prompt_tokens
+        if args.method == "target_only":
+            record["native_timing_scope"] = "sglang_client_request_wall"
+
+        if needs_target_only_reference:
+            reference = reference_results[sample_id]
+            reference_timing = reference["metrics"]
+            reference_payload = reference["payload"]
+            baseline_text = str(
+                reference_payload.get("text") or reference_payload.get("output") or ""
+            )
+            baseline_output_tokens = reference_timing.get("output_tokens")
+            record["baseline_text"] = baseline_text
+            record["baseline_raw_response_meta"] = reference_payload.get(
+                "meta_info", {}
+            )
+            record["baseline_output_tokens"] = (
+                int(baseline_output_tokens)
+                if baseline_output_tokens is not None
+                else None
+            )
+            record["baseline_prefill_ms"] = reference_timing.get("prefill_ms")
+            record["baseline_ttft_ms"] = reference_timing.get("ttft_ms")
+            record["baseline_decode_ms"] = reference_timing.get("decode_ms")
+            record["baseline_e2e_ms"] = reference_timing.get("request_wall_ms", reference_timing.get("e2e_ms"))
+            record["dense_prefill_ms"] = reference_timing.get("prefill_ms")
+            record["dense_ttft_ms"] = reference_timing.get("ttft_ms")
+            record["dense_decode_ms"] = reference_timing.get("decode_ms")
+            record["dense_e2e_ms"] = reference_timing.get("request_wall_ms", reference_timing.get("e2e_ms"))
+            record["baseline_server_startup_ms"] = reference_timing.get(
+                "server_startup_ms"
+            )
+            record["native_reference_id"] = str(args.target_only_reference_file or "inline_target_only")
+            record["native_reference"] = (
+                reference.get("record") if isinstance(reference.get("record"), dict) else None
+            )
+            record["speedup_scope"] = "paired_target_only"
+            record["speedup_reference_method"] = "sglang_target_only"
+            record["paired_output_exact_match"] = text == baseline_text
+            record["paired_output_token_count_match"] = (
+                output_tokens == int(baseline_output_tokens)
+                if baseline_output_tokens is not None
+                else None
+            )
+            record["paired_output_token_ratio"] = (
+                round(output_tokens / int(baseline_output_tokens), 4)
+                if baseline_output_tokens is not None
+                and int(baseline_output_tokens) > 0
+                else None
+            )
+            record["speedup_valid"] = metrics.has_valid_paired_speedup(record)
+
+        rouge.add_rouge(record, text, sample.get("reference"))
+        metrics.add_semantic(record, text, sample.get("reference"))
+        record["run_id"] = args.run_id
+        record["raw_response_meta"] = payload.get("meta_info", {})
+        writer.add(record)
+        successful += 1
+        print(
+            f"[sample {sample_id}] {args.method}={record.get('e2e_ms')}ms "
+            + (
+                f"target_only={record.get('dense_e2e_ms')}ms "
+                if needs_target_only_reference
+                else ""
+            )
+            + f"tokens={output_tokens}"
+            + (
+                f" exact_match={record.get('paired_output_exact_match')}"
+                if needs_target_only_reference
+                else ""
+            ),
+            flush=True,
+        )
+
+    records_written = list(writer.records)
+    method_startups = [
+        result["metrics"].get("server_startup_ms")
+        for result in method_results.values()
+        if result["metrics"].get("server_startup_ms") is not None
+    ]
+    reference_startups = [
+        result["metrics"].get("server_startup_ms")
+        for result in reference_results.values()
+        if result["metrics"].get("server_startup_ms") is not None
+    ]
+    summary = {
+        "type": "summary",
+        "method": args.method,
+        "dataset": Path(args.data_file).stem.replace("_100", ""),
+        "run_id": args.run_id,
+        "status": "success" if successful == len(records) else "failed",
+        "num_samples": len(records),
+        "successful_samples": successful,
+        "model": args.model,
+        "batch_size": args.batch_size,
+        "tp_size": args.tp_size,
+        "server_startup_ms": method_startups[0] if method_startups else None,
+        "target_only_server_startup_ms": (
+            reference_startups[0] if reference_startups else None
+        ),
+        "runtime": runtime,
+        "speedup": metrics.aggregate_speedup(records_written),
+        "speedup_scope": (
+            "paired_target_only" if needs_target_only_reference else None
+        ),
+        "speedup_reference_method": (
+            "sglang_target_only" if needs_target_only_reference else None
+        ),
+        **metrics.aggregate_paired_reference_fidelity(records_written),
+        **rouge.aggregate_rouge(records_written),
+        **metrics.aggregate_semantic(records_written),
+    }
+    writer.finalize(summary)
+    return 0 if successful == len(records) else 1
 
 
 if __name__ == "__main__":

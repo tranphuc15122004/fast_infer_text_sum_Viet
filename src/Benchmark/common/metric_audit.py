@@ -10,8 +10,11 @@ from __future__ import annotations
 
 from collections import Counter
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from Benchmark.common.quality_guard import is_degenerate_output
 
 
 AUDIT_SCHEMA_VERSION = 1
@@ -107,11 +110,199 @@ _TEXT_QUALITY_FIELDS = (
 )
 _DERIVED_ISSUES = {
     "speedup_invalid",
+    # Quality warning only: retain and report the latency observation.
+    "degenerate_repetition",
     "missing_tpot_ms",
     "missing_throughput_tok_s",
     "missing_decode_throughput_tok_s",
 }
 _QUALITY_FIELDS = tuple(dict.fromkeys(_QUALITY_FIELDS + _TEXT_QUALITY_FIELDS))
+_SPECULATIVE_BASELINES = frozenset({"eagle3", "dflash", "domino", "dspark"})
+
+
+def _acceptance_metric_issues(record: Mapping[str, Any]) -> list[str]:
+    """Check speculative acceptance fields and their directly available traces."""
+
+    baseline = str(record.get("method") or "")
+    if baseline not in _SPECULATIVE_BASELINES:
+        return []
+
+    issues: list[str] = []
+    avg_accept_length = record.get("avg_accept_length")
+    if avg_accept_length is None and baseline == "eagle3":
+        avg_accept_length = record.get("accept_length")
+    if avg_accept_length is None:
+        issues.append("missing_avg_accept_length")
+    else:
+        try:
+            avg_accept_length = float(avg_accept_length)
+        except (TypeError, ValueError):
+            issues.append("invalid_avg_accept_length")
+        else:
+            if not math.isfinite(avg_accept_length) or avg_accept_length < 1.0:
+                issues.append("invalid_avg_accept_length")
+
+    acceptance_rate = record.get("acceptance_rate")
+    if acceptance_rate is None:
+        issues.append("missing_acceptance_rate")
+    else:
+        try:
+            acceptance_rate = float(acceptance_rate)
+        except (TypeError, ValueError):
+            issues.append("invalid_acceptance_rate")
+        else:
+            if not math.isfinite(acceptance_rate) or not 0.0 <= acceptance_rate <= 1.0:
+                issues.append("invalid_acceptance_rate")
+
+    if baseline in {"eagle3", "dflash"}:
+        lengths = record.get("acceptance_lengths")
+        if not isinstance(lengths, (list, tuple)) or not lengths:
+            issues.append("missing_acceptance_lengths")
+        else:
+            try:
+                normalized_lengths = [float(value) for value in lengths]
+            except (TypeError, ValueError):
+                issues.append("invalid_acceptance_length")
+            else:
+                if any(
+                    not math.isfinite(value) or value < 1.0
+                    for value in normalized_lengths
+                ):
+                    issues.append("invalid_acceptance_length")
+                elif (
+                    avg_accept_length is not None
+                    and "invalid_avg_accept_length" not in issues
+                    and abs(
+                        sum(normalized_lengths) / len(normalized_lengths)
+                        - avg_accept_length
+                    ) > max(0.02, 0.005 * avg_accept_length)
+                ):
+                    issues.append("acceptance_trace_average_mismatch")
+            verification_steps = record.get("verification_steps")
+            if verification_steps is not None:
+                try:
+                    if len(lengths) != int(verification_steps):
+                        issues.append("acceptance_trace_step_mismatch")
+                except (TypeError, ValueError):
+                    issues.append("invalid_verification_steps")
+
+    histogram = record.get("acceptance_histogram")
+    verification_steps = record.get("verification_steps")
+    if histogram is not None:
+        if not isinstance(histogram, (list, tuple)) or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in histogram
+        ):
+            issues.append("invalid_acceptance_histogram")
+        else:
+            if (
+                verification_steps is not None
+                and sum(histogram) != int(verification_steps)
+            ):
+                issues.append("acceptance_histogram_step_mismatch")
+            if (
+                histogram
+                and verification_steps
+                and avg_accept_length is not None
+                and "invalid_avg_accept_length" not in issues
+            ):
+                histogram_average = 1.0 + sum(
+                    index * count for index, count in enumerate(histogram)
+                ) / float(verification_steps)
+                # A final EOS may be counted as one completion token by the
+                # request metric but omitted from the accepted-draft histogram.
+                # Allow that single-token discrepancy, plus small float noise.
+                histogram_tolerance = max(
+                    0.02,
+                    0.005 * avg_accept_length,
+                    1.0 / float(verification_steps) + 0.001,
+                )
+                if abs(histogram_average - avg_accept_length) > histogram_tolerance:
+                    issues.append("acceptance_histogram_length_mismatch")
+
+    correct = record.get("draft_tokens_accepted")
+    proposed = record.get("draft_tokens_proposed")
+    if (
+        baseline in {"eagle3", "dflash", "domino", "dspark"}
+        and correct is not None
+        and proposed is not None
+    ):
+        try:
+            correct_value = float(correct)
+            proposed_value = float(proposed)
+        except (TypeError, ValueError):
+            issues.append("invalid_acceptance_counters")
+        else:
+            if (
+                not math.isfinite(correct_value)
+                or not math.isfinite(proposed_value)
+                or proposed_value <= 0
+                or not 0 <= correct_value <= proposed_value
+            ):
+                issues.append("invalid_acceptance_counters")
+            elif (
+                acceptance_rate is not None
+                and "invalid_acceptance_rate" not in issues
+                and abs(correct_value / proposed_value - acceptance_rate) > 1e-4
+            ):
+                issues.append("acceptance_rate_counter_mismatch")
+            if acceptance_rate is not None:
+                rate_percent = record.get("acceptance_rate_percent")
+                if rate_percent is not None:
+                    try:
+                        rate_percent_value = float(rate_percent)
+                    except (TypeError, ValueError):
+                        issues.append("invalid_acceptance_rate_percent")
+                    else:
+                        if (
+                            not math.isfinite(rate_percent_value)
+                            or abs(rate_percent_value - acceptance_rate * 100.0)
+                            > 0.00011
+                        ):
+                            issues.append("acceptance_rate_percent_mismatch")
+                accepted_per_step = record.get("accepted_draft_tokens_per_step")
+                verification_steps = record.get("verification_steps")
+                if accepted_per_step is not None and verification_steps:
+                    try:
+                        accepted_per_step_value = float(accepted_per_step)
+                        steps_value = float(verification_steps)
+                    except (TypeError, ValueError):
+                        issues.append("invalid_accepted_draft_tokens_per_step")
+                    else:
+                        if (
+                            not math.isfinite(accepted_per_step_value)
+                            or steps_value <= 0
+                            or abs(accepted_per_step_value - correct_value / steps_value)
+                            > 1e-4
+                        ):
+                            issues.append("accepted_draft_tokens_per_step_mismatch")
+                        avg_accept_length = record.get("avg_accept_length")
+                        if (
+                            avg_accept_length is not None
+                            and "invalid_avg_accept_length" not in issues
+                            and steps_value > 0
+                        ):
+                            try:
+                                avg_accept_length_value = float(avg_accept_length)
+                            except (TypeError, ValueError):
+                                issues.append("invalid_avg_accept_length")
+                            else:
+                                expected_length = 1.0 + correct_value / steps_value
+                                length_tolerance = max(
+                                    0.02, 1.0 / steps_value + 0.001
+                                )
+                                if (
+                                    not math.isfinite(avg_accept_length_value)
+                                    or abs(avg_accept_length_value - expected_length)
+                                    > length_tolerance
+                                ):
+                                    issues.append(
+                                        "acceptance_length_counter_mismatch"
+                                    )
+
+    return issues
 
 
 def required_direct_metrics(
@@ -240,6 +431,15 @@ def audit_record(
             issues.append("missing_quality_metric")
     if record.get("speedup_valid") is False:
         issues.append("speedup_invalid")
+    issues.extend(_acceptance_metric_issues(record))
+    guard = record.get("output_quality_guard")
+    output_text = record.get("text") or record.get("answer")
+    if (
+        record.get("degenerate_repetition")
+        or (isinstance(guard, Mapping) and guard.get("degenerate_repetition"))
+        or is_degenerate_output(str(output_text or ""))
+    ):
+        issues.append("degenerate_repetition")
 
     return {
         "schema_version": AUDIT_SCHEMA_VERSION,
@@ -258,6 +458,14 @@ def audit_record(
             "reference_present": reference_present,
             "text_present": text_present,
             "present": quality_present,
+            "target_greedy_match": record.get("target_greedy_match"),
+            "external_reference_output_exact_match": record.get("external_reference_output_exact_match"),
+            "external_reference_output_token_count_match": record.get("external_reference_output_token_count_match"),
+            "output_degenerate": bool(
+                record.get("degenerate_repetition")
+                or (isinstance(guard, Mapping) and guard.get("degenerate_repetition"))
+                or is_degenerate_output(str(output_text or ""))
+            ),
         },
         "tokens": {
             "input_tokens": record.get("input_tokens"),
@@ -398,13 +606,6 @@ def validate_cell_metric_contract(
         if expected_scope is not None and scope != expected_scope:
             issue_counts["unexpected_measurement_scope"] += 1
             hard_issues.append("unexpected_measurement_scope")
-        guard = record.get("output_quality_guard")
-        if baseline in {"vanilla_hf", "vanilla_fa"} and (
-            record.get("degenerate_repetition")
-            or (isinstance(guard, Mapping) and guard.get("degenerate_repetition"))
-        ):
-            issue_counts["degenerate_repetition"] += 1
-            hard_issues.append("degenerate_repetition")
         if hard_issues:
             invalid_records.append(record.get("sample_id"))
         if record.get("speedup_valid") is True:

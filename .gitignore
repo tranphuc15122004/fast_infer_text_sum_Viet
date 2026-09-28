@@ -27,3 +27,5 @@ datasets/normalized/
 outputs/finetuning-synthetic/
 outputs/
 checkpoints/
+
+ket_qua_smoke_VietBench.zip

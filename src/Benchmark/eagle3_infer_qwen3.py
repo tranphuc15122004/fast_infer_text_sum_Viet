@@ -37,8 +37,21 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "externals" / "EAGLE"))
 
 from Benchmark.common import metrics, rouge  # noqa: E402
-from Benchmark.eagle_compat import install_eagle_transformers_compat  # noqa: E402
+from Benchmark.eagle_compat import (  # noqa: E402
+    eagle_model_load_options,
+    eagle_target_dtype,
+    eagle_paired_speedup_fields,
+    normalize_eagle_acceptance_metrics,
+    eagle_rotary_diagnostics,
+    install_eagle_transformers_compat,
+    reload_eagle_target_weights,
+    repair_eagle_rotary_embeddings,
+    truncate_eagle_generation_at_stop,
+)
 from Benchmark.common.input_utils import truncate_input_ids  # noqa: E402
+from Benchmark.common.paired_reference import build_v2_record_fields  # noqa: E402
+from Benchmark.common.benchmark_runtime import runtime_metadata  # noqa: E402
+from Benchmark.eagle_timing_patch import apply_eagle_timing_patch  # noqa: E402
 from Benchmark.common.reproducibility import seed_everything  # noqa: E402
 
 
@@ -161,6 +174,54 @@ def timed_generate(
     if output_ids.shape[1] > max_output_len:
         output_ids = output_ids[:, :max_output_len]
 
+    stop_token_ids = getattr(model.tokenizer, "eos_token_id", None)
+    if isinstance(stop_token_ids, int) and not isinstance(stop_token_ids, bool):
+        stop_token_ids = [stop_token_ids]
+    elif not isinstance(stop_token_ids, (list, tuple, set)):
+        stop_token_ids = []
+    else:
+        stop_token_ids = list(stop_token_ids)
+    if is_llama3:
+        try:
+            llama_stop_id = model.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        except (AttributeError, TypeError, ValueError):
+            llama_stop_id = None
+        if isinstance(llama_stop_id, int) and llama_stop_id >= 0:
+            stop_token_ids.append(llama_stop_id)
+
+    output_ids, acceptance_lengths, stop_tokens_trimmed = (
+        truncate_eagle_generation_at_stop(
+            output_ids,
+            prompt_length=input_ids.shape[1],
+            acceptance_lengths=acceptance_lengths,
+            stop_token_ids=stop_token_ids,
+        )
+    )
+    phase_timings = dict(phase_timings or {})
+    phase_timings["stop_tokens_trimmed"] = stop_tokens_trimmed
+    if stop_tokens_trimmed and spec:
+        accepted_draft_tokens = max(
+            0, sum(acceptance_lengths) - len(acceptance_lengths)
+        )
+        proposed_draft_tokens = int(
+            phase_timings.get("draft_tokens_proposed") or 0
+        )
+        phase_timings["draft_tokens_accepted"] = accepted_draft_tokens
+        phase_timings["avg_accept_length"] = (
+            sum(acceptance_lengths) / len(acceptance_lengths)
+            if acceptance_lengths
+            else 0.0
+        )
+        phase_timings["acceptance_rate"] = (
+            accepted_draft_tokens / proposed_draft_tokens
+            if proposed_draft_tokens > 0
+            else 0.0
+        )
+        phase_timings["rejected_draft_ratio"] = (
+            1.0 - phase_timings["acceptance_rate"]
+        )
+        steps = len(acceptance_lengths)
+
     # Use the returned sequence as the source of truth after max-token
     # truncation, rather than relying on the internal loop counter.
     new_tokens = int(output_ids.shape[1] - input_ids.shape[1])
@@ -223,7 +284,7 @@ def target_logits_parity(
     eagle_target,
     reference_target,
     input_ids: torch.Tensor,
-) -> dict[str, float | int | bool]:
+) -> dict[str, object]:
     """Compare the vendored KV target with stock Transformers on one prompt."""
 
     with torch.inference_mode():
@@ -232,12 +293,35 @@ def target_logits_parity(
     delta = (eagle_logits.float() - reference_logits.float()).abs()
     eagle_top = int(eagle_logits.argmax(dim=-1)[0])
     reference_top = int(reference_logits.argmax(dim=-1)[0])
+    parameter_checks = {}
+    eagle_state = eagle_target.state_dict()
+    reference_state = reference_target.state_dict()
+    for name in (
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_norm.weight",
+        "model.layers.0.mlp.down_proj.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+    ):
+        left = eagle_state.get(name)
+        right = reference_state.get(name)
+        if left is None or right is None:
+            parameter_checks[name] = {"available": False}
+            continue
+        weight_delta = (left.float() - right.float()).abs()
+        parameter_checks[name] = {
+            "available": True,
+            "max_abs_delta": float(weight_delta.max().item()),
+            "mean_abs_delta": float(weight_delta.mean().item()),
+        }
     return {
         "max_abs_logit_delta": float(delta.max().item()),
         "mean_abs_logit_delta": float(delta.mean().item()),
         "eagle_top_token": eagle_top,
         "reference_top_token": reference_top,
         "top_token_match": eagle_top == reference_top,
+        "parameter_checks": parameter_checks,
     }
 
 
@@ -296,6 +380,7 @@ def main() -> None:
 
     # Keep --help and preflight cheap.  The vendored model imports custom
     # attention/KV modules and may trigger CUDA extension discovery.
+    eagle_timing_patch = apply_eagle_timing_patch(ROOT)
     install_eagle_transformers_compat()
     from eagle.model.ea_model import EaModel
     from eagle.model.kv_cache import initialize_past_key_values
@@ -308,66 +393,84 @@ def main() -> None:
           f"{args.num_choices} choice(s) each")
 
     model_load_start = time.perf_counter()
+    target_dtype = eagle_target_dtype(torch, device_index=0)
     model = EaModel.from_pretrained(
         base_model_path=args.base_model,
         ea_model_path=args.eagle_model,
         total_token=args.total_token,
         depth=args.depth,
         top_k=args.top_k,
-        torch_dtype=torch.float16,
+        torch_dtype=target_dtype,
         # Transformers 5's meta-device loader reports a clean state-dict
         # audit for this vendored EAGLE class but leaves its parameters at
         # initialization values.  Materialize the custom target normally so
-        # the upstream checkpoint tensors are copied into it.
-        low_cpu_mem_usage=False,
-        output_loading_info=args.check_target_parity,
-        # EAGLE3 builds tree tensors with .tolist(), so CPU/meta offloading
-        # from device_map="auto" is not supported here. Keep both models on
-        # the single Tesla T4.
-        device_map={"": "cuda:0"},
+        # the upstream checkpoint tensors are copied into it. Loading info
+        # must remain disabled because EaModel.from_pretrained does not unwrap
+        # the (model, loading_info) tuple returned by Transformers.
+        **eagle_model_load_options(),
         use_eagle3=True,
     )
+    target_load_audit = reload_eagle_target_weights(
+        model.base_model, args.base_model
+    )
+    # The custom Transformers loader silently leaves several target parameters
+    # at initialization values on the supported 5.12 wheel. The explicit shard
+    # reload above is followed by one device transfer for the completed model.
+    model.to("cuda:0")
+    # EAGLE's tree masks are plain tensor attributes, so Module.to() does not
+    # move the copies created while EaModel was being constructed on CPU.
+    model.ea_layer.init_tree()
+    repair_eagle_rotary_embeddings(model.base_model.model)
     model.eval()
     torch.cuda.synchronize("cuda:0")
     model_load_ms = round((time.perf_counter() - model_load_start) * 1000.0, 3)
+    print(f"[EAGLE3] target checkpoint reload audit: {target_load_audit}")
+    print(f"[EAGLE3] target/draft compute dtype: {target_dtype}")
     tokenizer = model.get_tokenizer()
+    runtime = runtime_metadata()
+    hardware = {
+        "gpu_name": runtime.get("gpu_name"),
+        "gpu_capability": runtime.get("gpu_capability"),
+        "cuda_version": runtime.get("cuda_version"),
+    }
 
     parity: dict[str, float | int | bool] | None = None
     if args.check_target_parity:
         from transformers import AutoModelForCausalLM
 
         target_config = model.base_model.config
-        target_attention = model.base_model.model.layers[0].self_attn
-        if hasattr(target_attention, "_refresh_llama3_rope_buffers"):
-            target_attention._refresh_llama3_rope_buffers()
+        target_core = model.base_model.model
+        target_attention = target_core.layers[0].self_attn
         print(
             "[EAGLE3] target RoPE config:",
             {
                 "rope_scaling": getattr(target_config, "rope_scaling", None),
                 "rope_parameters": getattr(target_config, "rope_parameters", None),
                 "rope_theta": getattr(target_config, "rope_theta", None),
-                "rotary_impl": type(target_attention.rotary_emb).__name__,
-                "rotary_module": type(target_attention.rotary_emb).__module__,
-                "rotary_type": getattr(target_attention.rotary_emb, "rope_type", None),
-                "uses_llama3_rope": getattr(target_attention, "_uses_llama3_rope", None),
-                "inv_freq_head": target_attention.rotary_emb.inv_freq[:4].detach().float().cpu().tolist(),
+                **eagle_rotary_diagnostics(target_core, target_attention),
             },
         )
         print("Checking vendored EAGLE target logits against stock Transformers ...")
         reference_target = AutoModelForCausalLM.from_pretrained(
             args.base_model,
-            dtype=torch.float16,
+            dtype=target_dtype,
             attn_implementation="eager",
             low_cpu_mem_usage=True,
         ).to("cuda").eval()
         parity = target_logits_parity(
             model.base_model,
             reference_target,
-            build_input_ids(tokenizer, "Hello", "cuda"),
+            build_input_ids(tokenizer, questions[0]["turns"][0], "cuda"),
         )
         del reference_target
         torch.cuda.empty_cache()
         print(f"[EAGLE3] target parity: {parity}")
+        if not parity["top_token_match"]:
+            raise RuntimeError(
+                "EAGLE3 target logits do not match stock Transformers for the "
+                "representative prompt; speculative output and speedup are "
+                "not valid until target forward compatibility is fixed."
+            )
 
     # Tokenize every prompt up front. This also gives us the longest input so
     # the shared KV cache can be sized to fit *all* questions: EAGLE3 allocates
@@ -405,7 +508,7 @@ def main() -> None:
             max_new_tokens=8,
             max_length=warmup_ids.shape[1] + 8 + args.total_token + 32,
             log=False,
-            is_llama3=True,
+            is_llama3=False,
         )
         if not args.skip_naive:
             model.naivegenerate(
@@ -414,7 +517,7 @@ def main() -> None:
                 max_new_tokens=8,
                 max_length=warmup_ids.shape[1] + 8 + args.total_token + 32,
                 log=False,
-                is_llama3=True,
+                is_llama3=False,
             )
     print("Warmup done.")
 
@@ -429,9 +532,15 @@ def main() -> None:
             qid = question.get("question_id", qi)
             for choice in range(args.num_choices):
                 sample_seed = args.seed
-                input_ids = all_input_ids[qi]
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize("cuda:0")
+                request_start = time.perf_counter()
+                input_ids = build_input_ids(tokenizer, prompt, "cuda")
+                if args.max_input_tokens and args.max_input_tokens > 0:
+                    input_ids = truncate_input_ids(
+                        input_ids, args.max_input_tokens
+                    ).contiguous()
                 input_len = input_ids.shape[1]
-
                 seed_everything(sample_seed)
                 with torch.inference_mode():
                     (
@@ -444,15 +553,28 @@ def main() -> None:
                     ) = timed_generate(
                         model, input_ids, args.temperature,
                         args.max_new_tokens, args.total_token, spec=True,
-                        is_llama3=True,
+                        is_llama3=False,
                         include_phase_timings=True,
                     )
                     answer = decode_answer(tokenizer, out_ids, input_len)
+                    eagle_acceptance = normalize_eagle_acceptance_metrics(
+                        acceptance_lengths,
+                        draft_tokens_accepted=eagle_phases.get(
+                            "draft_tokens_accepted"
+                        ),
+                        draft_tokens_per_step=int(model.ea_layer.total_tokens),
+                    )
+                    eagle_phases = dict(eagle_phases)
+                    eagle_phases.update(eagle_acceptance)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize("cuda:0")
+                request_wall_ms = (time.perf_counter() - request_start) * 1000.0
 
-                    if not args.skip_naive:
-                        seed_everything(sample_seed)
+                if not args.skip_naive:
+                    seed_everything(sample_seed)
+                    with torch.inference_mode():
                         (
-                            _,
+                            naive_out_ids,
                             naive_tokens,
                             _,
                             naive_time,
@@ -461,11 +583,34 @@ def main() -> None:
                         ) = timed_generate(
                             model, input_ids, args.temperature,
                             args.max_new_tokens, args.total_token, spec=False,
-                            is_llama3=True,
+                            is_llama3=False,
                             include_phase_timings=True,
                         )
-                    else:
-                        naive_tokens, naive_time, naive_phases = None, None, {}
+                else:
+                    naive_out_ids = None
+                    naive_tokens, naive_time, naive_phases = None, None, {}
+
+                target_greedy_check_applicable = (
+                    args.temperature <= 1e-5 and naive_out_ids is not None
+                )
+                paired_speedup_fields = eagle_paired_speedup_fields(
+                    out_ids[0, input_len:].tolist(),
+                    naive_out_ids[0, input_len:].tolist()
+                    if naive_out_ids is not None
+                    else None,
+                    eagle_time_s=eagle_time,
+                    naive_time_s=naive_time,
+                )
+                if not target_greedy_check_applicable:
+                    paired_speedup_fields["target_greedy_match"] = None
+                naive_answer = (
+                    decode_answer(tokenizer, naive_out_ids, input_len)
+                    if naive_out_ids is not None
+                    else None
+                )
+                paired_speedup_fields["paired_output_exact_match"] = (
+                    answer == naive_answer if naive_answer is not None else None
+                )
 
                 # DFlash reports the unweighted mean of each generation's
                 # per-verification acceptance lengths.
@@ -476,7 +621,7 @@ def main() -> None:
                 eagle_tok_s = new_tokens / eagle_time if eagle_time > 0 else 0.0
                 if naive_time is not None and naive_time > 0 and naive_tokens:
                     naive_tok_s = naive_tokens / naive_time
-                    speedup = eagle_tok_s / naive_tok_s if naive_tok_s > 0 else 0.0
+                    speedup = paired_speedup_fields["paired_speedup"]
                 else:
                     naive_tok_s, speedup = None, None
 
@@ -489,10 +634,15 @@ def main() -> None:
                     "reference_output": question.get("answer") or question.get("reference"),
                     "task_type": question.get("task_type"),
                     "status": "success",
+                    "failure_reason": None,
                     "new_tokens": new_tokens,
                     "tree_steps": tree_steps,
                     "accept_length": round(accept_length, 4),
                     "acceptance_lengths": acceptance_lengths,
+                    "verification_steps": eagle_acceptance["verification_steps"],
+                    "stop_tokens_trimmed": eagle_phases.get(
+                        "stop_tokens_trimmed", 0
+                    ),
                     "eagle_time": round(eagle_time, 4),
                     "eagle_tok_s": round(eagle_tok_s, 2),
                     "naive_tokens": naive_tokens,
@@ -502,6 +652,64 @@ def main() -> None:
                                     if naive_tok_s is not None else None),
                     "speedup": (round(speedup, 3)
                                 if speedup is not None else None),
+                    "paired_speedup": paired_speedup_fields["paired_speedup"],
+                    "paired_speedup_valid": paired_speedup_fields[
+                        "paired_speedup_valid"
+                    ],
+                    "paired_first_mismatch_index": paired_speedup_fields.get(
+                        "paired_first_mismatch_index"
+                    ),
+                    "paired_eagle_mismatch_token": paired_speedup_fields.get(
+                        "paired_eagle_mismatch_token"
+                    ),
+                    "paired_naive_mismatch_token": paired_speedup_fields.get(
+                        "paired_naive_mismatch_token"
+                    ),
+                    "paired_eagle_output_tokens": paired_speedup_fields.get(
+                        "paired_eagle_output_tokens"
+                    ),
+                    "paired_naive_output_tokens": paired_speedup_fields.get(
+                        "paired_naive_output_tokens"
+                    ),
+                    "paired_speedup_invalid_reason": paired_speedup_fields[
+                        "paired_speedup_invalid_reason"
+                    ],
+                    "paired_output_exact_match": paired_speedup_fields.get(
+                        "paired_output_exact_match"
+                    ),
+                    "paired_output_token_count_match": paired_speedup_fields.get(
+                        "paired_output_token_count_match"
+                    ),
+                    "paired_output_token_ratio": (
+                        round(new_tokens / naive_tokens, 4)
+                        if naive_tokens is not None and naive_tokens > 0
+                        else None
+                    ),
+                    "baseline_text": naive_answer,
+                    "baseline_output_tokens": naive_tokens,
+                    "baseline_decode_ms": (
+                        round(naive_time * 1000.0, 3)
+                        if naive_time is not None
+                        else None
+                    ),
+                    "baseline_prefill_ms": naive_phases.get("prefill_ms"),
+                    "baseline_ttft_ms": naive_phases.get(
+                        "ttft_ms", naive_phases.get("prefill_ms")
+                    ),
+                    "baseline_e2e_ms": naive_phases.get("e2e_ms"),
+                    "speedup_scope": (
+                        "paired_target_only" if naive_out_ids is not None else None
+                    ),
+                    "speedup_reference_method": (
+                        "eagle_target_autoregressive"
+                        if naive_out_ids is not None
+                        else None
+                    ),
+                    "speedup_valid": paired_speedup_fields["paired_speedup_valid"],
+                    "target_greedy_check_applicable": target_greedy_check_applicable,
+                    "target_greedy_match": paired_speedup_fields[
+                        "target_greedy_match"
+                    ],
                     "base_model": args.base_model,
                     "eagle_model": args.eagle_model,
                     "model_load_ms": model_load_ms,
@@ -518,6 +726,89 @@ def main() -> None:
                         e2e_ms=eagle_phases.get("e2e_ms"),
                     )
                 )
+                special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+                prompt_token_ids = input_ids[0].detach().cpu().tolist()
+                spec_timed_tokens = int(new_tokens) + int(eagle_phases.get("stop_tokens_trimmed") or 0)
+                spec_visible_tokens = sum(
+                    1 for token in out_ids[0, input_len:].tolist() if int(token) not in special_ids
+                )
+                record.update(
+                    build_v2_record_fields(
+                        prompt_token_ids=prompt_token_ids,
+                        generation_config={
+                            "temperature": args.temperature,
+                            "max_new_tokens": args.max_new_tokens,
+                            "seed": args.seed,
+                            "stop_token_ids": getattr(tokenizer, "eos_token_id", None),
+                        },
+                        hardware=hardware,
+                        request_wall_ms=request_wall_ms,
+                        native_elapsed_ms=eagle_time * 1000.0,
+                        native_timing_scope="generation",
+                        timed_generated_tokens=spec_timed_tokens,
+                        visible_output_tokens=spec_visible_tokens,
+                        decode_active_ms=eagle_phases.get("strict_decode_active_ms"),
+                        decode_token_count=eagle_phases.get("strict_decode_token_count"),
+                        decode_phase_definition=eagle_phases.get("strict_decode_phase_definition"),
+                        decode_phase_verified=eagle_phases.get("strict_decode_phase_verified") is True,
+                        timing_source=f"{eagle_timing_patch['patch_version']}:{eagle_timing_patch['patched_model_sha256']}",
+                        target_revision=str(args.base_model),
+                        tokenizer_revision=str(getattr(tokenizer, "name_or_path", args.base_model)),
+                        gpu_count=1,
+                        tp_size=1,
+                        batch_size=1,
+                        concurrency=1,
+                        cache_policy="no_cross_request_prefix_reuse",
+                    )
+                )
+                if naive_out_ids is not None and naive_time is not None:
+                    naive_timed_tokens = int(naive_tokens or 0) + int(naive_phases.get("stop_tokens_trimmed") or 0)
+                    naive_visible_tokens = sum(
+                        1 for token in naive_out_ids[0, input_len:].tolist() if int(token) not in special_ids
+                    )
+                    record["native_reference"] = {
+                        **build_v2_record_fields(
+                            prompt_token_ids=prompt_token_ids,
+                            generation_config={
+                                "temperature": args.temperature,
+                                "max_new_tokens": args.max_new_tokens,
+                                "seed": args.seed,
+                                "stop_token_ids": getattr(tokenizer, "eos_token_id", None),
+                            },
+                            hardware=hardware,
+                            native_elapsed_ms=naive_time * 1000.0,
+                            native_timing_scope="generation",
+                            timed_generated_tokens=naive_timed_tokens,
+                            visible_output_tokens=naive_visible_tokens,
+                            decode_active_ms=naive_phases.get("strict_decode_active_ms"),
+                            decode_token_count=naive_phases.get("strict_decode_token_count"),
+                            decode_phase_definition=naive_phases.get("strict_decode_phase_definition"),
+                            decode_phase_verified=naive_phases.get("strict_decode_phase_verified") is True,
+                            timing_source=f"{eagle_timing_patch['patch_version']}:{eagle_timing_patch['patched_model_sha256']}",
+                            target_revision=str(args.base_model),
+                            tokenizer_revision=str(getattr(tokenizer, "name_or_path", args.base_model)),
+                            gpu_count=1,
+                            tp_size=1,
+                            batch_size=1,
+                            concurrency=1,
+                            cache_policy="no_cross_request_prefix_reuse",
+                        ),
+                        "sample_id": str(qid),
+                        "dataset": "eagle_input",
+                        "method": "eagle_naivegenerate",
+                        "status": "success",
+                        "text": naive_answer,
+                        "output_tokens": naive_timed_tokens,
+                    }
+                record["eagle_timing_patch"] = eagle_timing_patch
+                record["dense_decode_ms"] = record.get("baseline_decode_ms")
+                record["dense_prefill_ms"] = record.get("baseline_prefill_ms")
+                record["dense_ttft_ms"] = record.get("baseline_ttft_ms")
+                record["dense_e2e_ms"] = record.get("baseline_e2e_ms")
+                record["paired_output_token_ids_match"] = paired_speedup_fields.get(
+                    "paired_output_token_ids_match"
+                )
+                record["speedup_valid"] = metrics.has_valid_paired_speedup(record)
                 record["peak_memory_gb"] = eagle_phases.get("peak_memory_gb")
                 record["draft_latency_ms"] = eagle_phases.get("draft_latency_ms")
                 record["verification_latency_ms"] = eagle_phases.get(
@@ -529,7 +820,16 @@ def main() -> None:
                 record["draft_tokens_accepted"] = eagle_phases.get(
                     "draft_tokens_accepted"
                 )
+                record["draft_proposal_unit"] = eagle_phases.get(
+                    "draft_proposal_unit"
+                )
                 record["acceptance_rate"] = eagle_phases.get("acceptance_rate")
+                record["acceptance_rate_percent"] = eagle_phases.get(
+                    "acceptance_rate_percent"
+                )
+                record["accepted_draft_tokens_per_step"] = eagle_phases.get(
+                    "accepted_draft_tokens_per_step"
+                )
                 record["rejected_draft_ratio"] = eagle_phases.get(
                     "rejected_draft_ratio"
                 )
@@ -551,6 +851,12 @@ def main() -> None:
                     "accept_length": accept_length,
                     "naive_tokens": naive_tokens,
                     "naive_time": naive_time,
+                    "target_greedy_match": paired_speedup_fields[
+                        "target_greedy_match"
+                    ],
+                    "paired_speedup_valid": paired_speedup_fields[
+                        "paired_speedup_valid"
+                    ],
                 })
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -558,6 +864,20 @@ def main() -> None:
                     f"[{qid}] choice={choice} tokens={new_tokens} "
                     f"steps={tree_steps} accept={accept_length:.2f} "
                     f"eagle={eagle_tok_s:.1f} tok/s ({eagle_time:.2f}s)"
+                    + (
+                        " | target-greedy=match"
+                        if paired_speedup_fields["target_greedy_match"] is True
+                        else (
+                            " | target-greedy=mismatch"
+                            f" at token {paired_speedup_fields.get('paired_first_mismatch_index')}"
+                            f" (EAGLE={paired_speedup_fields.get('paired_eagle_mismatch_token')},"
+                            f" naive={paired_speedup_fields.get('paired_naive_mismatch_token')};"
+                            f" lengths={paired_speedup_fields.get('paired_eagle_output_tokens')}/"
+                            f"{paired_speedup_fields.get('paired_naive_output_tokens')})"
+                            if paired_speedup_fields["target_greedy_match"] is False
+                            else " | target-greedy=not checked"
+                        )
+                    )
                     + (f" | naive={naive_tok_s:.1f} tok/s ({naive_time:.2f}s)"
                        f" | speedup={speedup:.2f}x" if speedup is not None else "")
                 )
@@ -579,7 +899,8 @@ def main() -> None:
 
     naive_metrics = [
         r for r in raw_metrics
-        if r["naive_tokens"] is not None
+        if r["paired_speedup_valid"] is True
+        and r["naive_tokens"] is not None
         and r["naive_tokens"] > 0
         and r["naive_time"] is not None
         and r["naive_time"] > 0
@@ -587,13 +908,26 @@ def main() -> None:
     if naive_metrics and not args.skip_naive:
         total_naive_tokens = sum(r["naive_tokens"] for r in naive_metrics)
         total_naive_time = sum(r["naive_time"] for r in naive_metrics)
+        paired_eagle_tpot_values = [
+            r["eagle_time"] / r["eagle_tokens"]
+            for r in naive_metrics
+            if r["eagle_tokens"] > 0 and r["eagle_time"] > 0
+        ]
         naive_tpot_values = [
             r["naive_time"] / r["naive_tokens"] for r in naive_metrics
         ]
         naive_tpot = statistics.mean(naive_tpot_values)
         naive_throughput = 1.0 / naive_tpot if naive_tpot > 0 else 0.0
-        # Exact DFlash definition: mean baseline TPOT / mean speculative TPOT.
-        speedup = naive_tpot / eagle_tpot if eagle_tpot > 0 else 0.0
+        paired_eagle_tpot = (
+            statistics.mean(paired_eagle_tpot_values)
+            if paired_eagle_tpot_values
+            else 0.0
+        )
+        speedup = (
+            naive_tpot / paired_eagle_tpot
+            if paired_eagle_tpot > 0
+            else None
+        )
         speedups = [
             (r["naive_time"] / r["naive_tokens"])
             / (r["eagle_time"] / r["eagle_tokens"])
@@ -637,6 +971,12 @@ def main() -> None:
                         if naive_throughput is not None else None),
         "decoding_speedup": (round(speedup, 3) if speedup is not None else None),
         "mean_speedup": (round(statistics.mean(speedups), 3) if speedups else None),
+        "speedup": metrics.aggregate_speedup(records),
+        "speedup_scope": "paired_target_only" if not args.skip_naive else None,
+        "speedup_reference_method": (
+            "eagle_target_autoregressive" if not args.skip_naive else None
+        ),
+        **metrics.aggregate_paired_reference_fidelity(records),
         **quality,
     }
     with output.open("a", encoding="utf-8") as fout:

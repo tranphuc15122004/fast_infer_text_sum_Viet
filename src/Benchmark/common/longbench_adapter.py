@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+from importlib import metadata as importlib_metadata
 import json
 import os
 import subprocess
@@ -399,6 +400,19 @@ def preflight_baseline(
             "available": sglang_available,
             "reason": sglang_reason,
         }
+        try:
+            sglang_version = importlib_metadata.version("sglang")
+        except importlib_metadata.PackageNotFoundError:
+            sglang_version = None
+        except Exception as exc:
+            sglang_version = None
+            sglang_reason = sglang_reason or f"could not read SGLang version: {type(exc).__name__}"
+        paper_sglang_version_ok = not bool(cfg.get("paper_speedup")) or sglang_version == "0.5.20"
+        result["requirements"]["sglang_version"] = {
+            "required": "0.5.20" if cfg.get("paper_speedup") else None,
+            "installed": sglang_version,
+            "available": paper_sglang_version_ok,
+        }
         algorithm_ok = False
         algorithm_reason: str | None = None
         if sglang_available:
@@ -419,6 +433,11 @@ def preflight_baseline(
             result.update(status="missing_dependency", reason=f"vendored {source_name} source is missing")
         elif not sglang_available and result["status"] == "ready":
             result.update(status="missing_dependency", reason=f"sglang is required for {baseline}: {sglang_reason}")
+        elif not paper_sglang_version_ok and result["status"] == "ready":
+            result.update(
+                status="missing_dependency",
+                reason=f"--paper-speedup requires SGLang 0.5.20, found {sglang_version!r}",
+            )
         elif not algorithm_ok and result["status"] == "ready":
             result.update(
                 status="missing_dependency",
@@ -593,7 +612,7 @@ def build_adapter_command(
     converted checkpoint is still supplied separately from the HF tokenizer.
     """
 
-    if baseline not in SUPPORTED_BASELINES:
+    if baseline not in SUPPORTED_BASELINES and baseline != "target_only":
         raise ValueError(f"unknown baseline: {baseline}")
     cfg = dict(config or {})
     if data_file is None or output is None:
@@ -769,49 +788,51 @@ def build_adapter_command(
             "--output",
             str(output),
         ] + (["--smoke"] if smoke else [])
-        if bool(cfg.get("skip_reference")):
-            command.append("--skip-naive")
+        # EAGLE must retain its paired target-only greedy run: it both checks
+        # that speculative decoding preserves the target model's output and
+        # supplies a same-model speedup denominator.  The external Vanilla
+        # row is useful for cross-method comparison, but cannot replace that
+        # exact token-paired reference.
         if bool(cfg.get("eagle_check_target_parity")):
             command.append("--check-target-parity")
         return command
 
-    if baseline in {"domino", "dspark"}:
+    if baseline in {"target_only", "domino", "dspark"}:
         method = baseline
-        command = [
-            python,
-            str(ROOT / "src" / "Benchmark" / "infer_domino.py" if method == "domino" else ROOT / "src" / "Benchmark" / "infer_dspark.py"),
-            "--model",
-            str(cfg.get("model") or ""),
-            "--draft-model",
-            str(cfg.get(f"{method}_model") or ""),
-            "--data-file",
-            str(data_file),
-            "--max-samples",
-            str(max_samples),
-            "--max-new-tokens",
-            str(max_new_tokens),
-            "--max-input-tokens",
-            str(max_input),
-            "--temperature",
-            temperature,
-            "--seed",
-            seed,
-            "--batch-size",
-            str(cfg.get("batch_size", 1)),
-            "--tp-size",
-            str(cfg.get("tp_size", 1)),
-            "--attention-backend",
-            str(cfg.get("attention_backend", "flashinfer")),
-            "--mem-fraction-static",
-            str(cfg.get("mem_fraction_static", 0.9)),
-            "--port",
-            str(cfg.get("port", 30000)),
-            "--output",
-            str(output),
-        ]
+        if method == "target_only":
+            entry = ROOT / "src" / "Benchmark" / "infer_sglang_spec.py"
+        else:
+            entry = ROOT / "src" / "Benchmark" / ("infer_domino.py" if method == "domino" else "infer_dspark.py")
+        command = [python, str(entry)]
+        if method == "target_only":
+            command.extend(["--method", "target_only"])
+        command.extend(["--model", str(cfg.get("model") or "")])
+        if method != "target_only":
+            command.extend(["--draft-model", str(cfg.get(f"{method}_model") or "")])
+        command.extend([
+            "--data-file", str(data_file),
+            "--max-samples", str(max_samples),
+            "--max-new-tokens", str(max_new_tokens),
+            "--max-input-tokens", str(max_input),
+            "--temperature", temperature,
+            "--seed", seed,
+            "--batch-size", str(cfg.get("batch_size", 1)),
+            "--tp-size", str(cfg.get("tp_size", 1)),
+            "--attention-backend", str(cfg.get("attention_backend", "flashinfer")),
+            "--mem-fraction-static", str(cfg.get("mem_fraction_static", 0.9)),
+            "--port", str(cfg.get("port", 30000)),
+            "--output", str(output),
+        ])
         max_running = cfg.get("max_running_requests")
         if max_running not in (None, "", "auto"):
             command.extend(["--max-running-requests", str(max_running)])
+        target_reference = cfg.get("target_only_reference_file")
+        if target_reference and method in {"domino", "dspark"}:
+            command.extend(["--target-only-reference-file", str(target_reference)])
+        if cfg.get("paper_speedup"):
+            command.extend(["--paper-speedup", "--disable-radix-cache"])
+        elif cfg.get("disable_radix_cache"):
+            command.append("--disable-radix-cache")
         if smoke:
             command.append("--smoke")
         return command
@@ -941,6 +962,9 @@ def baseline_config_from_env(baseline: str, env: Mapping[str, str] | None = None
             else values.get("LONG_BENCH_SGLANG_ATTENTION_BACKEND", "flashinfer")
         ),
         "port": int(values.get("LONG_BENCH_SGLANG_PORT", "30000")),
+        "paper_speedup": False,
+        "disable_radix_cache": False,
+        "target_only_reference_file": None,
         "longspec_target_model": values.get("LONG_BENCH_LONGSPEC_TARGET_MODEL") or values.get("MODEL_TARGET"),
         "longspec_draft_model": values.get("LONG_BENCH_LONGSPEC_DRAFT_MODEL") or values.get("MODEL_LONGSPEC_DRAFT"),
         "longspec_model_name": values.get("LONG_BENCH_LONGSPEC_MODEL_NAME", "llama8b"),

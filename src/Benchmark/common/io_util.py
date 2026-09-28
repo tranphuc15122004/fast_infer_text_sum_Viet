@@ -37,6 +37,11 @@ BASE_SCHEMA_KEYS = [
 SPEC_SCHEMA_KEYS = [
     "avg_accept_length",
     "acceptance_rate",
+    "acceptance_rate_percent",
+    "accepted_draft_tokens_per_step",
+    "draft_tokens_accepted",
+    "draft_tokens_proposed",
+    "draft_proposal_unit",
     "draft_latency_ms",
     "verification_latency_ms",
     "rejected_draft_ratio",

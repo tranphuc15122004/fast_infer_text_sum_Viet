@@ -174,6 +174,11 @@ def _common_record(
         "extra_metrics": dict(config.get("extra_metrics", {}) or {}),
         "avg_accept_length": None,
         "acceptance_rate": None,
+        "acceptance_rate_percent": None,
+        "accepted_draft_tokens_per_step": None,
+        "draft_tokens_accepted": None,
+        "draft_tokens_proposed": None,
+        "draft_proposal_unit": None,
         "rejected_draft_ratio": None,
         "verification_steps": None,
     }
@@ -242,6 +247,11 @@ def build_sample_record(
     for key in (
         "avg_accept_length",
         "acceptance_rate",
+        "acceptance_rate_percent",
+        "accepted_draft_tokens_per_step",
+        "draft_tokens_accepted",
+        "draft_tokens_proposed",
+        "draft_proposal_unit",
         "rejected_draft_ratio",
         "verification_steps",
     ):
@@ -255,6 +265,7 @@ def build_sample_record(
     if decode_ms is not None and output_tokens > 0:
         record["tpot_ms"] = round(float(decode_ms) / output_tokens, 3)
     return record
+
 
 
 def append_jsonl(path: Path, record: Mapping[str, object]) -> None:
