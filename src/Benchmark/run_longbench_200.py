@@ -753,25 +753,79 @@ def _spawn_child(
     }
 
 
-def _kill_child_group(proc: subprocess.Popen[Any]) -> None:
-    """Kill a child and every descendant started in its process group."""
-    if os.name != "nt":
+def _child_group_exists(pgid: int) -> bool:
+    """Return whether a POSIX process group still has members."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill_child_group(
+    proc: subprocess.Popen[Any], *, term_grace_seconds: float = 30.0
+) -> None:
+    """Gracefully stop a child tree, then kill any members still in its group."""
+    if os.name == "nt":
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=term_grace_seconds)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        return
+
+    # Let Python adapters run their finally blocks.  In particular, the
+    # SGLang adapter uses this window to shut down its separately-grouped GPU
+    # server before the runner escalates to SIGKILL.
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        if proc.poll() is None:
+            proc.terminate()
+
+    deadline = time.monotonic() + max(0.0, float(term_grace_seconds))
+    while True:
+        if proc.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    proc.wait(timeout=min(0.1, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+        if not _child_group_exists(proc.pid):
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.1, remaining))
+
+    if _child_group_exists(proc.pid):
         try:
             os.killpg(proc.pid, signal.SIGKILL)
-            return
-        except (ProcessLookupError, PermissionError):
-            # The leader may have exited between wait() and cleanup.  Fall
-            # back to the direct child so this remains safe if group setup was
-            # unavailable for an unusual platform/runtime.
+        except ProcessLookupError:
             pass
-    proc.kill()
+        except PermissionError:
+            if proc.poll() is None:
+                proc.kill()
+    if proc.poll() is None:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 
 def _cleanup_spawned_children(handles: Sequence[Mapping[str, Any]]) -> None:
     """Stop and reap children when launching a group fails part-way through."""
     for handle in handles:
         proc = handle["proc"]
-        if proc.poll() is None:
+        if proc.poll() is None or (os.name != "nt" and _child_group_exists(proc.pid)):
             _kill_child_group(proc)
     for handle in handles:
         proc = handle["proc"]

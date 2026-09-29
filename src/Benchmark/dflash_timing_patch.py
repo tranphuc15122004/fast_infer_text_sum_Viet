@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 PATCH_VERSION = "fast_infer_dflash_strict_decode_v1"
-SOURCE_SHA256 = "cb65494843656803707d4270b13f396347e51216e4875ea4b1ffd8f2d9d26aef"
+SOURCE_SHA256 = "8128db87aa47eac4a14779bd65fcda29335059c979218282d7117a8dac947469"
 _MARKER = PATCH_VERSION
 
 

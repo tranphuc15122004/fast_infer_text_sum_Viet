@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+import sys
+
 import pytest
 import torch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 
 def test_normalize_capture_rows_preserves_order_and_converts_dtype() -> None:

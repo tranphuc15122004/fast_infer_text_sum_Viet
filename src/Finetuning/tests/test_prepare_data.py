@@ -49,11 +49,23 @@ def test_iter_input_output_jsonl_normalizes_to_summary_records(tmp_path: Path) -
     }
 
 
-def test_iter_input_output_jsonl_rejects_missing_or_empty_fields(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        ({"input": "văn bản"}, r"invalid\.jsonl:1.*missing fields.*output"),
+        (
+            {"input": "văn bản", "output": "   "},
+            r"invalid\.jsonl:1.*empty output",
+        ),
+    ],
+)
+def test_iter_input_output_jsonl_rejects_missing_or_empty_fields(
+    tmp_path: Path, row: dict[str, str], message: str
+) -> None:
     source = tmp_path / "invalid.jsonl"
-    _write_source(source, [{"input": "văn bản", "output": "   "}])
+    _write_source(source, [row])
 
-    with pytest.raises(ValueError, match=r"line 1.*output"):
+    with pytest.raises(ValueError, match=message):
         list(iter_input_output_jsonl(source))
 
 

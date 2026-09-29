@@ -18,6 +18,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 from urllib import error as urlerror
@@ -323,29 +324,67 @@ def _wait_ready(base_url: str, process: subprocess.Popen[Any], timeout: float) -
     raise TimeoutError(last_error)
 
 
-def _stop_process_group(process: subprocess.Popen[Any]) -> None:
-    """Stop the SGLang server and workers started in its process group."""
-
-    if process.poll() is not None:
-        return
-    if os.name != "nt":
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            process.terminate()
-    else:
-        process.terminate()
+def _server_process_group_exists(pgid: int) -> bool:
+    """Return whether a POSIX SGLang process group still has members."""
     try:
-        process.wait(timeout=20)
-    except subprocess.TimeoutExpired:
-        if os.name != "nt":
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_process_group(process: subprocess.Popen[Any]) -> None:
+    """Stop SGLang workers even if the server's group leader already exited."""
+    if os.name == "nt":
+        if process.poll() is None:
+            process.terminate()
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
                 process.kill()
-        else:
+                process.wait()
+        return
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        if process.poll() is None:
+            process.terminate()
+
+    deadline = time.monotonic() + 20.0
+    while True:
+        if process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    process.wait(timeout=min(0.1, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+        if not _server_process_group_exists(process.pid):
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.1, remaining))
+
+    if _server_process_group_exists(process.pid):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            if process.poll() is None:
+                process.kill()
+    if process.poll() is None:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
             process.kill()
-        process.wait()
+            process.wait()
 
 
 def _load_request_tokenizer(model: str, *, local_files_only: bool):
@@ -510,37 +549,67 @@ def _run_server_phase(
     )
     server_url = f"http://127.0.0.1:{args.port}"
     server_start = time.perf_counter()
-    process = subprocess.Popen(command, stdout=None, stderr=None, start_new_session=True)
-    try:
-        _wait_ready(server_url, process, args.server_timeout)
-        server_startup_ms = round((time.perf_counter() - server_start) * 1000.0, 3)
-        results: dict[str, dict[str, Any]] = {}
-        if getattr(args, "paper_speedup", False) and records:
-            warmup_args = argparse.Namespace(**vars(args))
-            warmup_args.max_new_tokens = min(int(args.max_new_tokens), 8)
-            _request_one(server_url, records[0], warmup_args, tokenizer, stop_token_ids)
-        with ThreadPoolExecutor(max_workers=args.batch_size) as executor:
-            futures = [
-                executor.submit(
-                    _request_one,
-                    server_url,
-                    sample,
-                    args,
-                    tokenizer,
-                    stop_token_ids,
-                )
-                for sample in records
-            ]
-            for future in as_completed(futures):
-                sample, result = future.result()
-                sample_id = str(sample["id"])
-                if sample_id in results:
-                    raise ValueError(f"duplicate sample id in benchmark input: {sample_id}")
-                result["metrics"]["server_startup_ms"] = server_startup_ms
-                results[sample_id] = result
-        return results
-    finally:
+    process: subprocess.Popen[Any] | None = None
+    termination_requested = False
+    termination_signum: int | None = None
+    on_main_thread = threading.current_thread() is threading.main_thread()
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    def _handle_sigterm(signum: int, frame: Any) -> None:
+        # The runner first sends SIGTERM to this adapter's process group.  The
+        # SGLang server has its own session, so stop it explicitly before the
+        # adapter exits (including while request futures are being awaited).
+        nonlocal termination_requested, termination_signum
+        if process is None:
+            # Popen may be interrupted after the OS has created the server but
+            # before it returns the Popen handle. Defer exit until that handle
+            # is available so the server's separate process group can be
+            # stopped by the normal cleanup path.
+            termination_requested = True
+            termination_signum = signum
+            return
         _stop_process_group(process)
+        raise SystemExit(128 + signum)
+
+    if on_main_thread:
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    try:
+        process = subprocess.Popen(command, stdout=None, stderr=None, start_new_session=True)
+        try:
+            if termination_requested:
+                raise SystemExit(128 + int(termination_signum or signal.SIGTERM))
+            _wait_ready(server_url, process, args.server_timeout)
+            server_startup_ms = round((time.perf_counter() - server_start) * 1000.0, 3)
+            results: dict[str, dict[str, Any]] = {}
+            if getattr(args, "paper_speedup", False) and records:
+                warmup_args = argparse.Namespace(**vars(args))
+                warmup_args.max_new_tokens = min(int(args.max_new_tokens), 8)
+                _request_one(server_url, records[0], warmup_args, tokenizer, stop_token_ids)
+            with ThreadPoolExecutor(max_workers=args.batch_size) as executor:
+                futures = [
+                    executor.submit(
+                        _request_one,
+                        server_url,
+                        sample,
+                        args,
+                        tokenizer,
+                        stop_token_ids,
+                    )
+                    for sample in records
+                ]
+                for future in as_completed(futures):
+                    sample, result = future.result()
+                    sample_id = str(sample["id"])
+                    if sample_id in results:
+                        raise ValueError(f"duplicate sample id in benchmark input: {sample_id}")
+                    result["metrics"]["server_startup_ms"] = server_startup_ms
+                    results[sample_id] = result
+            return results
+        finally:
+            _stop_process_group(process)
+    finally:
+        if on_main_thread:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 
 def _parser() -> argparse.ArgumentParser:
