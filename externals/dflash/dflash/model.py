@@ -221,7 +221,11 @@ def dflash_generate(
     time_to_first_token = _cuda_time() - prefill_start if return_stats else None
 
     decode_start = _cuda_time() if return_stats else None
+    # ``acceptance_lengths`` is accepted draft tokens plus the target token
+    # for each verification step. Track committed output separately because
+    # stop-token/max-length clipping can truncate the final verified block.
     acceptance_lengths = []
+    committed_tokens_per_step = []
     draft_latency = 0.0
     verification_latency = 0.0
     draft_tokens_proposed = 0
@@ -313,8 +317,10 @@ def dflash_generate(
                 stopped = True
         start += produced
         _crop_to(past_key_values_target, start)
-        acceptance_lengths.append(produced)
-        draft_tokens_accepted += min(acceptance_length, verify_size - 1)
+        accepted_this_step = min(acceptance_length, verify_size - 1)
+        acceptance_lengths.append(accepted_this_step + 1)
+        committed_tokens_per_step.append(produced)
+        draft_tokens_accepted += accepted_this_step
 
         if verify_size > 1:
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :produced, :]
@@ -333,6 +339,7 @@ def dflash_generate(
         time_to_first_token=time_to_first_token,
         time_per_output_token=total_decode_time / num_output_tokens,
         acceptance_lengths=acceptance_lengths,
+        committed_tokens_per_step=committed_tokens_per_step,
         draft_latency_ms=draft_latency * 1e3,
         verification_latency_ms=verification_latency * 1e3,
         draft_tokens_proposed=draft_tokens_proposed,

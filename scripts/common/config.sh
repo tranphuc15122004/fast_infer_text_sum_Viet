@@ -260,7 +260,7 @@ fast_infer__load_longbench() {
   fast_infer_default LONG_BENCH_SGLANG_ATTENTION_BACKEND "flashinfer"
   fast_infer_default LONG_BENCH_SGLANG_PORT "30000"
   fast_infer_default LONG_BENCH_LOCAL_FILES_ONLY "1"
-  fast_infer_default LONG_BENCH_TIMEOUT_SECONDS "900"
+  fast_infer_default LONG_BENCH_TIMEOUT_SECONDS "3600"
   fast_infer_default LONG_BENCH_STRICT "1"
   # Upstream EAGLE3 Llama-3.1 defaults; override explicitly for a hardware
   # ablation, but do not silently shrink the tree and call it the baseline.

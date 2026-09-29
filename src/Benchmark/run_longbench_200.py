@@ -349,7 +349,9 @@ def resolve_timeout_seconds(mode: str, cli_value: int | None = None) -> int:
             raise SystemExit("--timeout-seconds must be positive")
         return cli_value
     if mode == "smoke":
-        value = _env_int("LONG_BENCH_TIMEOUT_SECONDS", 900)
+        # Cold model load and CUDA graph capture on B200 can take longer
+        # than the former 15-minute limit even for one smoke sample.
+        value = _env_int("LONG_BENCH_TIMEOUT_SECONDS", 3600)
     elif mode == "representative":
         value = _env_int("LONG_BENCH_REPRESENTATIVE_TIMEOUT_SECONDS", 3600)
     else:
@@ -677,6 +679,35 @@ def _spawn_child(
         raise
 
     state: dict[str, str] = {"tail": ""}
+    log_lock = threading.Lock()
+    log_state = {"writes_enabled": True, "closed": False}
+
+    def _write_log(text: str) -> None:
+        with log_lock:
+            if not log_state["writes_enabled"]:
+                return
+            try:
+                log_handle.write(text)
+                log_handle.flush()
+            except (OSError, ValueError) as exc:
+                log_state["writes_enabled"] = False
+                state["log_write_error"] = f"{type(exc).__name__}: {exc}"
+
+    def _close_log() -> None:
+        with log_lock:
+            log_state["writes_enabled"] = False
+            if log_state["closed"]:
+                return
+            try:
+                log_handle.flush()
+            except (OSError, ValueError) as exc:
+                state["log_write_error"] = f"{type(exc).__name__}: {exc}"
+            try:
+                log_handle.close()
+            except (OSError, ValueError) as exc:
+                state["log_write_error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                log_state["closed"] = True
 
     def _stream_output() -> None:
         assert proc.stdout is not None
@@ -693,14 +724,12 @@ def _spawn_child(
                 if not text:
                     continue
                 state["tail"] = (state["tail"] + text)[-2000:]
-                log_handle.write(text)
-                log_handle.flush()
+                _write_log(text)
                 print(f"[{log_path.stem}] {text}", end="", flush=True)
             remainder = decoder.decode(b"", final=True)
             if remainder:
                 state["tail"] = (state["tail"] + remainder)[-2000:]
-                log_handle.write(remainder)
-                log_handle.flush()
+                _write_log(remainder)
                 print(f"[{log_path.stem}] {remainder}", end="", flush=True)
         finally:
             proc.stdout.close()
@@ -715,6 +744,7 @@ def _spawn_child(
         "proc": proc,
         "reader": reader,
         "log_handle": log_handle,
+        "close_log": _close_log,
         "log_path": log_path,
         "output": Path(output),
         "command": [str(part) for part in command],
@@ -755,9 +785,7 @@ def _cleanup_spawned_children(handles: Sequence[Mapping[str, Any]]) -> None:
         if reader.is_alive() and proc.stdout is not None:
             proc.stdout.close()
             reader.join(timeout=1)
-        log_handle = handle["log_handle"]
-        log_handle.flush()
-        log_handle.close()
+        handle["close_log"]()
 
 
 def _await_child(
@@ -766,7 +794,6 @@ def _await_child(
     """Wait (bounded) for a spawned child and return its result record."""
     proc = handle["proc"]
     log_path = handle["log_path"]
-    log_handle = handle["log_handle"]
     reader = handle["reader"]
     timed_out = False
     returncode: int | None = None
@@ -786,8 +813,7 @@ def _await_child(
         if reader.is_alive() and proc.stdout is not None:
             proc.stdout.close()
             reader.join(timeout=1)
-        log_handle.flush()
-        log_handle.close()
+        handle["close_log"]()
 
     elapsed_ms = round((time.perf_counter() - handle["start"]) * 1000.0, 3)
     output = handle["output"]
@@ -795,11 +821,42 @@ def _await_child(
         "status": "timeout" if timed_out else ("success" if returncode == 0 else "failed"),
         "returncode": returncode,
         "elapsed_ms": elapsed_ms,
+        "timeout_seconds": round(float(timeout_seconds), 3),
         "output_exists": output.is_file(),
         "log": str(log_path),
         "log_tail": handle["state"]["tail"],
+        "log_write_error": handle["state"].get("log_write_error"),
         "command": list(handle["command"]),
     }
+
+
+def _child_failure_reason(child: Mapping[str, Any], label: str) -> str:
+    """Make subprocess failures actionable in manifests and status rows."""
+    status = str(child.get("status") or "failed")
+    elapsed_ms = child.get("elapsed_ms")
+    try:
+        elapsed_seconds = float(elapsed_ms) / 1000.0
+    except (TypeError, ValueError, OverflowError):
+        elapsed_seconds = None
+    if status == "timeout":
+        limit = child.get("timeout_seconds")
+        detail = f"timed out after {elapsed_seconds:.1f}s" if elapsed_seconds is not None else "timed out"
+        if limit is not None:
+            detail += f" (limit {float(limit):.1f}s)"
+    elif child.get("returncode") not in (None, 0):
+        detail = f"exited with code {child.get('returncode')}"
+    elif child.get("returncode") is None:
+        detail = "did not return an exit code"
+    elif not child.get("output_exists"):
+        detail = "exited without writing its output file"
+    else:
+        detail = "did not produce a complete sample output"
+    log_path = child.get("log")
+    if log_path:
+        detail += f"; log: {log_path}"
+    if child.get("log_write_error"):
+        detail += f"; log write error: {child.get('log_write_error')}"
+    return f"{label} {detail}"
 
 
 def _run_child(
@@ -1936,6 +1993,7 @@ def _retry_unresolved_samples(
     retry_wait_seconds: float = 0.0,
     reference_path: Path | None = None,
     reference_baseline: str | None = None,
+    initial_failure_reason: str | None = None,
 ) -> dict[str, Any]:
     """Retry missing/failed samples one at a time and publish safe coverage.
 
@@ -2001,7 +2059,9 @@ def _retry_unresolved_samples(
             retried_ids.add(sample_id)
         raw_record = source_by_id.get(sample_id, record)
         last_reason = unresolved_reasons.get(
-            sample_id, "sample output is missing after the initial child run"
+            sample_id,
+            initial_failure_reason
+            or "sample output is missing after the initial child run",
         )
         recovered = False
         for attempt in range(1, max(0, int(sample_retries)) + 1):
@@ -2503,6 +2563,18 @@ def gpu_memory_guard_reason(
     )
 
 
+def _live_gpu_memory_guard_reason(
+    report: Mapping[str, Any], *, min_free_gb: float
+) -> str | None:
+    """Recheck physical VRAM immediately before each serial model child."""
+    live_gpus = _nvidia_smi_gpus()
+    if live_gpus is None:
+        return None
+    live_report = dict(report)
+    live_report["host_gpus"] = live_gpus
+    return gpu_memory_guard_reason(live_report, min_free_gb=min_free_gb)
+
+
 def print_gpu_summary(report: Mapping[str, Any], *, effective_cuda: bool) -> None:
     """Print a one-line GPU assignment banner for a normal run."""
     requested = report.get("requested_ids") or []
@@ -2717,7 +2789,9 @@ def _create_shared_sglang_reference(
     result.update(path=str(output_path), expected_samples=len(normalized), success_samples=0)
     if child.get("status") != "success" or not output_path.is_file():
         result["status"] = "failed"
-        result["reason"] = child.get("reason") or "SGLang target-only child did not complete"
+        result["reason"] = child.get("reason") or _child_failure_reason(
+            child, "SGLang target-only reference child"
+        )
         return result
     try:
         _normalize_child_output(
@@ -3799,22 +3873,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                 native_references = manifest.setdefault("native_references", {})
                 reference_status = native_references.get(dataset)
                 if reference_status is None:
-                    reference_status = _create_shared_sglang_reference(
-                        dataset=dataset,
-                        source_rows=source_rows,
-                        normalized=normalized,
-                        run_dir=run_dir,
-                        subset_path=subset_path,
-                        run_id=run_id,
-                        model=args.model or cfg.get("model"),
-                        temperature=temperature,
-                        warmup_runs=warmup_runs,
-                        max_input_tokens=max_input_tokens,
-                        seed=seed,
-                        max_new_tokens=max_new_tokens,
-                        timeout_seconds=timeout_seconds,
-                        vram=vram_cfg,
+                    reference_guard = (
+                        _live_gpu_memory_guard_reason(
+                            gpu_report, min_free_gb=min_free_gb
+                        )
+                        if cuda_available
+                        else None
                     )
+                    if reference_guard:
+                        reference_status = {
+                            "status": "vram_blocked",
+                            "reason": f"prelaunch GPU memory guard: {reference_guard}",
+                            "path": None,
+                            "expected_samples": len(normalized),
+                            "success_samples": 0,
+                        }
+                    else:
+                        reference_status = _create_shared_sglang_reference(
+                            dataset=dataset,
+                            source_rows=source_rows,
+                            normalized=normalized,
+                            run_dir=run_dir,
+                            subset_path=subset_path,
+                            run_id=run_id,
+                            model=args.model or cfg.get("model"),
+                            temperature=temperature,
+                            warmup_runs=warmup_runs,
+                            max_input_tokens=max_input_tokens,
+                            seed=seed,
+                            max_new_tokens=max_new_tokens,
+                            timeout_seconds=timeout_seconds,
+                            vram=vram_cfg,
+                        )
                     native_references[dataset] = reference_status
                     _write_json(run_dir / "run_manifest.json", manifest)
                 if reference_status.get("status") != "success":
@@ -3838,6 +3928,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                     continue
                 cfg["target_only_reference_file"] = reference_status["path"]
                 cell["native_reference"] = reference_status["path"]
+
+            live_gpu_guard = (
+                _live_gpu_memory_guard_reason(
+                    gpu_report, min_free_gb=min_free_gb
+                )
+                if cuda_available and not dp_enabled
+                else None
+            )
+            if live_gpu_guard:
+                reason = f"prelaunch GPU memory guard: {live_gpu_guard}"
+                _write_status_file(
+                    output_path, baseline=baseline, dataset=dataset,
+                    records=normalized, status="vram_blocked", reason=reason,
+                    model=cfg.get("model"), config=cfg, run_id=run_id,
+                )
+                cell.update(
+                    status="vram_blocked", reason=reason, returncode=None,
+                    elapsed_ms=0.0, output_exists=True, log="", log_tail="",
+                )
+                failures += 1
+                _append_cell(cell)
+                print(f"[{baseline}/{dataset}] blocked before launch: {reason}", flush=True)
+                continue
 
             try:
                 child = _execute_cell_once(
@@ -3941,6 +4054,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "child exited successfully but wrote no result records"
                 )
 
+            initial_failure_reason = child.get("reason")
+            if not initial_failure_reason and (
+                child.get("status") != "success"
+                or normalized_count < len(normalized)
+            ):
+                initial_failure_reason = _child_failure_reason(
+                    child, f"{baseline}/{dataset} child"
+                )
+            child["initial_failure_reason"] = initial_failure_reason
+
             # Reconcile every cell, even after a successful process exit:
             # adapters can omit individual rows or die after writing a prefix.
             # Retry attempts are isolated batch-1 children and can use the
@@ -3973,6 +4096,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         if external_reference_baseline
                         else None
                     ),
+                    initial_failure_reason=initial_failure_reason,
                 )
             except Exception as exc:
                 if not args.continue_on_error:
@@ -4020,9 +4144,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 child["returncode"] = 0
             else:
                 child["status"] = "failed"
+                unresolved_count = int(safe_result.get("unresolved_sample_count", 0))
                 child["reason"] = (
-                    f"{safe_result.get('unresolved_sample_count', 0)} sample(s) "
-                    "remain unresolved after safe retries"
+                    f"{unresolved_count} sample(s) remain unresolved after safe recovery"
+                    + (
+                        f"; initial failure: {initial_failure_reason}"
+                        if initial_failure_reason
+                        else ""
+                    )
                 )
             if external_reference_path is not None and output_path.is_file():
                 attached = _attach_external_reference_metrics(

@@ -760,7 +760,12 @@ def main() -> int:
         record["acceptance_rate_percent"] = timing.get("acceptance_rate_percent")
         local_prompt_tokens = timing.get("client_prompt_tokens")
         server_prompt_tokens = timing.get("input_tokens")
-        text_token_count = len(request_tokenizer(text, add_special_tokens=False).input_ids[0])
+        # A tokenizer called with one string returns one flat list of token IDs.
+        # Indexing [0] would select one integer token and len(int) raises, which
+        # used to abort target-only VLSP sidecars after generation completed.
+        text_token_count = len(
+            request_tokenizer(text, add_special_tokens=False).input_ids
+        )
         record.update(
             build_v2_record_fields(
                 prompt_token_ids=prompt_token_ids or [],

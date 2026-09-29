@@ -294,9 +294,8 @@ với sample có output lệch. Chỉ gọi speculative method **lossless** khi 
 minh điều kiện đúng tương ứng; timing ratio vẫn được báo khi output lệch nhưng
 được gọi là observed task latency, kèm quality.
 
-Paper gate khóa ngưỡng: ít nhất 95/100 successful mỗi cell, 90/100 ở six-way
-shared-set cho mọi metric, 90/100 native e2e/decode-rate cho mỗi speculative
-baseline/dataset, và anchor drift không quá 10%. Nếu
+Trước run, khóa ngưỡng coverage và drift trong manifest (ví dụ ít nhất 95/100
+successful mỗi cell và 90/100 ở shared-set, anchor drift không quá 10%). Nếu
 không đạt, vẫn xuất raw result và coverage nhưng không xếp hạng cell đó bằng
 claim chắc chắn. Không thay ngưỡng sau khi thấy số. Không dùng confidence
 interval theo sample để tuyên bố đã đo được độ ổn định giữa các phiên GPU.

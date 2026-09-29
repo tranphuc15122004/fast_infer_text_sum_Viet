@@ -424,6 +424,9 @@ def main() -> None:
             "baseline_text": baseline_text,
             "block_size": block_size,
             "acceptance_lengths": list(result.acceptance_lengths),
+            "committed_tokens_per_step": list(
+                getattr(result, "committed_tokens_per_step", result.acceptance_lengths)
+            ),
             "draft_latency_ms": round_optional(
                 getattr(result, "draft_latency_ms", None)
             ),
