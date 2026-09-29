@@ -174,7 +174,10 @@ def build_server_args(
 
 
 def extract_response_metrics(
-    payload: dict[str, Any], *, request_elapsed_ms: float
+    payload: dict[str, Any],
+    *,
+    request_elapsed_ms: float,
+    stream_timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Extract SGLang metadata and normalize acceptance counters."""
 
@@ -198,25 +201,42 @@ def extract_response_metrics(
     prefill_ms = duration_ms("prompt_latency")
     decode_ms = duration_ms("completion_latency")
     completion_tokens = meta.get("completion_tokens")
-    decode_throughput = meta.get("decode_throughput")
     strict_decode_ms = None
     strict_decode_tokens = None
     strict_decode_verified = False
     if completion_tokens is not None:
         try:
             strict_decode_tokens = max(int(completion_tokens) - 1, 0)
-            throughput = float(decode_throughput)
         except (TypeError, ValueError, OverflowError):
-            throughput = 0.0
-        if strict_decode_tokens > 0 and throughput > 0 and math.isfinite(throughput):
-            # In pinned SGLang 0.5.20, APIServerReqTimeStats computes
-            # decode_throughput=(completion_tokens-1)/(finished_time-first_token_time).
-            # Reconstructing the interval from that returned value uses the
-            # same server-side first-token and finish timestamps.
-            strict_decode_ms = strict_decode_tokens / throughput * 1000.0
-            strict_decode_verified = math.isfinite(strict_decode_ms) and strict_decode_ms > 0
-            if not strict_decode_verified:
-                strict_decode_ms = None
+            strict_decode_tokens = None
+        # decode_throughput is a derived rate, not timing evidence. The
+        # strict phase is reportable only when SGLang returns its direct
+        # completion_latency interval (first committed token -> final token).
+        stream_evidence_ok = stream_timing is None
+        if stream_timing is not None:
+            stream_duration = stream_timing.get("decode_ms")
+            try:
+                stream_duration = float(stream_duration)
+            except (TypeError, ValueError, OverflowError):
+                stream_duration = 0.0
+            stream_evidence_ok = (
+                int(stream_timing.get("output_chunks") or 0) >= 2
+                and stream_timing.get("decode_phase_verified") is True
+                and math.isfinite(stream_duration)
+                and stream_duration > 0.0
+                and meta.get("completion_latency_source")
+                == "sglang_api_server_monotonic_first_token_to_finished"
+            )
+        if (
+            strict_decode_tokens is not None
+            and strict_decode_tokens > 0
+            and decode_ms is not None
+            and math.isfinite(decode_ms)
+            and decode_ms > 0
+            and stream_evidence_ok
+        ):
+            strict_decode_ms = decode_ms
+            strict_decode_verified = True
     acceptance_histogram = meta.get(
         "spec_accept_histogram",
         meta.get("spec_correct_drafts_histogram"),
@@ -276,9 +296,27 @@ def extract_response_metrics(
         ),
         "strict_decode_phase_verified": strict_decode_verified,
         "measurement_scope": (
-            "full_e2e"
+            "e2e_plus_decode"
+            if strict_decode_verified and stream_timing is not None
+            else "full_e2e"
             if prefill_ms is not None and decode_ms is not None
             else "e2e_only"
+        ),
+        "stream_decode_client_ms": (
+            stream_timing.get("decode_ms") if stream_timing is not None else None
+        ),
+        "stream_output_chunks": (
+            stream_timing.get("output_chunks") if stream_timing is not None else None
+        ),
+        "strict_decode_phase_source": (
+            meta.get("completion_latency_source")
+            if strict_decode_verified
+            else None
+        ),
+        "timing_source": (
+            "sglang_0.5.20_api_server_monotonic_stream_phase_timer"
+            if strict_decode_verified
+            else "sglang_0.5.20_api_server_request_time_stats"
         ),
         # acceptance length/rate/counters use the shared normalization.
         **acceptance,
@@ -289,7 +327,116 @@ def extract_response_metrics(
     }
 
 
-def _http_json(url: str, body: dict[str, Any], timeout: float) -> dict[str, Any]:
+def _parse_sglang_sse_response(
+    response: Any, *, clock: Any = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Collect one SGLang SSE response and directly time its output events."""
+
+    now = clock or time.perf_counter
+    final_event: dict[str, Any] | None = None
+    first_output_at: float | None = None
+    last_output_at: float | None = None
+    output_chunks = 0
+    text_parts: list[str] = []
+    output_ids: list[int] = []
+    previous_ids: list[int] | None = None
+    ids_mode: str | None = None
+
+    for raw_line in response:
+        line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else str(raw_line)
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data:
+            continue
+        if data == "[DONE]":
+            break
+        event = json.loads(data)
+        if isinstance(event, list):
+            if len(event) != 1:
+                raise RuntimeError(
+                    f"unexpected streamed SGLang response list length: {len(event)}"
+                )
+            event = event[0]
+        if not isinstance(event, dict):
+            raise RuntimeError("SGLang stream event must be a JSON object")
+
+        event_time = float(now())
+        event_text = event.get("text")
+        event_ids = event.get("output_ids")
+        if not isinstance(event_ids, (list, tuple)):
+            event_ids = []
+        normalized_ids = [int(token) for token in event_ids]
+        has_output = bool(normalized_ids) or (
+            isinstance(event_text, str) and bool(event_text)
+        )
+        if has_output:
+            if first_output_at is None:
+                first_output_at = event_time
+            last_output_at = event_time
+            output_chunks += 1
+            if isinstance(event_text, str):
+                text_parts.append(event_text)
+            if normalized_ids:
+                if previous_ids is None:
+                    output_ids = list(normalized_ids)
+                elif ids_mode is None:
+                    if (
+                        len(normalized_ids) > len(previous_ids)
+                        and normalized_ids[: len(previous_ids)] == previous_ids
+                    ):
+                        ids_mode = "cumulative"
+                        output_ids = list(normalized_ids)
+                    else:
+                        ids_mode = "delta"
+                        output_ids.extend(normalized_ids)
+                elif ids_mode == "cumulative":
+                    if normalized_ids[: len(previous_ids)] != previous_ids:
+                        raise RuntimeError(
+                            "SGLang cumulative streamed output IDs changed prefix"
+                        )
+                    output_ids = list(normalized_ids)
+                else:
+                    output_ids.extend(normalized_ids)
+                previous_ids = list(normalized_ids)
+
+        meta = event.get("meta_info") or {}
+        if not isinstance(meta, dict):
+            raise RuntimeError("SGLang stream meta_info must be a JSON object")
+        finish_reason = meta.get("finish_reason", event.get("finish_reason"))
+        if finish_reason is not None:
+            final_event = event
+            break
+
+    if final_event is None:
+        raise RuntimeError("SGLang stream ended without a final finish_reason event")
+
+    payload = dict(final_event)
+    if text_parts:
+        # SGLang emits deltas when incremental streaming is enabled and only
+        # the final full text when it is disabled.
+        payload["text"] = "".join(text_parts)
+    if output_ids:
+        payload["output_ids"] = output_ids
+
+    decode_ms = None
+    if (
+        output_chunks >= 2
+        and first_output_at is not None
+        and last_output_at is not None
+        and last_output_at > first_output_at
+    ):
+        decode_ms = (last_output_at - first_output_at) * 1000.0
+    return payload, {
+        "decode_ms": round(decode_ms, 6) if decode_ms is not None else None,
+        "output_chunks": output_chunks,
+        "decode_phase_verified": decode_ms is not None,
+    }
+
+
+def _http_json_stream(
+    url: str, body: dict[str, Any], timeout: float
+) -> tuple[dict[str, Any], dict[str, Any]]:
     encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
     request = urlrequest.Request(
         url,
@@ -298,14 +445,7 @@ def _http_json(url: str, body: dict[str, Any], timeout: float) -> dict[str, Any]
         method="POST",
     )
     with urlrequest.urlopen(request, timeout=timeout) as response:
-        value = json.loads(response.read().decode("utf-8"))
-    if isinstance(value, list):
-        if len(value) != 1:
-            raise RuntimeError(f"unexpected SGLang response list length: {len(value)}")
-        value = value[0]
-    if not isinstance(value, dict):
-        raise RuntimeError("SGLang response must be a JSON object")
-    return value
+        return _parse_sglang_sse_response(response)
 
 
 def _wait_ready(base_url: str, process: subprocess.Popen[Any], timeout: float) -> None:
@@ -493,6 +633,9 @@ def _request_one(
         encoded = tokenizer(prepared_prompt, return_tensors="pt", add_special_tokens=False)
         local_ids = [int(value) for value in encoded.input_ids[0].tolist()]
     request_body = {
+        # Ensure first_token_time is captured at the first output event rather
+        # than when a non-streaming response is delivered at completion.
+        "stream": True,
         "sampling_params": build_sampling_params(
             temperature=args.temperature,
             max_new_tokens=args.max_new_tokens,
@@ -505,13 +648,17 @@ def _request_one(
         request_body["input_ids"] = local_ids
     else:
         request_body["text"] = prepared_prompt
-    payload = _http_json(
+    payload, stream_timing = _http_json_stream(
         base_url + "/generate",
         request_body,
         timeout=args.request_timeout,
     )
     elapsed_ms = (time.perf_counter() - start) * 1000.0
-    request_metrics = extract_response_metrics(payload, request_elapsed_ms=elapsed_ms)
+    request_metrics = extract_response_metrics(
+        payload,
+        request_elapsed_ms=elapsed_ms,
+        stream_timing=stream_timing,
+    )
     if local_ids is not None:
         request_metrics["prompt_token_sha256"] = token_ids_sha256(local_ids)
         request_metrics["client_prompt_tokens"] = len(local_ids)
@@ -573,8 +720,22 @@ def _run_server_phase(
 
     if on_main_thread:
         signal.signal(signal.SIGTERM, _handle_sigterm)
+    server_env = os.environ.copy()
+    source_root = str(Path(__file__).resolve().parents[1])
+    patch_bootstrap = str(Path(__file__).resolve().parent / "sglang_patch_site")
+    existing_pythonpath = server_env.get("PYTHONPATH", "")
+    server_env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (patch_bootstrap, source_root, existing_pythonpath) if value
+    )
+    server_env["FAST_INFER_SGLANG_TIMING_PATCH"] = "1"
     try:
-        process = subprocess.Popen(command, stdout=None, stderr=None, start_new_session=True)
+        process = subprocess.Popen(
+            command,
+            stdout=None,
+            stderr=None,
+            start_new_session=True,
+            env=server_env,
+        )
         try:
             if termination_requested:
                 raise SystemExit(128 + int(termination_signum or signal.SIGTERM))
@@ -814,6 +975,9 @@ def main() -> int:
                     "verification_steps": timing.get("verification_steps"),
                     "acceptance_histogram": timing.get("acceptance_histogram"),
                     "server_reported_e2e_ms": timing.get("server_reported_e2e_ms"),
+                    "stream_decode_client_ms": timing.get("stream_decode_client_ms"),
+                    "stream_output_chunks": timing.get("stream_output_chunks"),
+                    "strict_decode_phase_source": timing.get("strict_decode_phase_source"),
                 },
             },
             text=text,
@@ -849,7 +1013,10 @@ def main() -> int:
                 decode_token_count=timing.get("strict_decode_token_count"),
                 decode_phase_definition=timing.get("strict_decode_phase_definition"),
                 decode_phase_verified=timing.get("strict_decode_phase_verified") is True,
-                timing_source="sglang_0.5.20_api_server_request_time_stats",
+                timing_source=timing.get(
+                    "timing_source",
+                    "sglang_0.5.20_api_server_request_time_stats",
+                ),
                 target_revision=str(args.model),
                 tokenizer_revision=str(getattr(request_tokenizer, "name_or_path", args.model)),
                 gpu_count=args.tp_size,

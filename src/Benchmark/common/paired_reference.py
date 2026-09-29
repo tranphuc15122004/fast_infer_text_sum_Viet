@@ -171,6 +171,16 @@ def _paired_rows(
     return pairs, exclusions
 
 
+def _has_direct_decode_duration(row: Mapping[str, Any]) -> bool:
+    value = row.get("decode_ms")
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _metric_pairs(
     pairs: Sequence[tuple[str, Mapping[str, Any], Mapping[str, Any]]],
     *,
@@ -182,6 +192,13 @@ def _metric_pairs(
     exclusions: Counter = Counter()
     for sid, reference, method in pairs:
         if kind.startswith("decode"):
+            direct_evidence_present = (
+                _has_direct_decode_duration(reference)
+                and _has_direct_decode_duration(method)
+            )
+            if not direct_evidence_present:
+                exclusions["missing_decode_evidence"] += 1
+                continue
             definitions_match = (
                 reference.get("decode_phase_verified") is True
                 and method.get("decode_phase_verified") is True

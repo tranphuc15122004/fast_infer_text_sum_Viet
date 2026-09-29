@@ -28,11 +28,10 @@ BASELINE_MEASUREMENT_SCOPE = {
     "vanilla_fa": "full_e2e",
     "eagle3": "full_e2e",
     "dflash": "full_e2e",
-    # Stock SGLang's non-streaming /generate response exposes request-level
-    # timing but not prompt/decode phase timing.  Keep those cells eligible for
-    # honest e2e comparison while preventing phase-speedup claims.
-    "domino": "e2e_only",
-    "dspark": "e2e_only",
+    # SGLang-backed baselines expose request E2E plus a direct server-side
+    # decode interval when the benchmark's streaming timing patch is active.
+    "domino": "e2e_plus_decode",
+    "dspark": "e2e_plus_decode",
 }
 
 _TIMING_BY_SCOPE = {
@@ -48,6 +47,16 @@ _TIMING_BY_SCOPE = {
     "e2e_only": (
         "input_tokens",
         "output_tokens",
+        "e2e_ms",
+        "throughput_tok_s",
+    ),
+    # The endpoint does not return a trustworthy prefill/TTFT phase, but its
+    # patched streaming request stats expose a direct first-token-to-finish
+    # decode duration alongside end-to-end request time.
+    "e2e_plus_decode": (
+        "input_tokens",
+        "output_tokens",
+        "decode_ms",
         "e2e_ms",
         "throughput_tok_s",
     ),
@@ -310,10 +319,10 @@ def required_direct_metrics(
 ) -> tuple[str, ...]:
     """Return raw fields required by the Vietnamese baseline contract.
 
-    SGLang-backed Domino/DSpark do not expose model-load, process peak memory,
-    or (in the stock non-streaming endpoint) phase timing from the client
-    process.  Those server-level diagnostics remain optional for the current
-    adapter and are retained whenever the runtime provides them.
+    SGLang-backed Domino/DSpark expose request E2E and a direct decode phase
+    through the benchmark's version-pinned streaming timing patch.  They still
+    do not expose a comparable prefill/TTFT phase or model-load/process memory
+    fields, so those remain outside this adapter's required contract.
     """
 
     scope = measurement_scope or BASELINE_MEASUREMENT_SCOPE.get(baseline)
@@ -324,6 +333,8 @@ def required_direct_metrics(
         fields.extend(_MODEL_MEMORY_DIRECT_FIELDS)
     if scope == "full_e2e":
         fields.extend(_FULL_E2E_DIRECT_FIELDS)
+    elif scope == "e2e_plus_decode":
+        fields.extend(("decode_ms", "decode_phase_verified"))
     # EAGLE/DFlash expose per-iteration draft/verification timing directly.
     # SGLang server adapters retain these fields when upstream provides them,
     # but must not be marked incomplete merely because stock SGLang omits them.
@@ -421,6 +432,11 @@ def audit_record(
         if not known_scope:
             issues.append("missing_measurement_scope")
         issues.extend(f"missing_{field}" for field in missing)
+        if scope == "e2e_plus_decode":
+            if record.get("decode_phase_verified") is not True:
+                issues.append("unverified_decode_phase")
+            if record.get("decode_phase_definition") != "after_first_token_committed_to_final_token":
+                issues.append("missing_decode_phase_definition")
         if output_tokens is None or output_tokens <= 0:
             issues.append("missing_output_tokens")
         if budget_valid is False:
@@ -533,6 +549,23 @@ def summarize_audits(audits: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _has_verified_decode_phase(record: Mapping[str, Any]) -> bool:
+    if (
+        record.get("status", "success") != "success"
+        or record.get("decode_phase_verified") is not True
+        or record.get("decode_phase_definition") != "after_first_token_committed_to_final_token"
+    ):
+        return False
+    value = record.get("decode_ms")
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        duration = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(duration) and duration > 0.0
+
+
 def validate_cell_metric_contract(
     records: Sequence[Mapping[str, Any]],
     *,
@@ -603,7 +636,16 @@ def validate_cell_metric_contract(
                 issue_counts["missing_quality_metric"] += 1
                 hard_issues.append("missing_quality_metric")
 
-        if expected_scope is not None and scope != expected_scope:
+        legacy_sglang_e2e_only = (
+            baseline in {"domino", "dspark"}
+            and expected_scope == "e2e_plus_decode"
+            and scope == "e2e_only"
+        )
+        if (
+            expected_scope is not None
+            and scope != expected_scope
+            and not legacy_sglang_e2e_only
+        ):
             issue_counts["unexpected_measurement_scope"] += 1
             hard_issues.append("unexpected_measurement_scope")
         if hard_issues:
@@ -647,7 +689,10 @@ def validate_cell_metric_contract(
         "speedup_pair_ratio": round(valid_speedup_pairs / observed_count, 4)
         if observed_count
         else 0.0,
-        "decode_metrics_available": expected_scope != "e2e_only",
+        "decode_metrics_available": bool(sample_records) and all(
+            _has_verified_decode_phase(record)
+            for record in sample_records
+        ),
         "records": audits,
     }
 

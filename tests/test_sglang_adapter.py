@@ -20,6 +20,7 @@ def test_sglang_server_args_keep_official_speculative_contract() -> None:
         tp_size=2,
         mem_fraction_static=0.9,
     )
+    assert args[1:3] == ["-m", "sglang.launch_server"]
     assert "--speculative-algorithm" in args
     assert "--enable-metrics" in args
     assert "DFLASH" in args
@@ -331,14 +332,15 @@ def test_target_only_sidecar_load_requires_complete_matching_sample_identity(tmp
         load_target_only_reference(path, expected_sample_ids=["a"], expected_identity_by_id=expected)
 
 
-def test_sglang_strict_decode_reconstructs_verified_first_token_to_finish_interval() -> None:
+def test_sglang_strict_decode_uses_direct_completion_latency() -> None:
     from Benchmark.infer_sglang_spec import extract_response_metrics
 
     payload = {
         "meta_info": {
             "completion_tokens": 5,
+            "completion_latency": 0.05,
             # SGLang 0.5.20 computes this as (completion_tokens - 1) /
-            # (finished_time - first_token_time).
+            # (finished_time - first_token_time); it is not itself a timer.
             "decode_throughput": 80.0,
         }
     }
@@ -353,7 +355,131 @@ def test_sglang_strict_decode_reconstructs_verified_first_token_to_finish_interv
     )
 
 
-def test_sglang_strict_decode_is_unavailable_for_one_token_or_missing_rate() -> None:
+def test_sglang_rate_alone_does_not_verify_a_decode_phase() -> None:
+    from Benchmark.infer_sglang_spec import extract_response_metrics
+
+    metrics = extract_response_metrics(
+        {
+            "meta_info": {
+                "completion_tokens": 8,
+                "decode_throughput": 4_152_592.6895027626,
+                "prefill_finished_time": 1790699361.8854835,
+                "request_finished_ts": 1790699361.9060307,
+            }
+        },
+        request_elapsed_ms=33.909,
+    )
+
+    assert metrics["measurement_scope"] == "e2e_only"
+    assert metrics["strict_decode_token_count"] == 7
+    assert metrics["strict_decode_active_ms"] is None
+    assert metrics["strict_decode_phase_verified"] is False
+
+
+def test_sglang_streaming_parser_measures_first_output_to_final_output() -> None:
+    import io
+
+    import pytest
+
+    from Benchmark.infer_sglang_spec import _parse_sglang_sse_response
+
+    times = iter([10.0, 10.1, 10.25])
+    lines = io.BytesIO(
+        b'data: {"text":"a","output_ids":[11],"meta_info":{"completion_tokens":1,"finish_reason":null}}\n\n'
+        b'data: {"text":"b","output_ids":[12],"meta_info":{"completion_tokens":2,"finish_reason":null}}\n\n'
+        b'data: {"text":"c","output_ids":[13],"meta_info":{"completion_tokens":3,"finish_reason":{"type":"stop"}}}\n\n'
+        b'data: [DONE]\n\n'
+    )
+
+    payload, timing = _parse_sglang_sse_response(lines, clock=lambda: next(times))
+
+    assert payload["text"] == "abc"
+    assert payload["output_ids"] == [11, 12, 13]
+    assert payload["meta_info"]["completion_tokens"] == 3
+    assert timing["decode_ms"] == 250.0
+    assert timing["output_chunks"] == 3
+    assert timing["decode_phase_verified"] is True
+
+
+def test_sglang_streaming_parser_fails_closed_without_distinct_phase_events() -> None:
+    import io
+
+    from Benchmark.infer_sglang_spec import _parse_sglang_sse_response
+
+    lines = io.BytesIO(
+        b'data: {"text":"all","output_ids":[11,12],"meta_info":{"completion_tokens":2,"finish_reason":{"type":"stop"}}}\n\n'
+    )
+
+    _payload, timing = _parse_sglang_sse_response(lines, clock=lambda: 1.0)
+
+    assert timing["decode_ms"] is None
+    assert timing["decode_phase_verified"] is False
+
+
+def test_sglang_api_stats_patch_exposes_direct_monotonic_duration() -> None:
+    from Benchmark.sglang_timing_patch import patch_api_stats_class
+
+    class FakeApiStats:
+        first_token_time = 1.0
+        finished_time = 1.25
+
+        def convert_to_output_meta_info(
+            self, scheduler_time_stats=None, completion_tokens=0
+        ):
+            return {"decode_throughput": 12.0}
+
+    patch_api_stats_class(FakeApiStats)
+    meta = FakeApiStats().convert_to_output_meta_info(completion_tokens=4)
+
+    assert meta["completion_latency"] == 0.25
+    assert meta["completion_latency_source"] == (
+        "sglang_api_server_monotonic_first_token_to_finished"
+    )
+
+
+def test_sglang_stream_phase_requires_direct_server_timer_and_distinct_chunks() -> None:
+    from Benchmark.infer_sglang_spec import extract_response_metrics
+
+    payload = {
+        "meta_info": {
+            "completion_tokens": 4,
+            "completion_latency": 0.2,
+            "completion_latency_source": (
+                "sglang_api_server_monotonic_first_token_to_finished"
+            ),
+        }
+    }
+    metrics = extract_response_metrics(
+        payload,
+        request_elapsed_ms=400.0,
+        stream_timing={
+            "decode_ms": 240.0,
+            "output_chunks": 3,
+            "decode_phase_verified": True,
+        },
+    )
+
+    assert metrics["decode_ms"] == 200.0
+    assert metrics["strict_decode_active_ms"] == 200.0
+    assert metrics["strict_decode_phase_verified"] is True
+    assert metrics["measurement_scope"] == "e2e_plus_decode"
+    assert metrics["stream_decode_client_ms"] == 240.0
+
+    metrics = extract_response_metrics(
+        payload,
+        request_elapsed_ms=400.0,
+        stream_timing={
+            "decode_ms": None,
+            "output_chunks": 1,
+            "decode_phase_verified": False,
+        },
+    )
+    assert metrics["strict_decode_active_ms"] is None
+    assert metrics["strict_decode_phase_verified"] is False
+    assert metrics["measurement_scope"] == "e2e_only"
+
+
+def test_sglang_strict_decode_is_unavailable_for_one_token_or_missing_latency() -> None:
     from Benchmark.infer_sglang_spec import extract_response_metrics
 
     one_token = extract_response_metrics(
@@ -361,7 +487,8 @@ def test_sglang_strict_decode_is_unavailable_for_one_token_or_missing_rate() -> 
         request_elapsed_ms=10.0,
     )
     missing = extract_response_metrics(
-        {"meta_info": {"completion_tokens": 5}}, request_elapsed_ms=10.0
+        {"meta_info": {"completion_tokens": 5, "decode_throughput": 80.0}},
+        request_elapsed_ms=10.0
     )
 
     assert one_token["strict_decode_active_ms"] is None
@@ -387,11 +514,14 @@ def test_paper_sglang_request_sends_the_exact_hashed_prompt_token_ids(monkeypatc
     captured = {}
     monkeypatch.setattr(adapter, "_prepare_prompt", lambda prompt, _tok, _cap: f"formatted:{prompt}")
 
-    def fake_http(_url, body, timeout):
+    def fake_http_stream(_url, body, timeout):
         captured.update(body=body, timeout=timeout)
-        return {"text": "summary", "meta_info": {"prompt_tokens": 3, "completion_tokens": 2, "decode_throughput": 100.0}}
+        return (
+            {"text": "summary", "meta_info": {"prompt_tokens": 3, "completion_tokens": 2}},
+            {"decode_ms": 25.0, "output_chunks": 2, "decode_phase_verified": True},
+        )
 
-    monkeypatch.setattr(adapter, "_http_json", fake_http)
+    monkeypatch.setattr(adapter, "_http_json_stream", fake_http_stream)
     args = SimpleNamespace(
         paper_speedup=True, temperature=0.0, max_new_tokens=8, seed=42,
         max_input_tokens=0, request_timeout=5.0,
@@ -403,5 +533,6 @@ def test_paper_sglang_request_sends_the_exact_hashed_prompt_token_ids(monkeypatc
     assert sample["id"] == "x"
     assert captured["body"]["input_ids"] == [11, 12, 13]
     assert "text" not in captured["body"]
+    assert captured["body"]["stream"] is True
     assert result["metrics"]["prompt_token_count_match"] is True
     assert result["metrics"]["prompt_token_sha256"] == adapter.token_ids_sha256([11, 12, 13])

@@ -554,6 +554,37 @@ def test_dflash_acceptance_rate_uses_runtime_counters_when_available() -> None:
     assert summary["rejected_draft_ratio"] == 0.95
 
 
+def test_domino_e2e_plus_decode_scope_requires_verified_direct_phase() -> None:
+    from Benchmark.common.metric_audit import audit_record, required_direct_metrics
+
+    record = {
+        "method": "domino",
+        "status": "success",
+        "measurement_scope": "e2e_plus_decode",
+        "input_tokens": 10,
+        "output_tokens": 4,
+        "decode_ms": 5.0,
+        "e2e_ms": 20.0,
+        "throughput_tok_s": 200.0,
+        "decode_phase_verified": True,
+        "decode_phase_definition": "after_first_token_committed_to_final_token",
+    }
+
+    audit = audit_record(record)
+    required = required_direct_metrics(
+        "domino", measurement_scope="e2e_plus_decode"
+    )
+
+    assert audit["timing"]["status"] == "complete"
+    assert "unverified_decode_phase" not in audit["issues"]
+    assert "decode_ms" in required
+    assert "decode_phase_verified" in required
+
+    record["decode_phase_verified"] = False
+    audit = audit_record(record)
+    assert "unverified_decode_phase" in audit["issues"]
+
+
 def test_domino_e2e_only_contract_does_not_require_unavailable_phase_metrics(
     tmp_path,
 ) -> None:
@@ -616,3 +647,4 @@ def test_domino_e2e_only_contract_does_not_require_unavailable_phase_metrics(
     )
 
     assert summary["metric_contract"]["status"] == "complete"
+    assert summary["metric_contract"]["decode_metrics_available"] is False

@@ -28,6 +28,8 @@ def _row(sample_id, *, wall, decode, tokens, text, prompt="p", status="success")
         "request_wall_ms": wall,
         "native_elapsed_ms": wall,
         "native_timing_scope": "request_wall",
+        "measurement_scope": "full_e2e",
+        "decode_ms": decode,
         "decode_active_ms": decode,
         "decode_token_count": tokens,
         "decode_phase_definition": "after_first_token_to_final_token",
@@ -83,11 +85,33 @@ def test_failed_missing_phase_and_single_output_exclusions_are_metric_specific()
     assert result["common_decode_time_ratio"] is None
     assert result["common_decode_time_exclusions"] == {
         "nonpositive_time": 1,
-        "phase_unverified": 1,
+        "missing_decode_evidence": 1,
         "failed_status": 1,
     }
     assert result["common_decode_rate_ratio"] is None
     assert result["common_decode_rate_exclusions"]["zero_decode_tokens"] == 1
+
+
+def test_decode_metrics_reject_e2e_only_rate_reconstruction_even_if_flagged_verified():
+    from Benchmark.common.paired_reference import aggregate_pair
+
+    reference = [_row("a", wall=100, decode=60, tokens=30, text="same")]
+    method = {
+        **_row("a", wall=50, decode=0.0016, tokens=7, text="same"),
+        "method": "domino",
+        "measurement_scope": "e2e_only",
+        "decode_ms": None,
+        "decode_active_ms": 0.0016,
+        "decode_phase_verified": True,
+        "timing_source": "sglang_0.5.20_api_server_request_time_stats",
+    }
+
+    result = aggregate_pair(reference, [method], scope="common")
+
+    assert result["common_esr"] == pytest.approx(2.0)
+    assert result["common_decode_time_ratio"] is None
+    assert result["common_decode_rate_ratio"] is None
+    assert result["common_decode_time_exclusions"] == {"missing_decode_evidence": 1}
 
 
 def test_pairing_rejects_prompt_resource_and_duplicate_identity_mismatches():
