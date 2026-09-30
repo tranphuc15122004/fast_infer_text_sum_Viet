@@ -9,6 +9,29 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 
+def _smoke_metric_summary(*baselines: str) -> dict:
+    groups = {}
+    for baseline in baselines:
+        is_reference = baseline == "vanilla_hf"
+        reference_tpot = 4.0
+        method_tpot = 4.0 if is_reference else 3.0
+        dsr = 1.0 if is_reference else 1.3333
+        esr = 1.0 if is_reference else 1.125
+        groups[baseline] = {
+            "user_defined_speedup": {
+                "reference_baseline": "vanilla_hf",
+                "paired_samples": 1,
+                "common_prefill_ms": 100.0,
+                "reference_tpot_ms": reference_tpot,
+                "method_tpot_ms": method_tpot,
+                "mean_min_output_tokens": 20.0,
+                "dsr": dsr,
+                "esr": esr,
+            }
+        }
+    return {"metrics": {"vietnews": groups}}
+
+
 def test_parse_baselines_accepts_comma_separated_values_and_deduplicates() -> None:
     from modal_benchmark_debug import parse_baselines
 
@@ -23,6 +46,7 @@ def test_validate_smoke_result_requires_successful_audited_coverage() -> None:
 
     manifest = {
         "failure_count": 0,
+        "metrics_summary": _smoke_metric_summary("vanilla_hf", "dspark"),
         "cells": [
             {
                 "baseline": "dspark",
@@ -45,16 +69,65 @@ def test_validate_smoke_result_requires_successful_audited_coverage() -> None:
         ],
     }
 
-    assert validate_smoke_result(0, manifest, ["dspark"]) == {
-        "status": "passed",
-        "baselines": {"dspark": {"status": "passed", "issues": []}},
-        "issues": [],
-    }
+    result = validate_smoke_result(0, manifest, ["dspark"])
+    assert result["status"] == "passed"
+    assert result["baselines"]["dspark"]["user_defined_speedup"]["dsr"] == 1.3333
+    assert result["baselines"]["dspark"]["user_defined_speedup"]["esr"] == 1.125
 
+    manifest.pop("metrics_summary")
+    missing_metrics = validate_smoke_result(0, manifest, ["dspark"])
+    assert missing_metrics["status"] == "failed"
+    assert "DSR/ESR" in " ".join(missing_metrics["baselines"]["dspark"]["issues"])
+
+    manifest["metrics_summary"] = _smoke_metric_summary("vanilla_hf", "dspark")
     manifest["cells"][0]["metric_contract"]["observed_samples"] = 0
     result = validate_smoke_result(0, manifest, ["dspark"])
     assert result["status"] == "failed"
     assert "coverage mismatch" in " ".join(result["baselines"]["dspark"]["issues"])
+
+def test_validate_smoke_result_rejects_incorrect_paired_speedup() -> None:
+    from modal_benchmark_debug import validate_smoke_result
+
+    summary = _smoke_metric_summary("vanilla_hf", "dspark")
+    summary["metrics"]["vietnews"]["dspark"]["user_defined_speedup"]["dsr"] = 2.0
+    cell = {
+        "dataset": "vietnews",
+        "status": "success",
+        "sample_count": 1,
+        "preflight": {"status": "ready"},
+        "metric_audit_summary": {
+            "num_records": 1,
+            "status_counts": {"success": 1},
+            "issue_counts": {},
+        },
+        "metric_contract": {
+            "status": "complete",
+            "observed_samples": 1,
+            "expected_samples": 1,
+            "issue_counts": {},
+        },
+    }
+    manifest = {
+        "failure_count": 0,
+        "metrics_summary": summary,
+        "cells": [
+            {**cell, "baseline": "vanilla_hf"},
+            {**cell, "baseline": "dspark"},
+        ],
+    }
+
+    result = validate_smoke_result(0, manifest, ["vanilla_hf", "dspark"])
+    assert result["status"] == "failed"
+    assert "does not match TPOT ratio" in " ".join(
+        result["baselines"]["dspark"]["issues"]
+    )
+
+    summary["metrics"]["vietnews"]["dspark"]["user_defined_speedup"]["reference_baseline"] = "domino"
+    result = validate_smoke_result(0, manifest, ["vanilla_hf", "dspark"])
+    assert result["status"] == "failed"
+    assert "expected vanilla_hf" in " ".join(
+        result["baselines"]["dspark"]["issues"]
+    )
 
 
 def test_validate_smoke_result_rejects_missing_dependency_even_on_zero_exit() -> None:
@@ -341,3 +414,114 @@ def test_child_env_propagates_requested_smoke_generation_budget(tmp_path: Path) 
     assert env["LONG_BENCH_MODE"] == "representative"
     assert env["LONG_BENCH_MAX_NEW_TOKENS"] == "128"
     assert env["LONG_BENCH_SMOKE_MAX_NEW_TOKENS"] == "128"
+
+
+def test_modal_debug_baselines_add_vanilla_hf_as_the_paired_reference() -> None:
+    from modal_benchmark_debug import with_vanilla_hf_reference
+
+    assert with_vanilla_hf_reference(["eagle3", "domino", "dspark"]) == [
+        "vanilla_hf", "eagle3", "domino", "dspark"
+    ]
+    assert with_vanilla_hf_reference(["vanilla_hf", "domino"]) == [
+        "vanilla_hf", "domino"
+    ]
+
+
+def test_modal_debug_env_pins_single_process_and_eagle_block_16(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from modal_benchmark_debug import _child_env
+
+    for key, value in {
+        "LONG_BENCH_DATA_PARALLEL": "1",
+        "LONG_BENCH_DP_PROCESSES_PER_GPU": "2",
+        "LONG_BENCH_EAGLE_TOTAL_TOKEN": "60",
+        "LONG_BENCH_EAGLE_DEPTH": "5",
+        "LONG_BENCH_EAGLE_TOP_K": "10",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    env = _child_env(
+        baselines="vanilla_hf,eagle3,domino,dspark",
+        model_paths={"target": str(tmp_path / "target")},
+        hf_home=tmp_path / "hf",
+        run_root=tmp_path / "run",
+        output_dir=tmp_path / "out",
+        max_new_tokens=512,
+        benchmark_mode="representative",
+    )
+
+    assert env["LONG_BENCH_REFERENCE_BASELINE"] == "vanilla_hf"
+    assert env["LONG_BENCH_DATA_PARALLEL"] == "0"
+    assert env["LONG_BENCH_DP_PROCESSES_PER_GPU"] == "1"
+    assert env["LONG_BENCH_BATCH_SIZE"] == "1"
+    assert env["LONG_BENCH_MAX_RUNNING_REQUESTS"] == "1"
+    assert env["LONG_BENCH_EAGLE_TOTAL_TOKEN"] == "17"
+    assert env["LONG_BENCH_EAGLE_DEPTH"] == "16"
+    assert env["LONG_BENCH_EAGLE_TOP_K"] == "1"
+
+
+def test_validate_smoke_result_rejects_degenerate_repetition() -> None:
+    from modal_benchmark_debug import validate_smoke_result
+
+    manifest = {
+        "failure_count": 0,
+        "cells": [
+            {
+                "baseline": "dspark",
+                "dataset": "vietnews",
+                "status": "success",
+                "sample_count": 1,
+                "preflight": {"status": "ready"},
+                "metric_contract": {
+                    "status": "complete",
+                    "observed_samples": 1,
+                    "expected_samples": 1,
+                    "issue_counts": {"degenerate_repetition": 1},
+                },
+                "metric_audit_summary": {
+                    "num_records": 1,
+                    "status_counts": {"success": 1},
+                    "issue_counts": {"degenerate_repetition": 1},
+                },
+            }
+        ],
+    }
+
+    result = validate_smoke_result(0, manifest, ["dspark"])
+
+    assert result["status"] == "failed"
+    assert "degenerate_repetition" in " ".join(result["issues"])
+
+
+def test_validate_smoke_result_rejects_missing_rouge_l() -> None:
+    from modal_benchmark_debug import validate_smoke_result
+
+    manifest = {
+        "failure_count": 0,
+        "cells": [
+            {
+                "baseline": "domino",
+                "dataset": "vietnews",
+                "status": "success",
+                "sample_count": 1,
+                "preflight": {"status": "ready"},
+                "metric_contract": {
+                    "status": "complete",
+                    "observed_samples": 1,
+                    "expected_samples": 1,
+                    "missing_quality_field_counts": {"rougeL_f": 1},
+                },
+                "metric_audit_summary": {
+                    "num_records": 1,
+                    "status_counts": {"success": 1},
+                    "issue_counts": {},
+                },
+            }
+        ],
+    }
+
+    result = validate_smoke_result(0, manifest, ["domino"])
+
+    assert result["status"] == "failed"
+    assert "ROUGE-L" in " ".join(result["issues"])

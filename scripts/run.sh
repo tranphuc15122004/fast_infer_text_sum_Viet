@@ -15,6 +15,7 @@ shift || true
 
 case "$BASELINE" in
   longbench_200) WRAPPER="scripts/run_longbench_200.sh" ;;
+  vllm_all)     WRAPPER="scripts/run_vllm_all.sh" ;;
   vanilla_hf)   WRAPPER="scripts/run_vanilla_hf.sh" ;;
   vanilla_fa)   WRAPPER="scripts/run_vanilla_fa.sh" ;;
   eagle3)      WRAPPER="scripts/run_eagle3.sh" ;;
@@ -23,9 +24,9 @@ case "$BASELINE" in
   dspark)      WRAPPER="scripts/run_dspark.sh" ;;
   *)
     echo "Unknown baseline: $BASELINE" >&2
-    echo "Available: longbench_200 vanilla_hf vanilla_fa eagle3 dflash domino dspark" >&2
+    echo "Available: longbench_200 vllm_all vanilla_hf vanilla_fa eagle3 dflash domino dspark" >&2
     exit 1
     ;;
 esac
 
-exec "$ROOT/$WRAPPER" "$@"
+exec bash "$ROOT/$WRAPPER" "$@"

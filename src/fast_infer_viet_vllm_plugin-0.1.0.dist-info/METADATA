@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: fast-infer-viet-vllm-plugin
+Version: 0.1.0
+Summary: Domino compatibility adapter for the Vietnamese vLLM pilot

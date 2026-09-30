@@ -224,9 +224,9 @@ fast_infer__load_longbench() {
   fast_infer_default_from LONG_BENCH_FAFO_KV_METHOD FAFO_KV_METHOD
   fast_infer_default_from LONG_BENCH_LONGSPEC_MODEL_NAME LONGSPEC_MODEL_NAME
   fast_infer_default_from LONG_BENCH_SPECEXTEND_MODEL_NAME SPECEXTEND_MODEL_NAME
-  fast_infer_default_from LONG_BENCH_EAGLE_TOTAL_TOKEN EAGLE_TOTAL_TOKENS
-  fast_infer_default_from LONG_BENCH_EAGLE_DEPTH EAGLE_DEPTH
-  fast_infer_default_from LONG_BENCH_EAGLE_TOP_K EAGLE_TOP_K
+  # Do not inherit the standalone EAGLE tree defaults (60/5/10) here.
+  # LongBench uses its explicit AR16 profile below; callers can still override
+  # it directly through LONG_BENCH_EAGLE_* variables.
 
   fast_infer_default LONG_BENCH_DATA_DIR "datasets/eval_100"
   fast_infer_default LONG_BENCH_OUTPUT_DIR "outputs/longbench_viet_100"
@@ -262,14 +262,28 @@ fast_infer__load_longbench() {
   fast_infer_default LONG_BENCH_LOCAL_FILES_ONLY "1"
   fast_infer_default LONG_BENCH_TIMEOUT_SECONDS "3600"
   fast_infer_default LONG_BENCH_STRICT "1"
-  # Upstream EAGLE3 Llama-3.1 defaults; override explicitly for a hardware
-  # ablation, but do not silently shrink the tree and call it the baseline.
-  fast_infer_default LONG_BENCH_EAGLE_TOTAL_TOKEN "60"
-  fast_infer_default LONG_BENCH_EAGLE_DEPTH "5"
-  fast_infer_default LONG_BENCH_EAGLE_TOP_K "10"
+  # User-requested EAGLE3 AR profile: one draft path with 16 proposals.
+  # The upstream EaModel parameter includes one root token, so use total_token=17.
+  fast_infer_default LONG_BENCH_EAGLE_TOTAL_TOKEN "17"
+  fast_infer_default LONG_BENCH_EAGLE_DEPTH "16"
+  fast_infer_default LONG_BENCH_EAGLE_TOP_K "1"
   fast_infer_default LONG_BENCH_LONGSPEC_MODEL_NAME "llama8b"
   fast_infer_default LONG_BENCH_SPECEXTEND_MODEL_NAME "llama3_1_8b"
   fast_infer_default LONG_BENCH_MAGICDEC_MODEL_NAME "${MODEL_TARGET:-}"
+}
+
+fast_infer__load_vllm_all() {
+  fast_infer_default_from VLLM_TARGET_MODEL MODEL_TARGET LONG_BENCH_MODEL
+  fast_infer_default_from VLLM_EAGLE3_MODEL MODEL_EAGLE_DRAFT EAGLE_MODEL
+  fast_infer_default_from VLLM_DFLASH_MODEL MODEL_DFLASH_DRAFT
+  fast_infer_default_from VLLM_DOMINO_MODEL MODEL_DOMINO_DRAFT
+  fast_infer_default_from VLLM_DSPARK_MODEL MODEL_DSPARK_DRAFT
+  fast_infer_default_from VLLM_DATA_FILE LONG_BENCH_DATA_FILE DATA_INPUT
+  fast_infer_default_from VLLM_MAX_NEW_TOKENS RUN_MAX_NEW_TOKENS LONG_BENCH_MAX_NEW_TOKENS
+  fast_infer_default_from VLLM_MAX_INPUT_TOKENS RUN_MAX_INPUT_TOKENS LONG_BENCH_MAX_INPUT_TOKENS
+  fast_infer_default_from VLLM_MAX_MODEL_LEN LONG_BENCH_MAX_MODEL_LEN
+  fast_infer_default_from VLLM_DTYPE LONG_BENCH_DTYPE
+  fast_infer_default_from VLLM_SEED LONG_BENCH_SEED RUN_SEED
 }
 
 fast_infer__load_dflash() {
@@ -336,9 +350,9 @@ fast_infer__load_eagle3() {
   fast_infer_default_from MAX_NEW_TOKENS EAGLE_MAX_NEW_TOKENS RUN_MAX_NEW_TOKENS
   fast_infer_default_from NUM_CHOICES EAGLE_NUM_CHOICES
   fast_infer_default_from TEMPERATURE EAGLE_TEMPERATURE RUN_TEMPERATURE
-  fast_infer_default_from TOTAL_TOKEN EAGLE_TOTAL_TOKENS
-  fast_infer_default_from DEPTH EAGLE_DEPTH
-  fast_infer_default_from TOP_K EAGLE_TOP_K
+  fast_infer_default_from TOTAL_TOKEN LONG_BENCH_EAGLE_TOTAL_TOKEN EAGLE_TOTAL_TOKENS
+  fast_infer_default_from DEPTH LONG_BENCH_EAGLE_DEPTH EAGLE_DEPTH
+  fast_infer_default_from TOP_K LONG_BENCH_EAGLE_TOP_K EAGLE_TOP_K
   fast_infer_default_from SKIP_NAIVE EAGLE_SKIP_NAIVE RUN_SKIP_NAIVE
   fast_infer_default_from OUTPUT_FILE EAGLE_OUTPUT_FILE
 }
@@ -536,6 +550,7 @@ fast_infer_load_config() {
 
   case "$baseline" in
     longbench) fast_infer__load_longbench ;;
+    vllm_all) fast_infer__load_vllm_all ;;
     dflash) fast_infer__load_dflash ;;
     domino|dspark) fast_infer__load_sglang_spec ;;
     fafo) fast_infer__load_fafo ;;

@@ -387,7 +387,7 @@ def test_sglang_streaming_parser_measures_first_output_to_final_output() -> None
     lines = io.BytesIO(
         b'data: {"text":"a","output_ids":[11],"meta_info":{"completion_tokens":1,"finish_reason":null}}\n\n'
         b'data: {"text":"b","output_ids":[12],"meta_info":{"completion_tokens":2,"finish_reason":null}}\n\n'
-        b'data: {"text":"c","output_ids":[13],"meta_info":{"completion_tokens":3,"finish_reason":{"type":"stop"}}}\n\n'
+        b'data: {"text":"abc","output_ids":[13],"meta_info":{"completion_tokens":3,"finish_reason":{"type":"stop"}}}\n\n'
         b'data: [DONE]\n\n'
     )
 
@@ -399,6 +399,44 @@ def test_sglang_streaming_parser_measures_first_output_to_final_output() -> None
     assert timing["decode_ms"] == 250.0
     assert timing["output_chunks"] == 3
     assert timing["decode_phase_verified"] is True
+
+
+def test_sglang_streaming_parser_uses_full_text_from_final_event() -> None:
+    import io
+
+    from Benchmark.infer_sglang_spec import _parse_sglang_sse_response
+
+    # SGLang 0.5.20 streams text deltas, then its finish event carries the
+    # complete accumulated text (while output_ids can still be incremental).
+    lines = io.BytesIO(
+        b'data: {"text":"a","output_ids":[11],"meta_info":{"completion_tokens":1,"finish_reason":null}}\n\n'
+        b'data: {"text":"b","output_ids":[12],"meta_info":{"completion_tokens":2,"finish_reason":null}}\n\n'
+        b'data: {"text":"abc","output_ids":[13],"meta_info":{"completion_tokens":3,"finish_reason":{"type":"stop"}}}\n\n'
+    )
+
+    payload, _timing = _parse_sglang_sse_response(lines, clock=lambda: 1.0)
+
+    assert payload["text"] == "abc"
+    assert payload["output_ids"] == [11, 12, 13]
+
+
+def test_sglang_streaming_parser_does_not_concatenate_cumulative_snapshots() -> None:
+    import io
+
+    from Benchmark.infer_sglang_spec import _parse_sglang_sse_response
+
+    # With incremental streaming disabled, SGLang 0.5.20 can emit each
+    # accumulated text prefix, followed by the complete text at finish.
+    lines = io.BytesIO(
+        b'data: {"text":"a","output_ids":[11],"meta_info":{"completion_tokens":1,"finish_reason":null}}\n\n'
+        b'data: {"text":"ab","output_ids":[11,12],"meta_info":{"completion_tokens":2,"finish_reason":null}}\n\n'
+        b'data: {"text":"abc","output_ids":[11,12,13],"meta_info":{"completion_tokens":3,"finish_reason":{"type":"stop"}}}\n\n'
+    )
+
+    payload, _timing = _parse_sglang_sse_response(lines, clock=lambda: 1.0)
+
+    assert payload["text"] == "abc"
+    assert payload["output_ids"] == [11, 12, 13]
 
 
 def test_sglang_streaming_parser_fails_closed_without_distinct_phase_events() -> None:
@@ -536,3 +574,37 @@ def test_paper_sglang_request_sends_the_exact_hashed_prompt_token_ids(monkeypatc
     assert captured["body"]["stream"] is True
     assert result["metrics"]["prompt_token_count_match"] is True
     assert result["metrics"]["prompt_token_sha256"] == adapter.token_ids_sha256([11, 12, 13])
+
+
+def test_response_text_integrity_detects_cumulative_stream_duplication() -> None:
+    from Benchmark.infer_sglang_spec import response_text_token_integrity
+
+    class Tokenizer:
+        def decode(self, token_ids, **kwargs):
+            assert token_ids == [11, 12]
+            return "Tôi học."
+
+    result = response_text_token_integrity(
+        {"text": "Tôi học. Tôi học. Tôi học.", "output_ids": [11, 12]},
+        Tokenizer(),
+    )
+
+    assert result["text_decode_matches_token_ids"] is False
+    assert result["output_token_id_count"] == 2
+
+
+def test_response_text_integrity_accepts_normalized_server_decoding() -> None:
+    from Benchmark.infer_sglang_spec import response_text_token_integrity
+
+    class Tokenizer:
+        def decode(self, token_ids, **kwargs):
+            assert token_ids == [11, 12]
+            return " Tôi   học.\n"
+
+    result = response_text_token_integrity(
+        {"text": "Tôi học.", "output_ids": [11, 12]},
+        Tokenizer(),
+    )
+
+    assert result["text_decode_matches_token_ids"] is True
+    assert result["output_token_id_count"] == 2

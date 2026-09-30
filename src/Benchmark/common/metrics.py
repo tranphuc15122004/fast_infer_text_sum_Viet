@@ -518,3 +518,99 @@ def aggregate_speedup(records: Sequence[Mapping]) -> dict:
             mean(eagle_dense_times) / mean(eagle_speculative_times), 4
         )
     return out
+
+def aggregate_user_defined_speedup(
+    reference_records: Sequence[Mapping],
+    method_records: Sequence[Mapping],
+    *,
+    reference_baseline: str = "vanilla_hf",
+) -> dict[str, float | int | str]:
+    """Compute user-defined DSR/ESR from paired Vanilla HF and method rows.
+
+    DSR is reference TPOT / method TPOT. ESR uses mean reference prefill as a
+    shared cost and the minimum output length for each matched sample. The
+    metric is separate from :func:`aggregate_speedup`, whose legacy DSR/ESR
+    are raw decode-time and end-to-end time ratios.
+    """
+    def sample_key(record: Mapping) -> tuple[str, str] | None:
+        sample_id = record.get("sample_id", record.get("id"))
+        if sample_id is None:
+            return None
+        dataset = record.get("dataset", record.get("dataset_name", ""))
+        return str(dataset), str(sample_id)
+
+    reference_by_key: dict[tuple[str, str], Mapping] = {}
+    duplicate_reference_keys: set[tuple[str, str]] = set()
+    for record in reference_records:
+        key = sample_key(record)
+        if key is None or record.get("status", "success") != "success":
+            continue
+        if key in reference_by_key:
+            duplicate_reference_keys.add(key)
+        else:
+            reference_by_key[key] = record
+    for key in duplicate_reference_keys:
+        reference_by_key.pop(key, None)
+
+    method_by_key: dict[tuple[str, str], Mapping] = {}
+    duplicate_method_keys: set[tuple[str, str]] = set()
+    for method_record in method_records:
+        key = sample_key(method_record)
+        if key is None or method_record.get("status", "success") != "success":
+            continue
+        if key in method_by_key:
+            duplicate_method_keys.add(key)
+            continue
+        method_by_key[key] = method_record
+    for key in duplicate_method_keys:
+        method_by_key.pop(key, None)
+
+    pairs: list[tuple[float, float, float, float]] = []
+    for key, method_record in method_by_key.items():
+        reference_record = reference_by_key.get(key)
+        if reference_record is None:
+            continue
+        reference_tpot = _first_positive(reference_record, ("tpot_ms",))
+        method_tpot = _first_positive(method_record, ("tpot_ms",))
+        common_prefill = _first_positive(reference_record, ("prefill_ms",))
+        reference_tokens = _first_positive(reference_record, ("output_tokens",))
+        method_tokens = _first_positive(method_record, ("output_tokens",))
+        if any(
+            value is None
+            for value in (
+                reference_tpot, method_tpot, common_prefill,
+                reference_tokens, method_tokens,
+            )
+        ):
+            continue
+        pairs.append(
+            (
+                float(reference_tpot),
+                float(method_tpot),
+                float(common_prefill),
+                min(float(reference_tokens), float(method_tokens)),
+            )
+        )
+    if not pairs:
+        return {}
+
+    reference_tpot = mean([pair[0] for pair in pairs])
+    method_tpot = mean([pair[1] for pair in pairs])
+    common_prefill = mean([pair[2] for pair in pairs])
+    mean_min_tokens = mean([pair[3] for pair in pairs])
+    denominator = common_prefill + method_tpot * mean_min_tokens
+    if reference_tpot <= 0 or method_tpot <= 0 or denominator <= 0:
+        return {}
+    return {
+        "reference_baseline": reference_baseline,
+        "paired_samples": len(pairs),
+        "common_prefill_ms": round(common_prefill, 4),
+        "reference_tpot_ms": round(reference_tpot, 4),
+        "method_tpot_ms": round(method_tpot, 4),
+        "mean_min_output_tokens": round(mean_min_tokens, 4),
+        "dsr": round(reference_tpot / method_tpot, 4),
+        "esr": round(
+            (common_prefill + reference_tpot * mean_min_tokens) / denominator,
+            4,
+        ),
+    }

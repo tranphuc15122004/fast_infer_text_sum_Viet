@@ -353,8 +353,14 @@ def extract_hypotheses(record: dict) -> list[tuple[str, str]]:
     return out
 
 
-def compute_group(records: list[dict], data_index: dict) -> dict:
-    """Tổng hợp speed + speculative + semantic cho một nhóm (method, dataset)."""
+def compute_group(
+    records: list[dict],
+    data_index: dict,
+    *,
+    reference_records: Sequence[dict] | None = None,
+    reference_baseline: str = "vanilla_hf",
+) -> dict:
+    """Tổng hợp speed + quality + user-defined paired speedup cho một nhóm."""
     speed = metrics.aggregate_speed(records)
     spec = metrics.aggregate_speculative(records)
     joined = 0
@@ -395,19 +401,25 @@ def compute_group(records: list[dict], data_index: dict) -> dict:
     speedup = metrics.aggregate_speedup(records)
     if speedup:
         group["speedup"] = speedup
-        scopes = set()
-        for record in records:
-            if (
-                record.get("method") == "eagle3"
-                and record.get("speedup_reference_method") is None
-                and record.get("paired_speedup_valid") is True
-            ):
-                scopes.add("paired_eagle_target_greedy")
-            if record.get("speedup_valid") is True and record.get("speedup_scope"):
-                scopes.add(str(record["speedup_scope"]))
-        scopes = sorted(scopes)
-        if scopes:
-            group["speedup_scope"] = scopes[0] if len(scopes) == 1 else scopes
+    if reference_records is not None:
+        user_defined_speedup = metrics.aggregate_user_defined_speedup(
+            reference_records, records, reference_baseline=reference_baseline
+        )
+        if user_defined_speedup:
+            group["user_defined_speedup"] = user_defined_speedup
+    scopes = set()
+    for record in records:
+        if (
+            record.get("method") == "eagle3"
+            and record.get("speedup_reference_method") is None
+            and record.get("paired_speedup_valid") is True
+        ):
+            scopes.add("paired_eagle_target_greedy")
+        if record.get("speedup_valid") is True and record.get("speedup_scope"):
+            scopes.add(str(record["speedup_scope"]))
+    scopes = sorted(scopes)
+    if scopes:
+        group["speedup_scope"] = scopes[0] if len(scopes) == 1 else scopes
     references = sorted(
         {
             str(record["external_reference_baseline"])
@@ -591,7 +603,10 @@ def main() -> None:
 
     for (method, ds), records in sorted(resolved.items()):
         index = data_index.get(ds, {})
-        group = compute_group(records, index)
+        reference_records = resolved.get(("vanilla_hf", ds), [])
+        group = compute_group(
+            records, index, reference_records=reference_records
+        )
         result["metrics"].setdefault(ds, {})[method] = group
         if args.verbose:
             print(f"  [{ds}/{method}] records={group['num_records']} "
@@ -603,7 +618,15 @@ def main() -> None:
         index_all: dict = {}
         for ds in datasets:
             index_all.update(data_index.get(ds, {}))
-        result["overall"][method] = compute_group(all_records, index_all)
+        all_reference_records = [
+            record
+            for (reference_method, _), records in resolved.items()
+            if reference_method == "vanilla_hf"
+            for record in records
+        ]
+        result["overall"][method] = compute_group(
+            all_records, index_all, reference_records=all_reference_records
+        )
 
     out_path = Path(args.out) if args.out else outputs_dir / "metrics_summary.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -670,6 +693,11 @@ def write_csv(path: Path, result: dict, datasets: list[str]) -> None:
             if label not in seen:
                 seen.add(label)
                 col_meta.append(("speedup", key, "ratio"))
+        for key in ("dsr", "esr"):
+            label = f"user_{key}_ratio"
+            if label not in seen and key in group.get("user_defined_speedup", {}):
+                seen.add(label)
+                col_meta.append(("user_speedup", f"user_{key}", "ratio"))
         for key in group.get("semantic", {}):
             label = f"{key}_mean"
             if label not in seen:
@@ -687,6 +715,10 @@ def write_csv(path: Path, result: dict, datasets: list[str]) -> None:
                 row.append(f"{v:.4f}" if isinstance(v, (int, float)) else "")
             elif section == "speedup":
                 v = group.get("speedup", {}).get(key)
+                row.append(f"{v:.4f}" if isinstance(v, (int, float)) else "")
+            elif section == "user_speedup":
+                user_key = key.removeprefix("user_")
+                v = group.get("user_defined_speedup", {}).get(user_key)
                 row.append(f"{v:.4f}" if isinstance(v, (int, float)) else "")
             else:
                 agg = group.get(section, {}).get(key)
@@ -748,6 +780,25 @@ def write_markdown(path: Path, result: dict, datasets: list[str]) -> None:
                 f"| {method} | {_fmt(su.get('esr'))} "
                 f"| {_fmt(su.get('dsr'))} | {_fmt(su.get('prefill_speedup'))} "
                 f"| {_fmt(su.get('ttft_speedup'))} |"
+            )
+        md.append("")
+        md.append("### DSR/ESR theo TPOT và prefill chung (Vanilla HF)")
+        md.append("")
+        md.append("DSR = TPOT_vanilla_hf / TPOT_method; ESR = (P + TPOT_vanilla_hf × mean(Lmin)) / (P + TPOT_method × mean(Lmin)).")
+        md.append("")
+        md.append("| method | n | P (ms) | TPOT HF (ms/token) | TPOT method (ms/token) | mean Lmin | DSR | ESR |")
+        md.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        for method, group in sorted(groups.items()):
+            user = group.get("user_defined_speedup", {})
+            if not user:
+                continue
+            md.append(
+                f"| {method} | {user.get('paired_samples', 0)} "
+                f"| {_fmt(user.get('common_prefill_ms'))} "
+                f"| {_fmt(user.get('reference_tpot_ms'))} "
+                f"| {_fmt(user.get('method_tpot_ms'))} "
+                f"| {_fmt(user.get('mean_min_output_tokens'))} "
+                f"| {_fmt(user.get('dsr'))} | {_fmt(user.get('esr'))} |"
             )
         md.append("")
         md.append("### Semantic (mean)")

@@ -648,3 +648,131 @@ def test_domino_e2e_only_contract_does_not_require_unavailable_phase_metrics(
 
     assert summary["metric_contract"]["status"] == "complete"
     assert summary["metric_contract"]["decode_metrics_available"] is False
+
+
+def test_user_defined_dsr_esr_use_mean_tpot_common_prefill_and_paired_min_length() -> None:
+    from Benchmark.common.metrics import aggregate_user_defined_speedup
+
+    reference = [
+        {"status": "success", "sample_id": "a", "dataset": "vietnews",
+         "prefill_ms": 100.0, "tpot_ms": 10.0, "output_tokens": 100},
+        {"status": "success", "sample_id": "b", "dataset": "vietnews",
+         "prefill_ms": 100.0, "tpot_ms": 20.0, "output_tokens": 40},
+    ]
+    method = [
+        {"status": "success", "sample_id": "a", "dataset": "vietnews",
+         "tpot_ms": 5.0, "output_tokens": 60},
+        {"status": "success", "sample_id": "b", "dataset": "vietnews",
+         "tpot_ms": 10.0, "output_tokens": 50},
+    ]
+
+    result = aggregate_user_defined_speedup(reference, method)
+
+    assert result["paired_samples"] == 2
+    assert result["mean_min_output_tokens"] == 50.0
+    assert result["dsr"] == 2.0
+    assert result["esr"] == 1.7895
+
+
+def test_compute_group_reports_user_defined_speedup_separately_from_legacy_ratios() -> None:
+    from Benchmark.collect_metrics import compute_group
+
+    rows = [
+        {
+            "method": "domino",
+            "status": "success",
+            "sample_id": "a",
+            "external_speedup_valid": True,
+            "external_reference_baseline": "vanilla_hf",
+            "external_reference_tpot_ms": 10.0,
+            "external_reference_prefill_ms": 100.0,
+            "external_reference_output_tokens": 100,
+            "tpot_ms": 5.0,
+            "prefill_ms": 120.0,
+            "output_tokens": 60,
+            "text": "summary",
+            "reference": "summary",
+            "decode_ms": 295.0,
+            "e2e_ms": 395.0,
+        },
+    ]
+
+    reference = [
+        {
+            "method": "vanilla_hf",
+            "status": "success",
+            "sample_id": "a",
+            "dataset": "vietnews",
+            "prefill_ms": 100.0,
+            "tpot_ms": 10.0,
+            "output_tokens": 100,
+        }
+    ]
+    rows[0]["dataset"] = "vietnews"
+    result = compute_group(rows, {}, reference_records=reference)
+
+    assert result["user_defined_speedup"]["reference_baseline"] == "vanilla_hf"
+    assert result["user_defined_speedup"]["dsr"] == 2.0
+    assert result["user_defined_speedup"]["esr"] == 1.75
+
+
+def test_user_defined_speedup_is_written_to_csv_and_markdown(tmp_path) -> None:
+    from Benchmark.collect_metrics import compute_group, write_csv, write_markdown
+
+    method_records = [
+        {
+            "method": "domino",
+            "status": "success",
+            "sample_id": "a",
+            "dataset": "vietnews",
+            "tpot_ms": 5.0,
+            "output_tokens": 60,
+            "text": "summary",
+            "reference": "summary",
+        }
+    ]
+    reference_records = [
+        {
+            "method": "vanilla_hf",
+            "status": "success",
+            "sample_id": "a",
+            "dataset": "vietnews",
+            "prefill_ms": 100.0,
+            "tpot_ms": 10.0,
+            "output_tokens": 100,
+        }
+    ]
+    group = compute_group(
+        method_records, {}, reference_records=reference_records
+    )
+    result = {
+        "outputs_dir": str(tmp_path),
+        "datasets": ["vietnews"],
+        "metrics": {"vietnews": {"domino": group}},
+        "overall": {"domino": group},
+    }
+    csv_path = tmp_path / "summary.csv"
+    md_path = tmp_path / "summary.md"
+
+    write_csv(csv_path, result, ["vietnews"])
+    write_markdown(md_path, result, ["vietnews"])
+
+    assert "user_dsr_ratio" in csv_path.read_text(encoding="utf-8").splitlines()[0]
+    assert "user_esr_ratio" in csv_path.read_text(encoding="utf-8").splitlines()[0]
+    markdown = md_path.read_text(encoding="utf-8")
+    assert "DSR/ESR theo TPOT và prefill chung (Vanilla HF)" in markdown
+    assert "| domino | 1 |" in markdown
+
+def test_metric_audit_flags_text_that_differs_from_returned_token_ids() -> None:
+    from Benchmark.common.metric_audit import audit_record
+
+    audit = audit_record(
+        {
+            "method": "domino",
+            "status": "success",
+            "output_tokens": 12,
+            "text_decode_matches_token_ids": False,
+        }
+    )
+
+    assert "text_token_ids_mismatch" in audit["issues"]

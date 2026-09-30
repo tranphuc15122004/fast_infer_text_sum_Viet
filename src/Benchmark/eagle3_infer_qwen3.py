@@ -337,9 +337,9 @@ def main() -> None:
     parser.add_argument("--max-input-tokens", type=int, default=0,
                         help="truncate each prompt to this many tokens before "
                              "KV cache sizing (0 = no limit; use on T4 smoke runs)")
-    parser.add_argument("--total-token", type=int, default=32)
-    parser.add_argument("--depth", type=int, default=5)
-    parser.add_argument("--top-k", type=int, default=4)
+    parser.add_argument("--total-token", type=int, default=17)
+    parser.add_argument("--depth", type=int, default=16)
+    parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
         "--seed",
@@ -976,6 +976,7 @@ def main() -> None:
         "speedup_reference_method": (
             "eagle_target_autoregressive" if not args.skip_naive else None
         ),
+        "target_logits_parity": parity,
         **metrics.aggregate_paired_reference_fidelity(records),
         **quality,
     }

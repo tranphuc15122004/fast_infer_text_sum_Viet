@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -63,6 +64,59 @@ def resolve_stop_token_ids(tokenizer: Any) -> list[int]:
     if not normalized:
         raise ValueError("target tokenizer does not expose a valid EOS token id")
     return normalized
+
+
+def _normalize_decoded_text(text: str) -> str:
+    """Normalize only Unicode composition and whitespace for decode parity."""
+
+    return " ".join(unicodedata.normalize("NFKC", text).split())
+
+
+def response_text_token_integrity(
+    payload: dict[str, Any], tokenizer: Any | None
+) -> dict[str, Any]:
+    """Compare SGLang's visible text with decoding its returned output IDs.
+
+    This catches stream assembly bugs that duplicate text while token counts and
+    server timing still look plausible. ``None`` means the check was not
+    possible because the server omitted IDs or no tokenizer was available.
+    """
+
+    output_ids = payload.get("output_ids")
+    if not isinstance(output_ids, (list, tuple)) or any(
+        isinstance(token, bool) or not isinstance(token, int) for token in output_ids
+    ):
+        return {
+            "text_decode_matches_token_ids": None,
+            "output_token_id_count": None,
+        }
+
+    result: dict[str, Any] = {
+        "text_decode_matches_token_ids": None,
+        "output_token_id_count": len(output_ids),
+    }
+    if tokenizer is None or not hasattr(tokenizer, "decode"):
+        return result
+
+    response_text = payload.get("text")
+    if not isinstance(response_text, str):
+        return result
+    try:
+        decoded_text = tokenizer.decode(
+            list(output_ids),
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+    except Exception:
+        return result
+    if not isinstance(decoded_text, str):
+        return result
+
+    result["text_decode_matches_token_ids"] = (
+        _normalize_decoded_text(response_text)
+        == _normalize_decoded_text(decoded_text)
+    )
+    return result
 
 
 def build_sampling_params(
@@ -412,9 +466,15 @@ def _parse_sglang_sse_response(
         raise RuntimeError("SGLang stream ended without a final finish_reason event")
 
     payload = dict(final_event)
-    if text_parts:
-        # SGLang emits deltas when incremental streaming is enabled and only
-        # the final full text when it is disabled.
+    # SGLang 0.5.20 emits deltas when incremental streaming is enabled and
+    # accumulated text snapshots when it is disabled. In both modes, the final
+    # finish_reason event carries ReqState.get_text(): the complete response.
+    # Use that final snapshot instead of concatenating event text, which would
+    # duplicate or multiply the answer while leaving token/timing metadata intact.
+    final_text = final_event.get("text")
+    if isinstance(final_text, str):
+        payload["text"] = final_text
+    elif text_parts:
         payload["text"] = "".join(text_parts)
     if output_ids:
         payload["output_ids"] = output_ids
@@ -666,6 +726,7 @@ def _request_one(
         request_metrics["prompt_token_count_match"] = (
             int(server_tokens) == len(local_ids) if server_tokens is not None else None
         )
+    request_metrics.update(response_text_token_integrity(payload, tokenizer))
     request_metrics["prompt_token_ids"] = local_ids
     return sample, {"payload": payload, "metrics": request_metrics}
 
@@ -1028,6 +1089,10 @@ def main() -> int:
             )
         )
         record["prompt_token_count_match"] = timing.get("prompt_token_count_match")
+        record["text_decode_matches_token_ids"] = timing.get(
+            "text_decode_matches_token_ids"
+        )
+        record["output_token_id_count"] = timing.get("output_token_id_count")
         record["client_prompt_tokens"] = local_prompt_tokens
         record["server_prompt_tokens"] = server_prompt_tokens
         if args.method == "target_only":

@@ -343,12 +343,18 @@ def parse_baselines(value: str, allowed: tuple[str, ...] = BASELINES) -> list[st
     return selected
 
 
+def with_vanilla_hf_reference(values: list[str]) -> list[str]:
+    """Put Vanilla HF first so debug baselines get paired metrics in one run."""
+
+    return ["vanilla_hf", *(value for value in values if value != "vanilla_hf")]
+
+
 def validate_smoke_result(
     returncode: int | None,
     manifest: dict[str, Any] | None,
     expected_baselines: list[str],
 ) -> dict[str, Any]:
-    """Require one successful, complete, audited VietNews record per baseline."""
+    """Require successful audited records and paired Vanilla HF metrics."""
 
     overall_issues: list[str] = []
     per_baseline: dict[str, dict[str, Any]] = {}
@@ -360,13 +366,34 @@ def validate_smoke_result(
     if manifest.get("failure_count", 0) != 0:
         overall_issues.append(f"manifest failure_count={manifest.get('failure_count')}")
 
+    metrics_summary = manifest.get("metrics_summary")
+    metric_groups: dict[str, Any] = {}
+    if isinstance(metrics_summary, dict):
+        metrics = metrics_summary.get("metrics")
+        datasets = metrics.get("vietnews") if isinstance(metrics, dict) else None
+        if isinstance(datasets, dict):
+            metric_groups = datasets
+
     cells_by_baseline: dict[str, list[dict[str, Any]]] = {}
     for cell in manifest.get("cells", []):
         if isinstance(cell, dict):
             cells_by_baseline.setdefault(str(cell.get("baseline", "")), []).append(cell)
 
+    def positive_finite(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if number <= 0 or number != number or number == float("inf"):
+            return None
+        return number
+
+    def close_metric(actual: float, expected: float) -> bool:
+        return abs(actual - expected) <= 0.0005 * max(1.0, abs(expected))
+
     for baseline in expected_baselines:
         issues: list[str] = []
+        user_speedup: dict[str, Any] | None = None
         cells = cells_by_baseline.get(baseline, [])
         if len(cells) != 1:
             issues.append(f"expected one VietNews cell, found {len(cells)}")
@@ -397,15 +424,100 @@ def validate_smoke_result(
                 issues.append(f"metric audit records={audit.get('num_records')}, expected 1")
             if audit.get("status_counts") != {"success": 1}:
                 issues.append(f"metric audit statuses={audit.get('status_counts')}")
+            reported_issues: dict[str, int] = {}
+            for source in (audit, contract):
+                issue_counts = source.get("issue_counts") or {}
+                if not isinstance(issue_counts, dict):
+                    continue
+                for name, raw_count in issue_counts.items():
+                    try:
+                        count = int(raw_count)
+                    except (TypeError, ValueError, OverflowError):
+                        count = 1 if raw_count else 0
+                    if count > 0:
+                        reported_issues[str(name)] = max(
+                            count, reported_issues.get(str(name), 0)
+                        )
+            if reported_issues:
+                issues.append(f"output/metric issue counts={reported_issues}")
+            missing_quality_fields = contract.get("missing_quality_field_counts") or {}
+            if isinstance(missing_quality_fields, dict):
+                missing_quality_fields = {
+                    str(name): count
+                    for name, count in missing_quality_fields.items()
+                    if count is not None and int(count) > 0
+                }
+            if missing_quality_fields:
+                issues.append(
+                    f"missing quality metrics (including ROUGE-L)={missing_quality_fields}"
+                )
+
+        group = metric_groups.get(baseline)
+        raw_user = group.get("user_defined_speedup") if isinstance(group, dict) else None
+        if not isinstance(raw_user, dict):
+            issues.append("DSR/ESR missing from paired metrics_summary.json")
+        else:
+            user_speedup = dict(raw_user)
+            if user_speedup.get("reference_baseline") != "vanilla_hf":
+                issues.append(
+                    "DSR/ESR reference_baseline="
+                    f"{user_speedup.get('reference_baseline')}, expected vanilla_hf"
+                )
+            try:
+                paired_samples = int(user_speedup.get("paired_samples", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                paired_samples = 0
+            if paired_samples != 1:
+                issues.append(f"DSR/ESR paired_samples={paired_samples}, expected 1")
+
+            numeric_fields = (
+                "common_prefill_ms",
+                "reference_tpot_ms",
+                "method_tpot_ms",
+                "mean_min_output_tokens",
+                "dsr",
+                "esr",
+            )
+            parsed: dict[str, float] = {}
+            for field in numeric_fields:
+                value = positive_finite(user_speedup.get(field))
+                if value is None:
+                    issues.append(f"DSR/ESR {field} must be finite and positive")
+                else:
+                    parsed[field] = value
+            if len(parsed) == len(numeric_fields):
+                expected_dsr = parsed["reference_tpot_ms"] / parsed["method_tpot_ms"]
+                denominator = (
+                    parsed["common_prefill_ms"]
+                    + parsed["method_tpot_ms"] * parsed["mean_min_output_tokens"]
+                )
+                expected_esr = (
+                    parsed["common_prefill_ms"]
+                    + parsed["reference_tpot_ms"] * parsed["mean_min_output_tokens"]
+                ) / denominator
+                if not close_metric(parsed["dsr"], expected_dsr):
+                    issues.append(
+                        f"DSR={parsed['dsr']:.4f} does not match TPOT ratio "
+                        f"{expected_dsr:.4f}"
+                    )
+                if not close_metric(parsed["esr"], expected_esr):
+                    issues.append(
+                        f"ESR={parsed['esr']:.4f} does not match paired prefill/TPOT "
+                        f"ratio {expected_esr:.4f}"
+                    )
+
         per_baseline[baseline] = {
             "status": "passed" if not issues else "failed",
             "issues": issues,
+            "user_defined_speedup": user_speedup,
         }
         overall_issues.extend(f"{baseline}: {issue}" for issue in issues)
 
     unexpected = sorted(set(cells_by_baseline) - set(expected_baselines))
     if unexpected:
         overall_issues.append(f"unexpected baseline cells: {', '.join(unexpected)}")
+    if metrics_summary is None:
+        overall_issues.append("metrics_summary.json is missing or unreadable")
     return {
         "status": "passed" if not overall_issues else "failed",
         "baselines": per_baseline,
@@ -955,6 +1067,9 @@ def _child_env(
             "LONG_BENCH_LOCAL_FILES_ONLY": "1",
             "LONG_BENCH_MODE": benchmark_mode,
             "LONG_BENCH_BASELINES": baselines,
+            "LONG_BENCH_REFERENCE_BASELINE": "vanilla_hf",
+            "LONG_BENCH_DATA_PARALLEL": "0",
+            "LONG_BENCH_DP_PROCESSES_PER_GPU": "1",
             "LONG_BENCH_DATASETS": "vietnews",
             "LONG_BENCH_MAX_NEW_TOKENS": str(max_new_tokens),
             "LONG_BENCH_SMOKE_MAX_NEW_TOKENS": str(max_new_tokens),
@@ -963,6 +1078,9 @@ def _child_env(
             "LONG_BENCH_WARMUP_RUNS": "1",
             "LONG_BENCH_BATCH_SIZE": "1",
             "LONG_BENCH_MAX_RUNNING_REQUESTS": "1",
+            "LONG_BENCH_EAGLE_TOTAL_TOKEN": "17",
+            "LONG_BENCH_EAGLE_DEPTH": "16",
+            "LONG_BENCH_EAGLE_TOP_K": "1",
             # Diagnose the suspected Qwen3 EAGLE target-forward mismatch in
             # the same representative run. This check runs before timing.
             "LONG_BENCH_EAGLE_CHECK_TARGET_PARITY": "1",
@@ -1453,6 +1571,7 @@ print(json.dumps({
                 stage_baselines: list[str],
                 timeout_seconds: int,
             ) -> dict[str, Any]:
+                stage_baselines = with_vanilla_hf_reference(stage_baselines)
                 stage_output = benchmark_root / stage_name
                 longbench_run_id = f"{stage_name}-{run_id}"
                 env = _child_env(
@@ -1479,6 +1598,8 @@ print(json.dumps({
                     "--sample-retries", "0",
                     "--no-retry-failed-samples",
                     "--continue-on-error",
+                    "--no-data-parallel",
+                    "--dp-processes-per-gpu", "1",
                     "--strict",
                     "--collect",
                     "--run-id", longbench_run_id,
@@ -1492,11 +1613,21 @@ print(json.dumps({
                     timeout_seconds=timeout_seconds,
                 )
                 logs[stage_name] = log_path.read_text(encoding="utf-8")
-                manifest_path = stage_output / longbench_run_id / "run_manifest.json"
+                run_output = stage_output / longbench_run_id
+                manifest_path = run_output / "run_manifest.json"
+                metrics_summary_path = run_output / "metrics_summary.json"
                 try:
                     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     manifest = None
+                try:
+                    metrics_summary = json.loads(
+                        metrics_summary_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    metrics_summary = None
+                if isinstance(manifest, dict):
+                    manifest["metrics_summary"] = metrics_summary
                 validation = validate_smoke_result(
                     command_result["returncode"],
                     manifest,
@@ -1512,6 +1643,7 @@ print(json.dumps({
                     "elapsed_seconds": command_result["elapsed_seconds"],
                     "output_tail": command_result["output_tail"],
                     "manifest_path": str(manifest_path),
+                    "metrics_summary_path": str(metrics_summary_path),
                 }
 
             def run_sglang_target_diagnostic(
@@ -1670,7 +1802,8 @@ print(json.dumps({
                     overall_status = "failed"
                     errors.extend(focus["issues"])
             else:
-                focused = run_benchmarks("targeted", selected_baselines, 3600)
+                focused_baselines = with_vanilla_hf_reference(selected_baselines)
+                focused = run_benchmarks("targeted", focused_baselines, 3600)
                 stages["targeted"] = focused
                 overall_status = focused["status"]
                 errors.extend(focused["issues"])

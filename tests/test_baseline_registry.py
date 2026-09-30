@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -30,6 +32,81 @@ def test_baseline_config_uses_qwen3_target_and_viet_defaults(monkeypatch) -> Non
     config = baseline_config_from_env("eagle3")
     assert config["model"] == "/models/Qwen3-4B"
     assert config["eagle_model"] == "/models/eagle3-qwen3-4b"
+
+
+def test_longbench_ar16_profile_ignores_stale_legacy_eagle_tree_values() -> None:
+    config_script = ROOT / "scripts/common/config.sh"
+    env = {
+        **os.environ,
+        "EAGLE_TOTAL_TOKENS": "60",
+        "EAGLE_DEPTH": "5",
+        "EAGLE_TOP_K": "10",
+    }
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"source '{config_script}'; fast_infer__load_longbench; "
+            "printf '%s %s %s' \"$LONG_BENCH_EAGLE_TOTAL_TOKEN\" "
+            "\"$LONG_BENCH_EAGLE_DEPTH\" \"$LONG_BENCH_EAGLE_TOP_K\"",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.stdout == "17 16 1"
+
+def test_eagle3_launcher_defaults_to_linear_16_token_draft_block() -> None:
+    from Benchmark.common.longbench_adapter import (
+        baseline_config_from_env,
+        build_adapter_command,
+    )
+
+    config = baseline_config_from_env("eagle3", env={})
+    command = build_adapter_command(
+        "eagle3",
+        config=config,
+        data_file=ROOT / "datasets/eval_100/vietnews_100.jsonl",
+        output=ROOT / "outputs/eagle3.jsonl",
+        max_samples=1,
+        max_new_tokens=32,
+    )
+    assert command is not None
+    actual = {
+        flag: command[command.index(flag) + 1]
+        for flag in ("--total-token", "--depth", "--top-k")
+    }
+    # EaModel subtracts one from total_token to get proposal nodes. One branch
+    # with depth 16 gives a single autoregressive draft path of 16 tokens.
+    assert actual == {
+        "--total-token": "17",
+        "--depth": "16",
+        "--top-k": "1",
+    }
+
+
+def test_eagle3_smoke_requires_stock_target_logits_parity() -> None:
+    from Benchmark.common.longbench_adapter import (
+        baseline_config_from_env,
+        build_adapter_command,
+    )
+
+    config = baseline_config_from_env("eagle3", env={})
+    config["smoke"] = True
+    config["eagle_check_target_parity"] = False
+    command = build_adapter_command(
+        "eagle3",
+        config=config,
+        data_file=ROOT / "datasets/eval_100/vietnews_100.jsonl",
+        output=ROOT / "outputs/eagle3-smoke.jsonl",
+        max_samples=1,
+        max_new_tokens=32,
+    )
+
+    assert command is not None
+    assert "--check-target-parity" in command
 
 
 def test_sglang_config_keeps_auto_concurrency_resolvable(monkeypatch) -> None:

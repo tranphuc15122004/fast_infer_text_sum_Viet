@@ -776,11 +776,11 @@ def build_adapter_command(
             "--max-input-tokens",
             str(max_input),
             "--total-token",
-            str(cfg.get("eagle_total_token", 60)),
+            str(cfg.get("eagle_total_token", 17)),
             "--depth",
-            str(cfg.get("eagle_depth", 5)),
+            str(cfg.get("eagle_depth", 16)),
             "--top-k",
-            str(cfg.get("eagle_top_k", 10)),
+            str(cfg.get("eagle_top_k", 1)),
             "--temperature",
             temperature,
             "--seed",
@@ -793,7 +793,10 @@ def build_adapter_command(
         # supplies a same-model speedup denominator.  The external Vanilla
         # row is useful for cross-method comparison, but cannot replace that
         # exact token-paired reference.
-        if bool(cfg.get("eagle_check_target_parity")):
+        # Smoke runs must validate the customized Qwen3 target forward against
+        # stock Transformers before treating speculative speed or quality as
+        # meaningful. Full runs can opt into the same expensive audit by config.
+        if smoke or bool(cfg.get("eagle_check_target_parity")):
             command.append("--check-target-parity")
         return command
 
@@ -980,9 +983,9 @@ def baseline_config_from_env(baseline: str, env: Mapping[str, str] | None = None
         "magicdec_model_name": values.get("LONG_BENCH_MAGICDEC_MODEL_NAME") or values.get("MODEL_MAGICDEC_NAME") or values.get("MODEL_TARGET"),
         "fafo_kv_method": values.get("LONG_BENCH_FAFO_KV_METHOD") or values.get("FAFO_KV_METHOD", "stream-llm"),
         "fafo_use_flash": values.get("FAFO_USE_FLASH", "0") == "1",
-        "eagle_total_token": int(values.get("LONG_BENCH_EAGLE_TOTAL_TOKEN", "60")),
-        "eagle_depth": int(values.get("LONG_BENCH_EAGLE_DEPTH", "5")),
-        "eagle_top_k": int(values.get("LONG_BENCH_EAGLE_TOP_K", "10")),
+        "eagle_total_token": int(values.get("LONG_BENCH_EAGLE_TOTAL_TOKEN", "17")),
+        "eagle_depth": int(values.get("LONG_BENCH_EAGLE_DEPTH", "16")),
+        "eagle_top_k": int(values.get("LONG_BENCH_EAGLE_TOP_K", "1")),
         "eagle_check_target_parity": values.get(
             "LONG_BENCH_EAGLE_CHECK_TARGET_PARITY", "0"
         ) == "1",

@@ -447,6 +447,8 @@ def audit_record(
             issues.append("missing_quality_metric")
     if record.get("speedup_valid") is False:
         issues.append("speedup_invalid")
+    if record.get("text_decode_matches_token_ids") is False:
+        issues.append("text_token_ids_mismatch")
     issues.extend(_acceptance_metric_issues(record))
     guard = record.get("output_quality_guard")
     output_text = record.get("text") or record.get("answer")
