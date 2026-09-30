@@ -375,6 +375,15 @@ def _reference_text(row: dict[str, Any]) -> str | None:
     return None
 
 
+def _resolve_sample_limit(*, full: bool, smoke: bool, max_samples: int) -> int:
+    """Resolve the sample cap, with explicit full mode overriding smoke and caps."""
+    if full:
+        return 0
+    if smoke and max_samples == 0:
+        return 2
+    return max_samples
+
+
 def _prepare_samples(
     rows: list[dict[str, Any]],
     tokenizer: Any,
@@ -855,9 +864,11 @@ def _evaluate(args: argparse.Namespace) -> int:
         "chat_template": getattr(tokenizer, "chat_template", None),
     }
     source_rows = read_jsonl(data_path)
-    max_samples = args.max_samples
-    if args.smoke and max_samples == 0:
-        max_samples = 2
+    max_samples = _resolve_sample_limit(
+        full=args.full,
+        smoke=args.smoke,
+        max_samples=args.max_samples,
+    )
     samples, excluded = _prepare_samples(
         source_rows,
         tokenizer,
@@ -867,6 +878,12 @@ def _evaluate(args: argparse.Namespace) -> int:
     )
 
     common_config = {
+        "evaluation_mode": (
+            "full" if args.full else "smoke" if args.smoke and args.max_samples == 0
+            else "capped" if max_samples > 0 else "full"
+        ),
+        "max_samples_requested": args.max_samples,
+        "max_samples_effective": max_samples,
         "max_new_tokens": args.max_new_tokens,
         "max_input_tokens": args.max_input_tokens,
         "max_model_len": args.max_model_len,
@@ -1521,6 +1538,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-id", default="")
     parser.add_argument("--smoke", action="store_true", help="Limit to two common samples")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Process every eligible row, overriding smoke mode and sample caps",
+    )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
     return parser

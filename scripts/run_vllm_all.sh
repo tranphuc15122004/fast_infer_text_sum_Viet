@@ -10,6 +10,14 @@ elif [[ $# -gt 0 && "$1" != -* ]]; then
   shift
 fi
 
+FULL_REQUESTED=0
+for arg in "$@"; do
+  if [[ "$arg" == "--full" ]]; then
+    FULL_REQUESTED=1
+    break
+  fi
+done
+
 OUTPUT_DIR="${VLLM_OUTPUT_DIR:-$ROOT/outputs/vllm_unified}"
 if [[ "$OUTPUT_DIR" != /* ]]; then
   OUTPUT_DIR="$ROOT/$OUTPUT_DIR"
@@ -85,7 +93,7 @@ ARGS=(
 if [[ "${VLLM_SEED:-42}" != "42" ]]; then
   ARGS+=(--seed "$VLLM_SEED")
 fi
-if [[ "${SMOKE:-0}" == "1" || "${RUN_MODE:-}" == "smoke" ]]; then
+if [[ "$FULL_REQUESTED" != "1" && ( "${SMOKE:-0}" == "1" || "${RUN_MODE:-}" == "smoke" ) ]]; then
   ARGS+=(--smoke)
 fi
 if [[ "${VLLM_ENFORCE_EAGER:-0}" == "1" ]]; then

@@ -182,6 +182,34 @@ def test_prepared_sample_preserves_source_row_for_offline_recalculation():
     assert samples[0]["document_words"] == source["document_words"]
 
 
+def test_full_cli_flag_is_available_and_wins_over_smoke_flag():
+    args = evaluator._parser().parse_args(
+        ["--model", "m", "--data-file", "d", "--output-dir", "o", "--full", "--smoke"]
+    )
+
+    assert evaluator._resolve_sample_limit(
+        full=args.full,
+        smoke=args.smoke,
+        max_samples=args.max_samples,
+    ) == 0
+
+
+def test_full_mode_ignores_smoke_and_max_sample_caps():
+    assert evaluator._resolve_sample_limit(
+        full=True,
+        smoke=True,
+        max_samples=2,
+    ) == 0
+
+
+def test_smoke_mode_still_limits_samples_when_full_is_not_requested():
+    assert evaluator._resolve_sample_limit(
+        full=False,
+        smoke=True,
+        max_samples=0,
+    ) == 2
+
+
 def test_order_methods_keeps_vanilla_first_and_preserves_requested_order():
     assert order_methods("domino,vanilla_vllm,eagle3") == (
         "vanilla_vllm",

@@ -15,8 +15,8 @@ bash scripts/run.sh vllm_all --preflight-only
 # Smoke: 2 mẫu chung để kiểm tra runtime và output schema.
 bash scripts/run.sh vllm_all --smoke
 
-# Full: toàn bộ mẫu đủ điều kiện trong VLLM_DATA_FILE.
-bash scripts/run.sh vllm_all
+# Full: toàn bộ mẫu đủ điều kiện; --full ghi đè RUN_MODE/SMOKE trong master config.
+bash scripts/run.sh vllm_all --full
 ```
 
 Mặc định config được resolve qua `config/master.path`. Có thể override một lần:
