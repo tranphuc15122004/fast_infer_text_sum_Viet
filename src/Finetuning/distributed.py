@@ -175,18 +175,23 @@ def ranked_path(path: str | Path, rank: int, world_size: int) -> Path:
 def merge_ranked_jsonl(
     shard_paths: Iterable[str | Path],
     destination: str | Path,
+    *,
+    overwrite: bool = True,
+    cleanup_shards: bool = True,
 ) -> None:
     """Merge rank-local JSONL rows by their internal source index atomically."""
 
     target = Path(destination)
-    if target.exists():
+    if target.exists() and not overwrite:
         raise FileExistsError(f"distributed merge destination already exists: {target}")
     rows: list[tuple[int, dict[str, object]]] = []
     seen: set[int] = set()
+    found_shards: list[Path] = []
     for raw_path in shard_paths:
         path = Path(raw_path)
         if not path.is_file():
-            raise FileNotFoundError(f"distributed shard not found: {path}")
+            continue
+        found_shards.append(path)
         with path.open(encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
                 if not line.strip():
@@ -206,6 +211,8 @@ def merge_ranked_jsonl(
                     raise ValueError(f"duplicate distributed source index: {source_index}")
                 seen.add(source_index)
                 rows.append((source_index, payload))
+    if not rows and not target.is_file():
+        raise FileNotFoundError("no valid distributed shard files found to merge")
     rows.sort(key=lambda item: item[0])
     target.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -218,6 +225,9 @@ def merge_ranked_jsonl(
             for _source_index, payload in rows:
                 handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
         os.replace(temporary, target)
+        if cleanup_shards:
+            for shard_file in found_shards:
+                shard_file.unlink(missing_ok=True)
     finally:
         temporary.unlink(missing_ok=True)
 

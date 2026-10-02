@@ -13,23 +13,27 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import shutil
 import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Callable, Iterator, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 import yaml
+from tqdm import tqdm
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PYTHON = os.environ.get("FINETUNING_PYTHON", sys.executable)
 _CURRENT_PROCESS: subprocess.Popen[str] | None = None
+_PROGRESS_EVENT_PREFIX = "@@FINETUNE_PROGRESS "
 
 
 class LauncherError(RuntimeError):
@@ -41,6 +45,8 @@ class RunPaths:
     output_root: Path
     teacher_train: Path
     teacher_eval: Path
+    teacher_train_report: Path
+    teacher_eval_report: Path
     features_train: Path
     features_eval: Path
     checkpoints: Path
@@ -53,6 +59,97 @@ class RunPaths:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class _RunConsoleLog:
+    """Persist the concise messages shown to the operator during one run."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def emit(self, level: str, message: str) -> None:
+        line = f"{_utc_now()} | {level.upper():5s} | {message}"
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                handle.flush()
+        tqdm.write(line, file=sys.stderr)
+
+
+def _count_nonblank_jsonl(path: Path) -> int:
+    count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                count += 1
+    return count
+
+
+def _short_line(value: str, maximum: int = 360) -> str:
+    compact = " ".join(value.strip().split())
+    return compact if len(compact) <= maximum else compact[: maximum - 1] + "…"
+
+
+class _BackendLogMonitor:
+    """Tail managed vLLM/SGLang logs and surface only their warnings/errors."""
+
+    def __init__(self, paths: Sequence[Path], console: _RunConsoleLog) -> None:
+        self.paths = tuple(paths)
+        self.console = console
+        self._offsets: dict[Path, int] = {}
+        self._seen: set[tuple[Path, str]] = set()
+        self._stop = threading.Event()
+        for root in self.paths:
+            candidates = list(root.glob("*.log")) if root.is_dir() else [root]
+            for path in candidates:
+                if path.is_file():
+                    try:
+                        self._offsets[path] = path.stat().st_size
+                    except OSError:
+                        pass
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _scan(self) -> None:
+        for root in self.paths:
+            candidates = list(root.glob("*.log")) if root.is_dir() else [root]
+            for path in candidates:
+                if not path.is_file():
+                    continue
+                offset = self._offsets.get(path, 0)
+                try:
+                    with path.open("r", encoding="utf-8", errors="replace") as handle:
+                        size = path.stat().st_size
+                        if offset > size:
+                            offset = 0
+                        handle.seek(offset)
+                        for raw_line in handle:
+                            message = raw_line.strip()
+                            if not message:
+                                continue
+                            match = re.search(r"\b(CRITICAL|ERROR|WARNING|WARN)\b", message, re.I)
+                            if match is None:
+                                continue
+                            key = (path, message)
+                            if key in self._seen:
+                                continue
+                            self._seen.add(key)
+                            level = "ERROR" if match.group(1).upper() in {"ERROR", "CRITICAL"} else "WARN"
+                            self.console.emit(level, f"server={path.name} {_short_line(message)}")
+                        self._offsets[path] = handle.tell()
+                except OSError:
+                    continue
+
+    def _run(self) -> None:
+        while not self._stop.wait(0.5):
+            self._scan()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self._scan()
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -100,6 +197,8 @@ def resolve_paths(args: argparse.Namespace, run_id: str) -> RunPaths:
         output_root=output_root,
         teacher_train=output_root / "teacher" / "train.jsonl",
         teacher_eval=output_root / "teacher" / "eval.jsonl",
+        teacher_train_report=output_root / "teacher" / "train_validation_report.json",
+        teacher_eval_report=output_root / "teacher" / "eval_validation_report.json",
         features_train=output_root / "features" / "train",
         features_eval=output_root / "features" / "eval",
         checkpoints=output_root / "checkpoints",
@@ -301,6 +400,7 @@ def validate_preflight(
     )
     for module in (
         "Finetuning.generate_targets",
+        "Finetuning.validate_targets",
         "Finetuning.capture_features",
         "Finetuning.run_train",
     ):
@@ -508,7 +608,7 @@ def build_commands(
     else:
         layer_args = ["--num-draft-layers", str(model["num_draft_layers"])]
 
-    return [
+    commands: list[tuple[str, list[str], Path]] = [
         (
             "generate_train",
             [
@@ -531,6 +631,59 @@ def build_commands(
             ],
             paths.teacher_eval,
         ),
+    ]
+
+    if not getattr(args, "skip_validation", False):
+        val_train_cmd = [
+            python_bin,
+            "-m",
+            "Finetuning.validate_targets",
+            "--input",
+            str(paths.teacher_train),
+            "--report-path",
+            str(paths.teacher_train_report),
+            "--max-anomaly-rate",
+            str(args.max_anomaly_rate),
+            "--min-rouge1",
+            str(args.min_teacher_rouge1),
+        ]
+        if getattr(args, "filter_anomalies", False):
+            val_train_cmd.append("--filter-anomalies")
+        if getattr(args, "validate_warn_only", False):
+            val_train_cmd.append("--warn-only")
+
+        val_eval_cmd = [
+            python_bin,
+            "-m",
+            "Finetuning.validate_targets",
+            "--input",
+            str(paths.teacher_eval),
+            "--report-path",
+            str(paths.teacher_eval_report),
+            "--max-anomaly-rate",
+            str(args.max_anomaly_rate),
+            "--min-rouge1",
+            str(args.min_teacher_rouge1),
+        ]
+        if getattr(args, "filter_anomalies", False):
+            val_eval_cmd.append("--filter-anomalies")
+        if getattr(args, "validate_warn_only", False):
+            val_eval_cmd.append("--warn-only")
+
+        commands.extend([
+            (
+                "validate_teacher_train",
+                val_train_cmd,
+                paths.teacher_train_report,
+            ),
+            (
+                "validate_teacher_eval",
+                val_eval_cmd,
+                paths.teacher_eval_report,
+            ),
+        ])
+
+    commands.extend([
         (
             "cache_train",
             [
@@ -569,7 +722,19 @@ def build_commands(
             ],
             paths.checkpoints,
         ),
-    ]
+    ])
+    return commands
+
+
+def _valid_report(path: Path) -> None:
+    if not path.is_file():
+        raise LauncherError(f"validation report is missing: {path}")
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise LauncherError(f"invalid validation report: {path}") from exc
+    if not isinstance(report, dict) or "passed_gate" not in report:
+        raise LauncherError(f"malformed validation report: {path}")
 
 
 def _valid_jsonl(path: Path) -> None:
@@ -654,13 +819,21 @@ def run_stage(
     validator: Callable[[], None],
     environment: dict[str, str],
     dry_run: bool,
+    console: _RunConsoleLog | None = None,
+    metadata: str = "",
+    progress_total: int | None = None,
 ) -> None:
+    console = console or _RunConsoleLog(log_path.parent / "run.log")
     marker = _read_marker(marker_path)
     if marker is not None:
         if marker.get("stage") != name:
             raise LauncherError(f"stage marker name mismatch: {marker_path}")
-        validator()
-        print(f"SKIP {name}: validated marker and artifact {artifact}")
+        try:
+            validator()
+        except LauncherError as exc:
+            console.emit("ERROR", f"RESUME CHECK FAILED {name}: {_short_line(str(exc))}")
+            raise
+        console.emit("INFO", f"SKIP {name} artifact={artifact}")
         return
 
     try:
@@ -675,17 +848,21 @@ def run_stage(
             artifact=artifact,
             status="recovered",
         )
-        print(f"RECOVER {name}: artifact already complete at {artifact}")
+        console.emit("INFO", f"RECOVER {name} artifact={artifact}")
         return
 
     command_text = shlex.join(list(command))
     if dry_run:
-        print(f"RUN {name}: {command_text}")
+        console.emit("INFO", f"DRY RUN {name} {metadata}".strip())
         return
 
+    console.emit("INFO", f"RUN {name} {metadata}".strip())
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as log_handle:
-        log_handle.write(f"\n[{_utc_now()}] START {name}\n$ {command_text}\n")
+        log_handle.write(
+            f"\n[{_utc_now()}] START {name}\n"
+            f"metadata={metadata}\n$ {command_text}\n"
+        )
         log_handle.flush()
         global _CURRENT_PROCESS
         _CURRENT_PROCESS = subprocess.Popen(
@@ -694,23 +871,120 @@ def run_stage(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             start_new_session=True,
         )
         assert _CURRENT_PROCESS.stdout is not None
+        progress_bar = (
+            tqdm(
+                total=progress_total,
+                desc=name,
+                unit="records",
+                dynamic_ncols=True,
+                mininterval=1.0,
+                disable=not sys.stderr.isatty(),
+                file=sys.stderr,
+            )
+            if progress_total is not None
+            else None
+        )
+        last_progress_log = time.monotonic()
+        summary_payload: dict[str, object] | None = None
+        shown_warnings: set[str] = set()
+        repeated_warnings = 0
         for line in _CURRENT_PROCESS.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
             log_handle.write(line)
             log_handle.flush()
+            clean = line.rstrip("\r\n")
+            if clean.startswith(_PROGRESS_EVENT_PREFIX):
+                try:
+                    event = json.loads(clean[len(_PROGRESS_EVENT_PREFIX) :])
+                    total = int(event["total"])
+                    current = int(event["n"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    console.emit("WARN", f"{name}: malformed progress event in {log_path.name}")
+                    continue
+                if progress_bar is None:
+                    progress_bar = tqdm(
+                        total=total,
+                        desc=name,
+                        unit=str(event.get("unit", "records")),
+                        dynamic_ncols=True,
+                        mininterval=1.0,
+                        disable=not sys.stderr.isatty(),
+                        file=sys.stderr,
+                    )
+                progress_bar.total = total
+                current = min(max(current, 0), total)
+                delta = current - progress_bar.n
+                if delta > 0:
+                    progress_bar.update(delta)
+                elif delta < 0:
+                    # A resumed child may restart its event counter after a
+                    # fresh parent process. Keep the display aligned.
+                    progress_bar.n = current
+                    progress_bar.refresh()
+                now = time.monotonic()
+                if now - last_progress_log >= 30.0:
+                    pct = 100.0 if total == 0 else progress_bar.n * 100.0 / total
+                    eta = "unknown"
+                    rate = progress_bar.format_dict.get("rate")
+                    if rate and total > progress_bar.n:
+                        eta = tqdm.format_interval(int((total - progress_bar.n) / rate))
+                    console.emit(
+                        "INFO",
+                        f"PROGRESS {name} {progress_bar.n}/{total} ({pct:.1f}%) eta={eta}",
+                    )
+                    last_progress_log = now
+                continue
+
+            if clean.startswith("{"):
+                try:
+                    payload = json.loads(clean)
+                except json.JSONDecodeError:
+                    payload = None
+                if isinstance(payload, dict) and (
+                    "stats" in payload or {"written", "rejected"} <= set(payload)
+                ):
+                    summary_payload = payload
+                    continue
+
+            if "Teacher Trajectory Validation:" in clean:
+                console.emit("INFO", _short_line(clean))
+                continue
+            severity = re.search(r"\b(CRITICAL|ERROR|WARNING|WARN)\b", clean, re.I)
+            if severity is not None:
+                warning_key = _short_line(clean)
+                if warning_key in shown_warnings:
+                    repeated_warnings += 1
+                    continue
+                shown_warnings.add(warning_key)
+                level = (
+                    "ERROR"
+                    if severity.group(1).upper() in {"CRITICAL", "ERROR"}
+                    else "WARN"
+                )
+                console.emit(level, f"{name}: {_short_line(clean)}")
+
         return_code = _CURRENT_PROCESS.wait()
         _CURRENT_PROCESS = None
         log_handle.write(f"[{_utc_now()}] END {name} returncode={return_code}\n")
+    if progress_bar is not None:
+        progress_bar.close()
+    if repeated_warnings:
+        console.emit("WARN", f"{name}: suppressed {repeated_warnings} duplicate warning lines")
     if return_code != 0:
+        console.emit("ERROR", f"FAILED {name} returncode={return_code}; details={log_path}")
         raise LauncherError(
             f"stage {name} failed with return code {return_code}; inspect {log_path}"
         )
-    validator()
+    try:
+        validator()
+    except LauncherError as exc:
+        console.emit("ERROR", f"ARTIFACT CHECK FAILED {name}: {_short_line(str(exc))}")
+        raise
     _write_marker(
         marker_path,
         stage=name,
@@ -718,7 +992,50 @@ def run_stage(
         artifact=artifact,
         status="completed",
     )
-    print(f"DONE {name}: {artifact}")
+    if summary_payload is not None:
+        stats_value = summary_payload.get("stats", summary_payload)
+        stats = stats_value if isinstance(stats_value, dict) else {}
+        if name.startswith("generate_"):
+            detail = (
+                f"written={stats.get('written', '?')} rejected={stats.get('rejected', '?')} "
+                f"tokens={stats.get('tokens', '?')} oom_retries={stats.get('oom_retries', 0)}"
+            )
+            rate_x1000 = stats.get("samples_per_sec_x1000")
+            if isinstance(rate_x1000, (int, float)):
+                detail += f" samples_per_s={float(rate_x1000) / 1000.0:.2f}"
+            if int(stats.get("rejected", 0) or 0) > 0 or int(stats.get("oom_retries", 0) or 0) > 0:
+                console.emit("WARN", f"RESULT {name} {detail}")
+            else:
+                console.emit("INFO", f"RESULT {name} {detail}")
+        elif name.startswith("cache_"):
+            parity = stats.get("parity")
+            parity_status = (
+                "not_run"
+                if not isinstance(parity, dict)
+                else "passed"
+                if parity.get("passed")
+                else "failed"
+            )
+            detail = (
+                f"captured={stats.get('captured', '?')} source_records="
+                f"{stats.get('source_records', '?')} unrenderable="
+                f"{stats.get('unrenderable_records', 0)} tokens={stats.get('tokens', '?')} "
+                f"oom_retries={stats.get('oom_retries', 0)} parity={parity_status}"
+            )
+            rate_x1000 = stats.get("samples_per_sec_x1000")
+            if isinstance(rate_x1000, (int, float)):
+                detail += f" samples_per_s={float(rate_x1000) / 1000.0:.2f}"
+            if (
+                int(stats.get("unrenderable_records", 0) or 0) > 0
+                or int(stats.get("oom_retries", 0) or 0) > 0
+                or parity_status == "failed"
+            ):
+                console.emit("WARN", f"RESULT {name} {detail}")
+            else:
+                console.emit("INFO", f"RESULT {name} {detail}")
+        else:
+            console.emit("INFO", f"RESULT {name} complete")
+    console.emit("INFO", f"DONE {name} artifact={artifact}")
 
 
 def _signal_handler(signum: int, _frame: object) -> None:
@@ -760,6 +1077,7 @@ def _job_lock(path: Path) -> Iterator[None]:
 class _ManagedGenerationServers:
     process: subprocess.Popen[str]
     log_handle: object
+    monitor: _BackendLogMonitor
 
 
 def _server_probe_urls(base_url: str) -> tuple[str, ...]:
@@ -807,8 +1125,17 @@ def _start_managed_generation_servers(
     config: dict[str, object],
     paths: RunPaths,
     environment: dict[str, str],
+    console: _RunConsoleLog,
 ) -> _ManagedGenerationServers:
     model_path = str(_mapping(config, "model")["target_model_path"])
+    console.emit(
+        "INFO",
+        f"SERVER START backend={args.generation_backend} model={Path(model_path).name} "
+        f"endpoints={len(args.generation_server_urls)} "
+        f"gpu_groups={','.join(args.generation_server_gpu_groups)} "
+        f"tp={args.generation_server_tp_size} "
+        f"mem_fraction={args.generation_server_mem_fraction:.2f}",
+    )
     command = [
         args.python_bin,
         str(ROOT / "scripts" / "launch_finetuning_target_servers.py"),
@@ -839,14 +1166,23 @@ def _start_managed_generation_servers(
     log_handle = log_path.open("a", encoding="utf-8")
     log_handle.write(f"\n$ {shlex.join(command)}\n")
     log_handle.flush()
-    process = subprocess.Popen(
-        command,
-        env=environment,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
+    monitor = _BackendLogMonitor(
+        (paths.log_dir / "target_servers", log_path),
+        console,
     )
-    handle = _ManagedGenerationServers(process, log_handle)
+    try:
+        process = subprocess.Popen(
+            command,
+            env=environment,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except Exception:
+        monitor.close()
+        log_handle.close()
+        raise
+    handle = _ManagedGenerationServers(process, log_handle, monitor)
     try:
         _wait_for_generation_servers(
             handle,
@@ -856,7 +1192,10 @@ def _start_managed_generation_servers(
     except Exception:
         _stop_managed_generation_servers(handle)
         raise
-    print(f"managed generation servers ready: {', '.join(args.generation_server_urls)}")
+    console.emit(
+        "INFO",
+        f"SERVER READY backend={args.generation_backend} endpoints={len(args.generation_server_urls)}",
+    )
     return handle
 
 
@@ -877,6 +1216,7 @@ def _stop_managed_generation_servers(handle: _ManagedGenerationServers | None) -
             except ProcessLookupError:
                 pass
             process.wait(timeout=10)
+    handle.monitor.close()
     handle.log_handle.close()  # type: ignore[union-attr]
 
 
@@ -932,6 +1272,11 @@ def _write_run_manifest(
         "parity_mean_abs_error": args.parity_mean_abs_error,
         "parity_relative_l2_error": args.parity_relative_l2_error,
         "parity_min_cosine_similarity": args.parity_min_cosine_similarity,
+        "max_anomaly_rate": args.max_anomaly_rate,
+        "min_teacher_rouge1": args.min_teacher_rouge1,
+        "filter_anomalies": args.filter_anomalies,
+        "validate_warn_only": args.validate_warn_only,
+        "skip_validation": args.skip_validation,
     }
     if paths.run_manifest.exists():
         try:
@@ -966,6 +1311,36 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens-per-batch", type=int, default=0)
     parser.add_argument("--bucket-window", type=int, default=512)
     parser.add_argument("--probe-batches", type=int, default=2)
+    parser.add_argument(
+        "--max-anomaly-rate",
+        type=float,
+        default=float(os.environ.get("FINETUNE_MAX_ANOMALY_RATE", "0.05")),
+        help="maximum allowable anomaly rate in teacher trajectories before failure (default 0.05)",
+    )
+    parser.add_argument(
+        "--min-teacher-rouge1",
+        type=float,
+        default=float(os.environ.get("FINETUNE_MIN_TEACHER_ROUGE1", "0.0")),
+        help="minimum required teacher average ROUGE-1 F1 against gold references",
+    )
+    parser.add_argument(
+        "--filter-anomalies",
+        action="store_true",
+        default=os.environ.get("FINETUNE_FILTER_ANOMALIES", "0") == "1",
+        help="automatically prune anomalous/degenerated records from teacher JSONL before caching",
+    )
+    parser.add_argument(
+        "--validate-warn-only",
+        action="store_true",
+        default=os.environ.get("FINETUNE_VALIDATE_WARN_ONLY", "0") == "1",
+        help="log warnings on validation gate failure without terminating the launcher",
+    )
+    parser.add_argument(
+        "--skip-validation",
+        action="store_true",
+        default=os.environ.get("FINETUNE_SKIP_VALIDATION", "0") == "1",
+        help="skip teacher trajectory validation stages completely",
+    )
     parser.add_argument(
         "--capture-backend",
         choices=("hf", "sglang"),
@@ -1212,6 +1587,7 @@ def main(argv: list[str] | None = None) -> int:
     paths.output_root.mkdir(parents=True, exist_ok=True)
     paths.state_dir.mkdir(parents=True, exist_ok=True)
     paths.log_dir.mkdir(parents=True, exist_ok=True)
+    console = _RunConsoleLog(paths.log_dir / "run.log")
 
     with _signal_guard(), _job_lock(paths.lock_path):
         config = materialize_config(Path(args.config), paths.run_config, paths, args)
@@ -1229,16 +1605,42 @@ def main(argv: list[str] | None = None) -> int:
         env["TRANSFORMERS_OFFLINE"] = "1"
         env["NCCL_ASYNC_ERROR_HANDLING"] = "1"
         env["TORCH_NCCL_BLOCKING_WAIT"] = "1"
-        validate_preflight(
-            config,
-            paths,
-            python_bin=args.python_bin,
-            nproc_per_node=args.nproc_per_node,
-            train_input=args.train_input,
-            eval_input=args.eval_input,
-            dry_run=args.dry_run,
+        env["FINETUNE_PROGRESS_MODE"] = "events"
+        console.emit(
+            "INFO",
+            f"PREFLIGHT model={Path(str(_mapping(config, 'model')['target_model_path'])).name} "
+            f"workers={args.nproc_per_node} offline=true",
         )
+        try:
+            validate_preflight(
+                config,
+                paths,
+                python_bin=args.python_bin,
+                nproc_per_node=args.nproc_per_node,
+                train_input=args.train_input,
+                eval_input=args.eval_input,
+                dry_run=args.dry_run,
+            )
+        except Exception as exc:
+            console.emit("ERROR", f"PREFLIGHT FAILED {_short_line(str(exc))}")
+            raise
+        console.emit("INFO", "PREFLIGHT PASS")
         run_id = _safe_run_id(config.get("run_id", source_run_id))
+        model_path = str(_mapping(config, "model").get("target_model_path", ""))
+        model_config = _mapping(config, "model")
+        data_config = _mapping(config, "data")
+        console.emit(
+            "INFO",
+            "RUN START "
+            f"run_id={run_id} model={Path(model_path).name or 'unknown'} "
+            f"dtype={model_config.get('torch_dtype', 'unknown')} "
+            f"generate_backend={args.generation_backend} "
+            f"cache_backend={args.capture_backend}/{args.capture_method} "
+            f"max_length={data_config.get('max_length', 'unknown')} "
+            f"workers={args.nproc_per_node} "
+            f"train_input={args.train_input.name} eval_input={args.eval_input.name} "
+            f"output_root={paths.output_root}",
+        )
         commands = build_commands(
             config,
             paths,
@@ -1249,6 +1651,8 @@ def main(argv: list[str] | None = None) -> int:
         validators: dict[str, Callable[[], None]] = {
             "generate_train": lambda: _valid_jsonl(paths.teacher_train),
             "generate_eval": lambda: _valid_jsonl(paths.teacher_eval),
+            "validate_teacher_train": lambda: _valid_report(paths.teacher_train_report),
+            "validate_teacher_eval": lambda: _valid_report(paths.teacher_eval_report),
             "cache_train": lambda: _valid_features(paths.features_train),
             "cache_eval": lambda: _valid_features(paths.features_eval),
             "train": lambda: _valid_checkpoint(paths.checkpoints, run_id),
@@ -1264,29 +1668,82 @@ def main(argv: list[str] | None = None) -> int:
                         generation_ready = False
                         break
                 if not generation_ready:
-                    managed_servers = _start_managed_generation_servers(
-                        args,
-                        config,
-                        paths,
-                        env,
-                    )
+                    try:
+                        managed_servers = _start_managed_generation_servers(
+                            args,
+                            config,
+                            paths,
+                            env,
+                            console,
+                        )
+                    except Exception as exc:
+                        console.emit("ERROR", f"SERVER START FAILED {_short_line(str(exc))}")
+                        raise
             for name, command, artifact in commands:
+                stage_command = list(command)
+                metadata = f"artifact={artifact}"
+                progress_total: int | None = None
+                if name.startswith(("generate_", "validate_teacher_", "cache_")):
+                    input_path = Path(stage_command[stage_command.index("--input") + 1])
+                    if input_path.is_file():
+                        progress_total = _count_nonblank_jsonl(input_path)
+                        stage_command.extend(["--progress-total", str(progress_total)])
+                    else:
+                        progress_total = 0
+                    split = name.rsplit("_", 1)[-1]
+                    if name.startswith("generate_"):
+                        backend = args.generation_backend
+                        workers = (
+                            len(args.generation_server_urls)
+                            if backend != "hf"
+                            else args.nproc_per_node
+                        )
+                        metadata = (
+                            f"dataset={split} model={Path(model_path).name} backend={backend} "
+                            f"records={progress_total} workers={workers} "
+                            f"max_length={data_config.get('max_length', 'unknown')} "
+                            f"source_tokens={data_config.get('max_source_tokens', 'unknown')} "
+                            f"summary_tokens={data_config.get('max_summary_tokens', 'unknown')} "
+                            f"dtype={model_config.get('torch_dtype', 'unknown')}"
+                        )
+                    elif name.startswith("cache_"):
+                        metadata = (
+                            f"dataset={split} model={Path(model_path).name} "
+                            f"backend={args.capture_backend}/{args.capture_method} "
+                            f"records={progress_total} workers={args.nproc_per_node} "
+                            f"max_length={data_config.get('max_length', 'unknown')} "
+                            f"dtype={model_config.get('torch_dtype', 'unknown')} "
+                            f"layers={model_config.get('target_layer_ids') or model_config.get('num_draft_layers')} "
+                            f"parity_samples={args.parity_samples}"
+                        )
+                    else:
+                        metadata = (
+                            f"dataset={split} gate=teacher_quality records={progress_total} "
+                            f"max_anomaly_rate={args.max_anomaly_rate} "
+                            f"min_rouge1={args.min_teacher_rouge1} "
+                            f"filter={args.filter_anomalies} warn_only={args.validate_warn_only}"
+                        )
+                elif name == "train":
+                    metadata = f"model={Path(model_path).name} workers={args.nproc_per_node}"
                 run_stage(
                     name,
-                    command,
+                    stage_command,
                     log_path=paths.log_dir / f"{name}.log",
                     marker_path=paths.state_dir / f"{name}.json",
                     artifact=artifact,
                     validator=validators[name],
                     environment=env,
                     dry_run=args.dry_run,
+                    console=console,
+                    metadata=metadata,
+                    progress_total=progress_total,
                 )
                 if name == "generate_eval" and managed_servers is not None:
                     _stop_managed_generation_servers(managed_servers)
                     managed_servers = None
         finally:
             _stop_managed_generation_servers(managed_servers)
-        print(f"ALL DONE: {paths.output_root}")
+        console.emit("INFO", f"ALL DONE output_root={paths.output_root}")
     return 0
 
 

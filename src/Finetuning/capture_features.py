@@ -48,6 +48,7 @@ from .offline_sglang_capture import (
     initialize_specforge_distributed,
     sglang_capture_available,
 )
+from .run_logging import ProgressReporter, count_jsonl_records
 
 
 def _as_dtype(value: torch.dtype | str) -> torch.dtype:
@@ -112,6 +113,8 @@ def _validate_feature_output_dir(destination: Path) -> None:
             raise ValueError(
                 "refusing to use feature output containing a symlink: " f"{path}"
             )
+        if path.is_dir() and (path.name.startswith(".staging") or path.name == ".generations" or path.name.startswith("generation-")):
+            continue
         if path.is_file() and path.name != FEATURE_MANIFEST_FILENAME and not path.name.endswith(allowed_suffixes):
             raise ValueError(
                 "refusing to replace feature output containing unrelated file: "
@@ -129,8 +132,13 @@ def _publish_feature_generation(
     generations = destination / ".generations"
     generations.mkdir(parents=True, exist_ok=True)
     generation_name = staging.name.lstrip(".")
-    generation_dir = generations / f"generation-{generation_name}"
-    os.replace(staging, generation_dir)
+    generation_dir = generations / f"generation-{generation_name}-{int(time.time())}"
+    if generation_dir.exists():
+        shutil.rmtree(generation_dir)
+    generation_dir.mkdir(parents=True, exist_ok=True)
+    for file_path in staging.glob("feature_*.pt"):
+        shutil.move(str(file_path), str(generation_dir / file_path.name))
+    shutil.rmtree(staging, ignore_errors=True)
     manifest.generation_dir = generation_dir.relative_to(destination).as_posix()
     # Readers either retain the old manifest/generation or observe this new
     # manifest after its complete generation has already been renamed in.
@@ -542,10 +550,18 @@ def capture_dataset(
         capture_metadata=capture_metadata,
     )
 
-    staging = Path(
-        tempfile.mkdtemp(prefix=f".{destination.name}.new-", dir=destination.parent)
-    )
-    captured = 0
+    staging = destination.parent / f".staging_{destination.name}"
+    staging.mkdir(parents=True, exist_ok=True)
+    existing_indices: set[int] = set()
+    for pt_path in staging.glob("feature_*.pt"):
+        try:
+            if pt_path.stat().st_size > 0:
+                name_part = pt_path.stem.split("_", 1)[1]
+                existing_indices.add(int(name_part))
+        except (IndexError, ValueError, OSError):
+            continue
+
+    captured = len(existing_indices)
     processed_tokens = 0
     oom_retries = 0
     started = time.perf_counter()
@@ -712,6 +728,8 @@ def capture_dataset(
             examples,
         )
         for source_index, example in stream:
+            if source_index in existing_indices:
+                continue
             input_ids, loss_mask = prepare_example(example)
             window.append(
                 PreparedExample(
@@ -759,8 +777,7 @@ def capture_dataset(
             )
         return manifest
     finally:
-        if staging.exists():
-            shutil.rmtree(staging)
+        pass
 
 
 def _layer_ids_argument(value: str) -> list[int]:
@@ -814,6 +831,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--chat-template", default="qwen3")
     parser.add_argument("--prompt-template", default=DEFAULT_SUMMARY_PROMPT_TEMPLATE)
     parser.add_argument("--max-samples", type=int)
+    parser.add_argument(
+        "--progress-total",
+        type=int,
+        help="known input record count supplied by the run launcher",
+    )
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -910,6 +932,21 @@ def main(argv: list[str] | None = None) -> None:
             requested_max_total_tokens=args.sglang_max_total_tokens,
         )
         capture_stats: dict[str, Any] = {}
+        source_stats = {"records": 0, "unrenderable": 0}
+        progress = ProgressReporter(
+            f"cache:{Path(args.input).stem}",
+            args.progress_total
+            if args.progress_total is not None
+            else count_jsonl_records(args.input, max_records=args.max_samples),
+            enabled=context.is_main_process,
+        )
+
+        def record_source_progress(rendered: bool) -> None:
+            source_stats["records"] += 1
+            if not rendered:
+                source_stats["unrenderable"] += 1
+            progress.update()
+
         parity_thresholds = ParityThresholds(
             max_abs_error=args.parity_max_abs_error,
             mean_abs_error=args.parity_mean_abs_error,
@@ -923,43 +960,49 @@ def main(argv: list[str] | None = None) -> None:
             "max_summary_tokens": args.max_summary_tokens,
             "prompt_template": args.prompt_template,
         }
-        manifest = capture_dataset(
-            target_model_path=args.target_model_path,
-            prepared_examples=iter_summary_examples(
-                args.input,
-                tokenizer,
+        capture_succeeded = False
+        try:
+            manifest = capture_dataset(
+                target_model_path=args.target_model_path,
+                prepared_examples=iter_summary_examples(
+                    args.input,
+                    tokenizer,
+                    max_length=args.max_length,
+                    chat_template=args.chat_template,
+                    max_samples=args.max_samples,
+                    max_source_tokens=args.max_source_tokens,
+                    max_summary_tokens=args.max_summary_tokens,
+                    prompt_template=args.prompt_template,
+                    progress_callback=record_source_progress,
+                ),
+                output_dir=ranked_path(args.output, context.rank, context.world_size),
+                target_layer_ids=args.target_layer_ids,
+                num_draft_layers=args.num_draft_layers,
+                trust_remote_code=args.trust_remote_code,
                 max_length=args.max_length,
-                chat_template=args.chat_template,
-                max_samples=args.max_samples,
-                max_source_tokens=args.max_source_tokens,
-                max_summary_tokens=args.max_summary_tokens,
-                prompt_template=args.prompt_template,
-            ),
-            output_dir=ranked_path(args.output, context.rank, context.world_size),
-            target_layer_ids=args.target_layer_ids,
-            num_draft_layers=args.num_draft_layers,
-            trust_remote_code=args.trust_remote_code,
-            max_length=args.max_length,
-            device=device,
-            dtype=args.torch_dtype,
-            tokenizer_id=str(Path(args.target_model_path)),
-            prompt_contract=prompt_contract,
-            rank=context.rank,
-            world_size=context.world_size,
-            allow_empty=context.is_distributed,
-            adaptive_settings=adaptive_settings,
-            stats=capture_stats,
-            capture_backend=args.capture_backend,
-            capture_method=args.capture_method,
-            sglang_attention_backend=args.sglang_attention_backend,
-            sglang_mem_fraction_static=args.sglang_mem_fraction_static,
-            sglang_max_running_requests=sglang_max_running_requests,
-            sglang_max_total_tokens=sglang_max_total_tokens,
-            sglang_context_length=args.sglang_context_length,
-            sglang_disable_radix_cache=args.sglang_disable_radix_cache,
-            parity_samples=args.parity_samples,
-            parity_thresholds=parity_thresholds,
-        )
+                device=device,
+                dtype=args.torch_dtype,
+                tokenizer_id=str(Path(args.target_model_path)),
+                prompt_contract=prompt_contract,
+                rank=context.rank,
+                world_size=context.world_size,
+                allow_empty=context.is_distributed,
+                adaptive_settings=adaptive_settings,
+                stats=capture_stats,
+                capture_backend=args.capture_backend,
+                capture_method=args.capture_method,
+                sglang_attention_backend=args.sglang_attention_backend,
+                sglang_mem_fraction_static=args.sglang_mem_fraction_static,
+                sglang_max_running_requests=sglang_max_running_requests,
+                sglang_max_total_tokens=sglang_max_total_tokens,
+                sglang_context_length=args.sglang_context_length,
+                sglang_disable_radix_cache=args.sglang_disable_radix_cache,
+                parity_samples=args.parity_samples,
+                parity_thresholds=parity_thresholds,
+            )
+            capture_succeeded = True
+        finally:
+            progress.close(complete=capture_succeeded)
         totals = context.all_reduce_sum(
             torch.tensor(
                 [
@@ -986,8 +1029,18 @@ def main(argv: list[str] | None = None) -> None:
             capture_stats["captured"] = int(totals[0])
             capture_stats["tokens"] = int(totals[1])
             capture_stats["oom_retries"] = int(totals[2])
-            output = manifest.to_dict()
-            output["stats"] = capture_stats
+            capture_stats["source_records"] = source_stats["records"]
+            capture_stats["unrenderable_records"] = source_stats["unrenderable"]
+            output = {
+                "model": Path(manifest.model_id).name,
+                "layer_ids": manifest.layer_ids,
+                "feature_width": manifest.feature_width,
+                "hidden_states_dtype": manifest.hidden_states_dtype,
+                "capture_backend": manifest.capture_backend,
+                "capture_method": manifest.capture_method,
+                "generation_dir": manifest.generation_dir,
+                "stats": capture_stats,
+            }
             print(json.dumps(output, ensure_ascii=False, sort_keys=True))
     finally:
         cleanup_distributed(context)

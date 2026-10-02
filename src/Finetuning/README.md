@@ -100,7 +100,15 @@ PYTHONPATH=src python3 -m Finetuning.generate_targets \
   --generation-server-url http://127.0.0.1:30001/v1 \
   --generation-model qwen3
 
-# 2. Capture hidden state một lần. --num-draft-layers=5 sẽ chọn cùng rule
+# 2. Kiểm định chất lượng teacher trajectory trước khi cache (Quality & Anomaly Gate).
+#    Kiểm tra ROUGE, phát hiện lặp từ vô tận, độ dài bất thường, rỗng, mojibake.
+PYTHONPATH=src python3 -m Finetuning.validate_targets \
+  --input /work/teacher_train.jsonl \
+  --report-path /work/teacher_train_report.json \
+  --max-anomaly-rate 0.05 \
+  --filter-anomalies
+
+# 3. Capture hidden state một lần. --num-draft-layers=5 sẽ chọn cùng rule
 #    target layer với config khi target_layer_ids: null.
 PYTHONPATH=src python3 -m Finetuning.capture_features \
   --input /work/teacher_train.jsonl \
@@ -112,7 +120,7 @@ PYTHONPATH=src python3 -m Finetuning.capture_features \
   --adaptive-batch --target-memory-fraction 0.90 \
   --adaptive-max-batch-size 256 --bucket-window 512
 
-# Lặp lại stage 1–2 cho validation và thay các path trong config.
+# Lặp lại các stage cho validation và thay các path trong config.
 PYTHONPATH=src python3 -m Finetuning.run_train \
   --config src/Finetuning/configs/qwen3_4b.yaml --device cuda
 ```
@@ -126,7 +134,7 @@ sau lỗi, nhưng phải dùng thư mục output chỉ dành cho feature store.
 
 ## Chạy một job dài end-to-end trên server B200
 
-Để chạy tự động cả regenerate train/eval, capture feature train/eval và DFlash
+Để chạy tự động cả regenerate train/eval, kiểm định chất lượng trajectory, capture feature train/eval và DFlash
 training, dùng launcher ở repo root:
 
 ```bash
@@ -136,7 +144,9 @@ bash scripts/run_finetuning_b200.sh \
   --eval-input /server/data/vietnamese_eval.jsonl \
   --target-model-path /server/models/Qwen3-4B \
   --output-root /server/work/dflash-qwen3-4b \
-  --nproc-per-node 8
+  --nproc-per-node 8 \
+  --filter-anomalies \
+  --max-anomaly-rate 0.05
 ```
 
 Nếu bỏ `--nproc-per-node`, launcher tự lấy số GPU từ `nvidia-smi -L`. Có thể
@@ -145,7 +155,7 @@ chọn interpreter khác bằng `FINETUNING_PYTHON=/path/to/python`.
 Launcher chạy theo thứ tự cố định:
 
 ```text
-generate_train → generate_eval → cache_train → cache_eval → train
+generate_train → generate_eval → validate_teacher_train → validate_teacher_eval → cache_train → cache_eval → train
 ```
 
 Mỗi stage có log riêng trong `output-root/logs/` và marker trong
@@ -160,9 +170,10 @@ Artifact sau khi chạy:
 ```text
 output-root/
 ├── teacher/{train,eval}.jsonl
+├── teacher/{train,eval}_validation_report.json
 ├── features/{train,eval}/manifest.json
 ├── checkpoints/<run-id>-stepN/COMPLETE
-├── logs/{generate_*,cache_*,train}.log
+├── logs/{generate_*,validate_*,cache_*,train}.log
 └── run_config.yaml
 ```
 

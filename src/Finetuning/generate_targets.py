@@ -36,6 +36,7 @@ from .distributed import (
     merge_ranked_jsonl,
     ranked_path,
 )
+from .run_logging import ProgressReporter, count_jsonl_records
 
 
 def _generated_ids(output: Any, prompt_length: int) -> list[int]:
@@ -131,6 +132,33 @@ def _trim_at_eos(token_ids: list[int], eos_token_id: int | None) -> list[int]:
         return token_ids
 
 
+def _load_completed_records(path: Path) -> tuple[set[str], set[int], int]:
+    """Load already written record IDs and internal source indices from a partial/completed JSONL."""
+    completed_ids: set[str] = set()
+    completed_indices: set[int] = set()
+    valid_count = 0
+    if not path.is_file():
+        return completed_ids, completed_indices, 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line_str = line.strip()
+            if not line_str:
+                continue
+            try:
+                payload = json.loads(line_str)
+            except json.JSONDecodeError:
+                break
+            if isinstance(payload, dict):
+                rec_id = payload.get("id")
+                if rec_id is not None:
+                    completed_ids.add(str(rec_id))
+                src_idx = payload.get("_source_index")
+                if isinstance(src_idx, int):
+                    completed_indices.add(src_idx)
+                valid_count += 1
+    return completed_ids, completed_indices, valid_count
+
+
 def generate_teacher_jsonl(
     input_path: str | Path,
     output_path: str | Path,
@@ -148,17 +176,19 @@ def generate_teacher_jsonl(
     world_size: int = 1,
     allow_empty: bool = False,
     adaptive_settings: AdaptiveInferenceSettings | None = None,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, int]:
     """Write target-generated summaries while retaining human references."""
 
     destination = Path(output_path)
-    if destination.exists():
-        raise FileExistsError(f"teacher trajectory output already exists: {destination}")
+    part_path = destination.with_name(f"{destination.name}.part")
+    if destination.is_file():
+        _comp_ids, _comp_indices, existing_count = _load_completed_records(destination)
+        if existing_count > 0 and not allow_empty:
+            return {"written": existing_count, "rejected": 0, "resumed": existing_count}
+
     destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
-    )
-    written = 0
+    completed_ids, completed_indices, written = _load_completed_records(part_path)
     rejected = 0
     processed_tokens = 0
     oom_retries = 0
@@ -174,80 +204,81 @@ def generate_teacher_jsonl(
     current_batch_size = settings.min_batch_size
     selection = None
     observed_peak_reserved = 0
+    handle = part_path.open("a", encoding="utf-8")
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            window: list[PreparedExample] = []
+        window: list[PreparedExample] = []
 
-            def flush_window(items: list[PreparedExample]) -> None:
-                nonlocal written, processed_tokens, oom_retries
-                nonlocal current_batch_size, selection, observed_peak_reserved
-                if not items:
-                    return
-                if selection is None:
-                    probe_items = sorted(items, key=lambda item: (-item.length, item.index))
+        def flush_window(items: list[PreparedExample]) -> None:
+            nonlocal written, rejected, processed_tokens, oom_retries
+            nonlocal current_batch_size, selection, observed_peak_reserved
+            if not items:
+                return
+            if selection is None:
+                probe_items = sorted(items, key=lambda item: (-item.length, item.index))
 
-                    def probe(batch_size: int) -> None:
-                        selected = probe_items[:batch_size]
-                        for _ in range(settings.probe_batches):
-                            _generate_batch(
-                                selected,
-                                tokenizer=tokenizer,
-                                target=target,
-                                max_summary_tokens=max_summary_tokens,
-                                device=device_obj,
-                            )
-                        return None
-
-                    selection = select_cuda_batch_size(
-                        probe,
-                        settings=settings,
-                        device=device_obj,
-                        maximum=min(settings.max_batch_size, len(probe_items)),
-                    )
-                    current_batch_size = selection.batch_size
-                    if device_obj.type == "cuda" and torch.cuda.is_available():
-                        torch.cuda.reset_peak_memory_stats(device_obj)
-                results: dict[int, list[int]] = {}
-                for batch in length_bucket_batches(
-                    items,
-                    batch_size=current_batch_size,
-                    max_tokens=settings.max_tokens_per_batch,
-                    window=max(settings.bucket_window, current_batch_size),
-                ):
-                    offset = 0
-                    while offset < len(batch):
-                        subset = batch[offset : offset + current_batch_size]
-
-                        def work(size: int) -> list[list[int]]:
-                            return _generate_batch(
-                                subset[:size],
-                                tokenizer=tokenizer,
-                                target=target,
-                                max_summary_tokens=max_summary_tokens,
-                                device=device_obj,
-                            )
-
-                        result = run_with_oom_backoff(
-                            work,
-                            initial_batch_size=len(subset),
-                            minimum_batch_size=min(settings.min_batch_size, len(subset)),
-                        ) if settings.oom_backoff else BackoffResult(
-                            work(len(subset)), len(subset), 0
+                def probe(batch_size: int) -> None:
+                    selected = probe_items[:batch_size]
+                    for _ in range(settings.probe_batches):
+                        _generate_batch(
+                            selected,
+                            tokenizer=tokenizer,
+                            target=target,
+                            max_summary_tokens=max_summary_tokens,
+                            device=device_obj,
                         )
-                        for example, token_ids in zip(
-                            subset[: result.batch_size], result.value, strict=True
-                        ):
-                            results[example.index] = token_ids
-                            processed_tokens += example.length
-                        oom_retries += result.oom_retries
-                        if device_obj.type == "cuda" and torch.cuda.is_available():
-                            observed_peak_reserved = max(
-                                observed_peak_reserved,
-                                int(torch.cuda.max_memory_reserved(device_obj)),
-                            )
-                        current_batch_size = min(current_batch_size, result.batch_size)
-                        offset += result.batch_size
-                for example in sorted(items, key=lambda item: item.index):
+                    return None
+
+                selection = select_cuda_batch_size(
+                    probe,
+                    settings=settings,
+                    device=device_obj,
+                    maximum=min(settings.max_batch_size, len(probe_items)),
+                )
+                current_batch_size = selection.batch_size
+                if device_obj.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats(device_obj)
+            results: dict[int, list[int]] = {}
+            for batch in length_bucket_batches(
+                items,
+                batch_size=current_batch_size,
+                max_tokens=settings.max_tokens_per_batch,
+                window=max(settings.bucket_window, current_batch_size),
+            ):
+                offset = 0
+                while offset < len(batch):
+                    subset = batch[offset : offset + current_batch_size]
+
+                    def work(size: int) -> list[list[int]]:
+                        return _generate_batch(
+                            subset[:size],
+                            tokenizer=tokenizer,
+                            target=target,
+                            max_summary_tokens=max_summary_tokens,
+                            device=device_obj,
+                        )
+
+                    result = run_with_oom_backoff(
+                        work,
+                        initial_batch_size=len(subset),
+                        minimum_batch_size=min(settings.min_batch_size, len(subset)),
+                    ) if settings.oom_backoff else BackoffResult(
+                        work(len(subset)), len(subset), 0
+                    )
+                    for example, token_ids in zip(
+                        subset[: result.batch_size], result.value, strict=True
+                    ):
+                        results[example.index] = token_ids
+                        processed_tokens += example.length
+                    oom_retries += result.oom_retries
+                    if device_obj.type == "cuda" and torch.cuda.is_available():
+                        observed_peak_reserved = max(
+                            observed_peak_reserved,
+                            int(torch.cuda.max_memory_reserved(device_obj)),
+                        )
+                    current_batch_size = min(current_batch_size, result.batch_size)
+                    offset += result.batch_size
+            for example in sorted(items, key=lambda item: item.index):
+                try:
                     token_ids = _trim_at_eos(
                         results[example.index],
                         getattr(tokenizer, "eos_token_id", None),
@@ -276,40 +307,49 @@ def generate_teacher_jsonl(
                     if world_size > 1:
                         payload["_source_index"] = example.index
                     handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+                    handle.flush()
                     written += 1
-
-            for source_index, record in enumerate(iter_summary_jsonl(input_path)):
-                if source_index % world_size != rank:
-                    continue
-                try:
-                    prompt = render_summary_prompt(
-                        record,
-                        tokenizer,
-                        max_length,
-                        max_source_tokens=max_source_tokens,
-                        max_summary_tokens=max_summary_tokens,
-                        chat_template=chat_template,
-                        prompt_template=prompt_template,
-                    )
-                    window.append(
-                        PreparedExample(
-                            source_index,
-                            int(prompt.numel()) + max_summary_tokens,
-                            {"record": record, "prompt": prompt},
-                        )
-                    )
-                    if len(window) >= max(settings.bucket_window, settings.min_batch_size):
-                        flush_window(window)
-                        window = []
-                except (TypeError, ValueError) as exc:
+                except Exception:
                     rejected += 1
                     continue
-            flush_window(window)
+
+        for source_index, record in enumerate(iter_summary_jsonl(input_path)):
+            if progress is not None:
+                progress.update()
+            if source_index % world_size != rank:
+                continue
+            if record.id in completed_ids or source_index in completed_indices:
+                continue
+            try:
+                prompt = render_summary_prompt(
+                    record,
+                    tokenizer,
+                    max_length,
+                    max_source_tokens=max_source_tokens,
+                    max_summary_tokens=max_summary_tokens,
+                    chat_template=chat_template,
+                    prompt_template=prompt_template,
+                )
+                window.append(
+                    PreparedExample(
+                        source_index,
+                        int(prompt.numel()) + max_summary_tokens,
+                        {"record": record, "prompt": prompt},
+                    )
+                )
+                if len(window) >= max(settings.bucket_window, settings.min_batch_size):
+                    flush_window(window)
+                    window = []
+            except (TypeError, ValueError, RuntimeError):
+                rejected += 1
+                continue
+        flush_window(window)
+        handle.close()
         if written == 0 and not allow_empty:
             raise ValueError("target generation produced no usable summaries")
-        os.replace(temporary_name, destination)
+        os.replace(part_path, destination)
     except Exception:
-        Path(temporary_name).unlink(missing_ok=True)
+        handle.close()
         raise
     stats: dict[str, int] = {
         "written": written,
@@ -359,6 +399,7 @@ def generate_teacher_jsonl_server(
     prompt_template: str = DEFAULT_SUMMARY_PROMPT_TEMPLATE,
     window_size: int = 0,
     allow_empty: bool = False,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, int]:
     """Generate teacher summaries through a SGLang/vLLM server pool.
 
@@ -370,95 +411,107 @@ def generate_teacher_jsonl_server(
     if generation_backend not in {"sglang", "vllm"}:
         raise ValueError("server generation backend must be sglang or vllm")
     destination = Path(output_path)
-    if destination.exists():
-        raise FileExistsError(f"teacher trajectory output already exists: {destination}")
+    part_path = destination.with_suffix(".part")
+    if destination.is_file():
+        _comp_ids, _comp_indices, existing_count = _load_completed_records(destination)
+        if existing_count > 0 and not allow_empty:
+            return {"written": existing_count, "rejected": 0, "resumed": existing_count}
+
     destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
-    )
+    completed_ids, completed_indices, written = _load_completed_records(part_path)
     window_limit = window_size or max(1, int(getattr(server_pool, "max_in_flight", 1)) * 2)
     if window_limit <= 0:
         raise ValueError("window_size must be positive")
-    written = 0
     rejected = 0
     requests_sent = 0
     started = time.perf_counter()
+    handle = part_path.open("a", encoding="utf-8")
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            window: list[tuple[int, Any, str]] = []
+        window: list[tuple[int, Any, str]] = []
 
-            def flush_window(items: list[tuple[int, Any, str]]) -> None:
-                nonlocal written, rejected, requests_sent
-                if not items:
-                    return
-                requests = [
-                    {
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": max_summary_tokens,
-                        "temperature": 0.0,
-                        "top_p": 1.0,
-                        "stream": False,
-                    }
-                    for _source_index, _record, prompt in items
-                ]
-                requests_sent += len(requests)
+        def flush_window(items: list[tuple[int, Any, str]]) -> None:
+            nonlocal written, rejected, requests_sent
+            if not items:
+                return
+            requests = [
+                {
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_summary_tokens,
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "stream": False,
+                }
+                for _source_index, _record, prompt in items
+            ]
+            requests_sent += len(requests)
+            try:
                 summaries = server_pool.generate_many(requests)
-                if len(summaries) != len(items):
-                    raise ValueError(
-                        "generation server pool returned a different number of summaries"
-                    )
-                for (_source_index, record, _prompt), summary in zip(
-                    items, summaries, strict=True
-                ):
-                    cleaned = str(summary).strip()
-                    if not cleaned:
-                        rejected += 1
-                        continue
-                    payload = {
-                        "id": record.id,
-                        "document": record.document,
-                        "summary": cleaned,
-                        "reference_summary": record.summary,
-                        **dict(record.metadata),
-                        "teacher": {
-                            "target_model_path": str(target_model_path),
-                            "generation_backend": generation_backend,
-                            "server_model": server_model,
-                            "chat_template": chat_template,
-                            "prompt_template": prompt_template,
-                            "do_sample": False,
-                            "max_length": max_length,
-                            "max_source_tokens": max_source_tokens,
-                            "max_summary_tokens": max_summary_tokens,
-                        },
-                    }
-                    handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-                    written += 1
-
-            for source_index, record in enumerate(iter_summary_jsonl(input_path)):
-                try:
-                    prompt = render_summary_user_prompt_budgeted(
-                        record,
-                        tokenizer,
-                        max_length,
-                        max_source_tokens=max_source_tokens,
-                        max_summary_tokens=max_summary_tokens,
-                        chat_template=chat_template,
-                        prompt_template=prompt_template,
-                    )
-                except (TypeError, ValueError):
+            except Exception:
+                # If batch failed, fallback to individual generation to isolate bad samples
+                summaries = []
+                for req in requests:
+                    try:
+                        summaries.append(server_pool._generate_one(0, req))
+                    except Exception:
+                        summaries.append("")
+            for (_source_index, record, _prompt), summary in zip(
+                items, summaries, strict=True
+            ):
+                cleaned = str(summary).strip()
+                if not cleaned:
                     rejected += 1
                     continue
-                window.append((source_index, record, prompt))
-                if len(window) >= window_limit:
-                    flush_window(window)
-                    window = []
-            flush_window(window)
+                payload = {
+                    "id": record.id,
+                    "document": record.document,
+                    "summary": cleaned,
+                    "reference_summary": record.summary,
+                    **dict(record.metadata),
+                    "teacher": {
+                        "target_model_path": str(target_model_path),
+                        "generation_backend": generation_backend,
+                        "server_model": server_model,
+                        "chat_template": chat_template,
+                        "prompt_template": prompt_template,
+                        "do_sample": False,
+                        "max_length": max_length,
+                        "max_source_tokens": max_source_tokens,
+                        "max_summary_tokens": max_summary_tokens,
+                    },
+                }
+                handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.flush()
+                written += 1
+
+        for source_index, record in enumerate(iter_summary_jsonl(input_path)):
+            if progress is not None:
+                progress.update()
+            if record.id in completed_ids or source_index in completed_indices:
+                continue
+            try:
+                prompt = render_summary_user_prompt_budgeted(
+                    record,
+                    tokenizer,
+                    max_length,
+                    max_source_tokens=max_source_tokens,
+                    max_summary_tokens=max_summary_tokens,
+                    chat_template=chat_template,
+                    prompt_template=prompt_template,
+                )
+            except (TypeError, ValueError, RuntimeError):
+                rejected += 1
+                continue
+            window.append((source_index, record, prompt))
+            if len(window) >= window_limit:
+                flush_window(window)
+                window = []
+        flush_window(window)
+        handle.close()
         if written == 0 and not allow_empty:
             raise ValueError("target server generation produced no usable summaries")
-        os.replace(temporary_name, destination)
+        os.replace(part_path, destination)
     except Exception:
-        Path(temporary_name).unlink(missing_ok=True)
+        handle.close()
         raise
     elapsed = max(time.perf_counter() - started, 1e-9)
     return {
@@ -508,6 +561,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--generation-retries", type=int, default=2)
     parser.add_argument("--generation-backoff-seconds", type=float, default=0.25)
     parser.add_argument("--generation-window-size", type=int, default=0)
+    parser.add_argument(
+        "--progress-total",
+        type=int,
+        help="known input record count supplied by the run launcher",
+    )
     add_adaptive_cli_args(parser)
     args = parser.parse_args(argv)
     if args.max_source_tokens < 0 or args.max_summary_tokens < 1:
@@ -542,21 +600,33 @@ def main(argv: list[str] | None = None) -> None:
             max_retries=args.generation_retries,
             retry_backoff_seconds=args.generation_backoff_seconds,
         )
-        stats = generate_teacher_jsonl_server(
-            args.input,
-            args.output,
-            tokenizer=tokenizer,
-            server_pool=server_pool,
-            target_model_path=args.target_model_path,
-            generation_backend=args.generation_backend,
-            server_model=server_model,
-            max_length=args.max_length,
-            max_source_tokens=args.max_source_tokens,
-            max_summary_tokens=args.max_summary_tokens,
-            chat_template=args.chat_template,
-            prompt_template=args.prompt_template,
-            window_size=args.generation_window_size,
+        progress = ProgressReporter(
+            f"generate:{Path(args.input).stem}",
+            args.progress_total
+            if args.progress_total is not None
+            else count_jsonl_records(args.input),
         )
+        succeeded = False
+        try:
+            stats = generate_teacher_jsonl_server(
+                args.input,
+                args.output,
+                tokenizer=tokenizer,
+                server_pool=server_pool,
+                target_model_path=args.target_model_path,
+                generation_backend=args.generation_backend,
+                server_model=server_model,
+                max_length=args.max_length,
+                max_source_tokens=args.max_source_tokens,
+                max_summary_tokens=args.max_summary_tokens,
+                chat_template=args.chat_template,
+                prompt_template=args.prompt_template,
+                window_size=args.generation_window_size,
+                progress=progress,
+            )
+            succeeded = True
+        finally:
+            progress.close(complete=succeeded)
         print(json.dumps(stats, ensure_ascii=False, sort_keys=True))
         return
     context = initialize_distributed(args.device)
@@ -582,23 +652,36 @@ def main(argv: list[str] | None = None) -> None:
         ).to(device).eval()
         adaptive_settings = adaptive_settings_from_args(args, device)
         shard_output = ranked_path(args.output, context.rank, context.world_size)
-        stats = generate_teacher_jsonl(
-            args.input,
-            shard_output,
-            tokenizer=tokenizer,
-            target=target,
-            target_model_path=args.target_model_path,
-            max_length=args.max_length,
-            max_source_tokens=args.max_source_tokens,
-            max_summary_tokens=args.max_summary_tokens,
-            chat_template=args.chat_template,
-            prompt_template=args.prompt_template,
-            device=device,
-            rank=context.rank,
-            world_size=context.world_size,
-            allow_empty=context.is_distributed,
-            adaptive_settings=adaptive_settings,
+        progress = ProgressReporter(
+            f"generate:{Path(args.input).stem}",
+            args.progress_total
+            if args.progress_total is not None
+            else count_jsonl_records(args.input),
+            enabled=context.is_main_process,
         )
+        succeeded = False
+        try:
+            stats = generate_teacher_jsonl(
+                args.input,
+                shard_output,
+                tokenizer=tokenizer,
+                target=target,
+                target_model_path=args.target_model_path,
+                max_length=args.max_length,
+                max_source_tokens=args.max_source_tokens,
+                max_summary_tokens=args.max_summary_tokens,
+                chat_template=args.chat_template,
+                prompt_template=args.prompt_template,
+                device=device,
+                rank=context.rank,
+                world_size=context.world_size,
+                allow_empty=context.is_distributed,
+                adaptive_settings=adaptive_settings,
+                progress=progress,
+            )
+            succeeded = True
+        finally:
+            progress.close(complete=succeeded)
         totals = context.all_reduce_sum(
             torch.tensor(
                 [

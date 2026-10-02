@@ -20,7 +20,7 @@ import tempfile
 import unicodedata
 from collections import Counter
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Callable
 
 from .data import SummaryRecord, iter_summary_jsonl, render_summary_example
 
@@ -515,6 +515,7 @@ def iter_summary_examples(
     max_source_tokens: int | None = None,
     max_summary_tokens: int | None = None,
     prompt_template: str | None = None,
+    progress_callback: Callable[[bool], None] | None = None,
 ):
     """Render JSONL records lazily for capture without materializing the corpus.
 
@@ -541,8 +542,12 @@ def iter_summary_examples(
                 **kwargs,
             )
         except ValueError:
+            if progress_callback is not None:
+                progress_callback(False)
             continue
         yield {**rendered, "id": record.id}
+        if progress_callback is not None:
+            progress_callback(True)
 
 
 def prepare_summary_examples(
