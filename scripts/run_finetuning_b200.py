@@ -293,14 +293,7 @@ def materialize_config(
             )
 
     serialized = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
-    if destination.exists() and any(paths.state_dir.glob("*.json")):
-        existing = _load_yaml(destination)
-        if existing != payload:
-            raise LauncherError(
-                f"resolved config differs from existing resumable run: {destination}"
-            )
-    else:
-        _atomic_write_text(destination, serialized)
+    _atomic_write_text(destination, serialized)
     return payload
 
 
@@ -1290,9 +1283,6 @@ def _write_run_manifest(
         "train_input",
         "eval_input",
         "target_model_path",
-        "capture_backend",
-        "capture_method",
-        "generation_backend",
     }
     if paths.run_manifest.exists():
         try:
