@@ -24,3 +24,12 @@ Máy local T4 chỉ dùng profile dependency tối thiểu và venv mô phỏng 
 /home/tuantb/fast_infer_text_sum/.venv/bin/python \
   scripts/check_shared_env.py --profile minimal
 ```
+
+## Tài liệu & Pipeline Thực nghiệm
+
+- **Pipeline Benchmark Chính (vLLM Đồng Bộ)**: Chi tiết xem tại [`src/Benchmark/README.md`](file:///home/tuantb/fast_infer_text_sum_Viet/src/Benchmark/README.md) hoặc [`docs/baselines/vllm_unified.md`](file:///home/tuantb/fast_infer_text_sum_Viet/docs/baselines/vllm_unified.md).
+  - Lệnh chạy full trên B200: `bash scripts/run_vllm_all.sh --full`
+  - Lệnh chạy smoke test: `bash scripts/run_vllm_all.sh --smoke`
+- **Pipeline Huấn luyện Draft Model (DFlash)**: Chi tiết xem tại [`src/Finetuning/README.md`](file:///home/tuantb/fast_infer_text_sum_Viet/src/Finetuning/README.md).
+  - Lệnh chạy trên B200: `bash scripts/run_finetuning_b200.sh`
+
