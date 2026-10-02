@@ -258,3 +258,22 @@ def test_default_prompt_explicitly_requests_a_vietnamese_summary() -> None:
 
     assert tokenizer.messages[0][0]["content"].startswith("Hãy tóm tắt")
     assert tokenizer.messages[0][0]["content"].endswith("nội dung")
+
+
+def test_iter_summary_jsonl_supports_text_field_alias(tmp_path: Path) -> None:
+    _require_data_api()
+    path = tmp_path / "sample.jsonl"
+    path.write_text(
+        '{"id": "376726.0", "text": "văn bản dài", "summary": "bản tóm tắt"}\n'
+        '{"input": "văn bản khác", "output": "tóm tắt khác"}\n',
+        encoding="utf-8",
+    )
+    records = load_summary_jsonl(path)
+    assert len(records) == 2
+    assert records[0].id == "376726.0"
+    assert records[0].document == "văn bản dài"
+    assert records[0].summary == "bản tóm tắt"
+    assert records[1].id == "sample-00000002"
+    assert records[1].document == "văn bản khác"
+    assert records[1].summary == "tóm tắt khác"
+

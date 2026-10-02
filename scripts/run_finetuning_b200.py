@@ -723,6 +723,11 @@ def build_commands(
             paths.checkpoints,
         ),
     ])
+    if getattr(args, "phase1_only", False):
+        commands = [cmd for cmd in commands if cmd[0] != "train"]
+    if getattr(args, "stages", None):
+        selected = {s.strip() for s in str(args.stages).split(",") if s.strip()}
+        commands = [cmd for cmd in commands if cmd[0] in selected]
     return commands
 
 
@@ -1340,6 +1345,17 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         default=os.environ.get("FINETUNE_SKIP_VALIDATION", "0") == "1",
         help="skip teacher trajectory validation stages completely",
+    )
+    parser.add_argument(
+        "--phase1-only",
+        action="store_true",
+        default=os.environ.get("FINETUNE_PHASE1_ONLY", "0") == "1",
+        help="execute only Phase 1 (regenerate, validation, and feature caching) and stop before training",
+    )
+    parser.add_argument(
+        "--stages",
+        default=os.environ.get("FINETUNE_STAGES"),
+        help="comma-separated list of stages to run (e.g. generate_train,cache_train)",
     )
     parser.add_argument(
         "--capture-backend",

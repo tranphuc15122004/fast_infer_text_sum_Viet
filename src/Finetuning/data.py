@@ -80,29 +80,64 @@ def iter_summary_jsonl(
                 raise ValueError(
                     f"summary JSONL line {line_number} must be a JSON object"
                 )
-            missing = [
-                key for key in ("id", "document", "summary") if key not in payload
-            ]
-            if missing:
+            # Extract document from supported aliases: document, text, input, article, context, src
+            if "document" in payload:
+                raw_document = payload["document"]
+            elif "text" in payload:
+                raw_document = payload["text"]
+            elif "input" in payload:
+                raw_document = payload["input"]
+            elif "article" in payload:
+                raw_document = payload["article"]
+            elif "context" in payload:
+                raw_document = payload["context"]
+            elif "src" in payload:
+                raw_document = payload["src"]
+            else:
+                raw_document = None
+
+            # Extract summary from supported aliases: summary, output, target, gold, tgt, reference
+            if "summary" in payload:
+                raw_summary = payload["summary"]
+            elif "output" in payload:
+                raw_summary = payload["output"]
+            elif "target" in payload:
+                raw_summary = payload["target"]
+            elif "gold" in payload:
+                raw_summary = payload["gold"]
+            elif "tgt" in payload:
+                raw_summary = payload["tgt"]
+            elif "reference" in payload:
+                raw_summary = payload["reference"]
+            else:
+                raw_summary = ""
+
+            raw_id = payload.get("id")
+            if raw_id is None:
+                rec_id = f"sample-{line_number:08d}"
+            else:
+                rec_id = str(raw_id)
+
+            if raw_document is None:
                 raise ValueError(
-                    f"summary JSONL line {line_number} missing fields {missing}"
+                    f"summary JSONL line {line_number} missing document field (expected 'document', 'text', or 'input')"
                 )
+            if not isinstance(raw_document, str) or not isinstance(raw_summary, str):
+                raise ValueError(
+                    f"summary JSONL line {line_number} has non-string document or summary"
+                )
+
             metadata = {
                 key: value
                 for key, value in payload.items()
                 if key not in {"id", "document", "summary"}
             }
-            try:
-                record = SummaryRecord(
-                    id=payload["id"],
-                    document=payload["document"],
-                    summary=payload["summary"],
-                    metadata=metadata,
-                )
-            except TypeError as exc:
-                raise ValueError(
-                    f"summary JSONL line {line_number} has invalid field types"
-                ) from exc
+            record = SummaryRecord(
+                id=rec_id,
+                document=raw_document,
+                summary=raw_summary,
+                metadata=metadata,
+            )
             yielded += 1
             yield record
 
