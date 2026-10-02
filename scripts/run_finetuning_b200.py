@@ -281,6 +281,8 @@ def materialize_config(
         training["adaptive_probe_batches"] = args.probe_batches
     if args.max_steps is not None:
         training["max_steps"] = args.max_steps
+    if getattr(args, "num_epochs", None) is not None:
+        training["num_epochs"] = args.num_epochs
     if args.batch_size is not None:
         training["batch_size"] = args.batch_size
 
@@ -1283,17 +1285,31 @@ def _write_run_manifest(
         "validate_warn_only": args.validate_warn_only,
         "skip_validation": args.skip_validation,
     }
+    IMMUTABLE_KEYS = {
+        "config_sha256",
+        "train_input",
+        "eval_input",
+        "target_model_path",
+        "capture_backend",
+        "capture_method",
+        "generation_backend",
+    }
     if paths.run_manifest.exists():
         try:
             previous = json.loads(paths.run_manifest.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise LauncherError(f"invalid run manifest: {paths.run_manifest}") from exc
-        comparable = {key: previous.get(key) for key in payload if key != "created_at"}
-        if comparable != {key: payload[key] for key in comparable}:
+        diff_immutable = [
+            k for k in IMMUTABLE_KEYS
+            if previous.get(k) is not None and str(previous.get(k)) != str(payload.get(k))
+        ]
+        if diff_immutable:
             raise LauncherError(
-                "run arguments/config differ from existing run_manifest.json; "
+                f"Core run arguments ({', '.join(diff_immutable)}) differ from existing run_manifest.json; "
                 "use a new --output-root"
             )
+        # Update manifest with latest runtime execution parameters
+        _atomic_write_text(paths.run_manifest, json.dumps({**previous, **payload}, indent=2) + "\n")
         return
     _atomic_write_text(paths.run_manifest, json.dumps(payload, indent=2) + "\n")
 
@@ -1527,6 +1543,7 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=float(os.environ.get("FINETUNE_CAPTURE_PARITY_MIN_COSINE_SIMILARITY", "0.999")),
     )
+    parser.add_argument("--epochs", "--num-epochs", dest="num_epochs", type=int, default=int(os.environ.get("FINETUNE_NUM_EPOCHS", "6")) if "FINETUNE_NUM_EPOCHS" in os.environ else None)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--dry-run", action="store_true")

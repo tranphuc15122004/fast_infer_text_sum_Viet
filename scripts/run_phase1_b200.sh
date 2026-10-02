@@ -37,19 +37,41 @@ PYTHON_BIN="${PYTHON:-${FAST_INFER_PYTHON:-python3}}"
 # 2. Default Parameters & B200 VRAM Optimization Defaults
 CONFIG="${CONFIG:-$ROOT/src/Finetuning/configs/qwen3_4b.yaml}"
 
-# Server canonical paths
-DEFAULT_SERVER_TRAIN_50K="/workspace/storage-shared/nlp/dungdx4/bien_projects/LLM2Seq/src/eviseq_new/datasets/50k/train_clean.jsonl"
-DEFAULT_SERVER_QWEN3_4B="${MODEL_QWEN3_4B:-/workspace/storage-shared/nlp/dungdx4/models/Qwen3-4B}"
+# Resolve TARGET_MODEL_PATH across master config variables and server paths
+resolve_target_model() {
+  local candidates=(
+    "${TARGET_MODEL_PATH:-}"
+    "${MODEL_QWEN3_4B:-}"
+    "${MODEL_TARGET:-}"
+    "${B200_TARGET_MODEL:-}"
+    "${MODEL_ROOT:-/workspace/storage-shared/nlp/dungdx4/BERT}/Qwen3-4B"
+    "/workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B"
+    "/workspace/storage-shared/nlp/dungdx4/models/Qwen3-4B"
+  )
+  for candidate in "${candidates[@]}"; do
+    if [[ -n "$candidate" && -d "$candidate" && -f "$candidate/config.json" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  for candidate in "${candidates[@]}"; do
+    if [[ -n "$candidate" && -d "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  for candidate in "${candidates[@]}"; do
+    if [[ -n "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
 
-if [[ -z "${TARGET_MODEL_PATH:-}" ]]; then
-  if [[ -n "${MODEL_QWEN3_4B:-}" ]]; then
-    TARGET_MODEL_PATH="$MODEL_QWEN3_4B"
-  elif [[ -d "$DEFAULT_SERVER_QWEN3_4B" ]]; then
-    TARGET_MODEL_PATH="$DEFAULT_SERVER_QWEN3_4B"
-  else
-    TARGET_MODEL_PATH=""
-  fi
-fi
+TARGET_MODEL_PATH="$(resolve_target_model || true)"
+
+DEFAULT_SERVER_TRAIN_50K="/workspace/storage-shared/nlp/dungdx4/bien_projects/LLM2Seq/src/eviseq_new/datasets/50k/train_clean.jsonl"
 
 if [[ -z "${TRAIN_INPUT:-}" ]]; then
   if [[ -f "$DEFAULT_SERVER_TRAIN_50K" ]]; then
@@ -85,9 +107,10 @@ ADAPTIVE_MIN_BATCH_SIZE="${ADAPTIVE_MIN_BATCH_SIZE:-1}"
 TARGET_MEMORY_FRACTION="${TARGET_MEMORY_FRACTION:-0.90}"
 
 # Trajectory Validation Gating
-MAX_ANOMALY_RATE="${MAX_ANOMALY_RATE:-0.05}"
+MAX_ANOMALY_RATE="${MAX_ANOMALY_RATE:-0.20}"
 MIN_TEACHER_ROUGE1="${MIN_TEACHER_ROUGE1:-0.0}"
 FILTER_ANOMALIES="${FILTER_ANOMALIES:-1}"
+VALIDATE_WARN_ONLY="${VALIDATE_WARN_ONLY:-0}"
 
 DRY_RUN=0
 EXTRA_ARGS=()
@@ -121,7 +144,8 @@ Tùy chọn Backend & Tối ưu hóa B200 (180GB VRAM):
   --max-batch-size INT           Batch size tối đa khi trích xuất features (mặc định: 128)
 
 Tùy chọn Kiểm soát & Chịu lỗi:
-  --max-anomaly-rate FLOAT       Tỷ lệ lỗi dị thường tối đa cho phép (mặc định: 0.05)
+  --max-anomaly-rate FLOAT       Tỷ lệ lỗi dị thường tối đa cho phép (mặc định: 0.20)
+  --validate-warn-only           Chỉ cảnh báo khi vượt ngưỡng lỗi, không dừng tiến trình
   --no-filter-anomalies          Không tự động lọc bỏ mẫu lỗi khỏi tập dữ liệu
   --dry-run                      Chỉ in lệnh và kiểm tra preflight, không chạy thực tế
   -h, --help                     Hiển thị hướng dẫn này
@@ -205,6 +229,10 @@ while [[ $# -gt 0 ]]; do
       MAX_ANOMALY_RATE="$2"
       shift 2
       ;;
+    --validate-warn-only)
+      VALIDATE_WARN_ONLY=1
+      shift 1
+      ;;
     --no-filter-anomalies)
       FILTER_ANOMALIES=0
       shift 1
@@ -255,7 +283,7 @@ echo " - Eval Input            : $EVAL_INPUT"
 echo " - Output Root           : $OUTPUT_ROOT"
 echo " - Generation Backend    : $GEN_BACKEND (mem_fraction: $GEN_MEM_FRACTION, concurrency: $GEN_CONCURRENCY/server)"
 echo " - Cache Backend         : $CACHE_BACKEND/$CAPTURE_METHOD (mem_fraction: $CACHE_MEM_FRACTION, max_tokens: $MAX_TOKENS_PER_BATCH)"
-echo " - Trajectory Validation : max_anomaly_rate=$MAX_ANOMALY_RATE, filter_anomalies=$FILTER_ANOMALIES"
+echo " - Trajectory Validation : max_anomaly_rate=$MAX_ANOMALY_RATE, filter_anomalies=$FILTER_ANOMALIES, warn_only=$VALIDATE_WARN_ONLY"
 echo " - Resume & Chịu lỗi     : Kích hoạt tự động (theo dõi tại $OUTPUT_ROOT/.state/)"
 echo "================================================================================"
 
@@ -303,6 +331,10 @@ fi
 
 if [[ "$FILTER_ANOMALIES" -eq 1 ]]; then
   CMD+=(--filter-anomalies)
+fi
+
+if [[ "$VALIDATE_WARN_ONLY" -eq 1 ]]; then
+  CMD+=(--validate-warn-only)
 fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then

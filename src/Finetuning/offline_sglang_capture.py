@@ -300,8 +300,11 @@ def _prepare_runtime_cache_env() -> None:
             linker_dir = root / "cuda_lib"
             linker_dir.mkdir(parents=True, exist_ok=True)
             linker_alias = linker_dir / "libcudart.so"
-            if not linker_alias.exists():
-                linker_alias.symlink_to(runtime_library)
+            try:
+                if not linker_alias.exists() and not linker_alias.is_symlink():
+                    linker_alias.symlink_to(runtime_library)
+            except FileExistsError:
+                pass
             runtime_dir = str(linker_dir)
             for variable in ("LIBRARY_PATH", "LD_LIBRARY_PATH"):
                 current = os.environ.get(variable, "")
