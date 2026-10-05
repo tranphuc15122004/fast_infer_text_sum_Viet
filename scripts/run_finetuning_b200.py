@@ -818,10 +818,30 @@ def _valid_checkpoint(path: Path, run_id: str) -> None:
     complete = [
         candidate
         for candidate in path.glob(f"{run_id}-step*")
-        if candidate.is_dir() and (candidate / "COMPLETE").is_file()
+        if candidate.is_dir() and (candidate / "COMPLETE").is_file() and (candidate / "draft_state_dict.pt").is_file()
     ]
     if not complete:
         raise LauncherError(f"no complete checkpoint found under {path}")
+    latest = sorted(
+        complete,
+        key=lambda item: int(item.name.removeprefix(f"{run_id}-step"))
+        if item.name.removeprefix(f"{run_id}-step").isdigit()
+        else -1,
+    )[-1]
+    trainer_state_file = latest / "trainer_state.json"
+    extra_file = latest / "extra.json"
+    if trainer_state_file.is_file() and extra_file.is_file():
+        try:
+            t_state = json.loads(trainer_state_file.read_text(encoding="utf-8"))
+            extra_state = json.loads(extra_file.read_text(encoding="utf-8"))
+            g_step = int(t_state.get("global_step", 0))
+            tot_steps = int(extra_state.get("total_steps", 0))
+            if tot_steps > 0 and g_step < tot_steps:
+                raise LauncherError(
+                    f"checkpoint at step {g_step}/{tot_steps} is intermediate, training must resume"
+                )
+        except (ValueError, KeyError, json.JSONDecodeError):
+            pass
 
 
 def _write_marker(path: Path, *, stage: str, command: Sequence[str], artifact: Path, status: str) -> None:
@@ -868,11 +888,15 @@ def run_stage(
             raise LauncherError(f"stage marker name mismatch: {marker_path}")
         try:
             validator()
+            console.emit("INFO", f"SKIP {name} artifact={artifact}")
+            return
         except LauncherError as exc:
-            console.emit("ERROR", f"RESUME CHECK FAILED {name}: {_short_line(str(exc))}")
-            raise
-        console.emit("INFO", f"SKIP {name} artifact={artifact}")
-        return
+            # If checkpoint is intermediate, remove premature marker and proceed to resume
+            if "intermediate" in str(exc) and marker_path.is_file():
+                marker_path.unlink()
+            else:
+                console.emit("ERROR", f"RESUME CHECK FAILED {name}: {_short_line(str(exc))}")
+                raise
 
     try:
         validator()
