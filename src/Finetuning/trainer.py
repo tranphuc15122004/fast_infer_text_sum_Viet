@@ -391,15 +391,17 @@ class Trainer:
                 break
         if self.global_step <= 0:
             raise ValueError("training completed without an optimizer step")
-        if self.distributed_context.is_main_process:
-            try:
-                latest = self.checkpoint_manager.latest_dir()
-            except FileNotFoundError:
-                latest = None
-            if latest is None or not latest.exists():
-                self._save()
-            else:
-                self.distributed_context.barrier()
+        try:
+            latest = self.checkpoint_manager.latest_dir()
+        except FileNotFoundError:
+            latest = None
+        needs_final_save = True
+        if latest is not None and latest.exists():
+            step_str = latest.name.removeprefix(f"{self.run_id}-step")
+            if step_str.isdigit() and int(step_str) == self.global_step:
+                needs_final_save = False
+        if needs_final_save:
+            self._save()
         else:
             self.distributed_context.barrier()
         return self.global_step
