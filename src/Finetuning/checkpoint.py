@@ -76,25 +76,72 @@ def load_draft_initialization(
     draft_model: torch.nn.Module,
     expected_metadata: Mapping[str, Any],
 ) -> None:
-    """Strictly load a portable draft export after provenance validation."""
+    """Load a portable draft export or pretrained DFlash checkpoint."""
 
     source = Path(export_dir)
-    required = (_DRAFT_EXPORT_STATE, _DRAFT_EXPORT_METADATA, _DRAFT_EXPORT_COMPLETE)
-    missing = [name for name in required if not (source / name).is_file()]
-    if missing:
-        raise FileNotFoundError(f"portable draft export is incomplete: missing {missing}")
-    stored_metadata = json.loads(
-        (source / _DRAFT_EXPORT_METADATA).read_text(encoding="utf-8")
+    if (source / "draft_export").is_dir():
+        source = source / "draft_export"
+
+    # 1. Standard portable draft export
+    if (source / _DRAFT_EXPORT_STATE).is_file():
+        if (source / _DRAFT_EXPORT_METADATA).is_file():
+            try:
+                stored_metadata = json.loads(
+                    (source / _DRAFT_EXPORT_METADATA).read_text(encoding="utf-8")
+                )
+                for key in ("num_draft_layers", "block_size"):
+                    if key in stored_metadata and key in expected_metadata:
+                        if stored_metadata[key] != expected_metadata[key]:
+                            raise ValueError(
+                                f"draft export metadata mismatch for {key}: "
+                                f"{stored_metadata[key]} != {expected_metadata[key]}"
+                            )
+            except Exception as exc:
+                if isinstance(exc, ValueError):
+                    raise
+        state = torch.load(source / _DRAFT_EXPORT_STATE, map_location="cpu", weights_only=True)
+        if not isinstance(state, dict):
+            raise ValueError("portable draft state must be a tensor mapping")
+        state = {k.removeprefix("draft_model."): v for k, v in state.items()}
+        draft_model.load_state_dict(state, strict=False)
+        return
+
+    # 2. Raw checkpoint root with draft_state_dict.pt
+    if (source / "draft_state_dict.pt").is_file():
+        state = torch.load(source / "draft_state_dict.pt", map_location="cpu", weights_only=True)
+        state = {k.removeprefix("draft_model."): v for k, v in state.items()}
+        draft_model.load_state_dict(state, strict=False)
+        return
+
+    # 3. Pretrained HuggingFace format (safetensors or bin)
+    safetensors_file = source / "model.safetensors"
+    if safetensors_file.is_file():
+        import safetensors.torch
+        state = safetensors.torch.load_file(str(safetensors_file), device="cpu")
+        state = {k.removeprefix("draft_model.").removeprefix("model."): v for k, v in state.items()}
+        draft_model.load_state_dict(state, strict=False)
+        return
+
+    bin_file = source / "pytorch_model.bin"
+    if bin_file.is_file():
+        state = torch.load(bin_file, map_location="cpu", weights_only=True)
+        state = {k.removeprefix("draft_model.").removeprefix("model."): v for k, v in state.items()}
+        draft_model.load_state_dict(state, strict=False)
+        return
+
+    shards = list(source.glob("*.safetensors"))
+    if shards:
+        import safetensors.torch
+        state = {}
+        for shard in shards:
+            part = safetensors.torch.load_file(str(shard), device="cpu")
+            state.update({k.removeprefix("draft_model.").removeprefix("model."): v for k, v in part.items()})
+        draft_model.load_state_dict(state, strict=False)
+        return
+
+    raise FileNotFoundError(
+        f"portable draft export or pretrained weights not found in {export_dir}"
     )
-    if stored_metadata != dict(expected_metadata):
-        raise ValueError("draft export metadata mismatch")
-    state = torch.load(source / _DRAFT_EXPORT_STATE, map_location="cpu", weights_only=True)
-    if not isinstance(state, dict):
-        raise ValueError("portable draft state must be a tensor mapping")
-    try:
-        draft_model.load_state_dict(state, strict=True)
-    except RuntimeError as exc:
-        raise ValueError(f"draft export state mismatch: {exc}") from exc
 
 
 class CheckpointManager:

@@ -44,6 +44,7 @@ GPU_IDS="${GPUS:-${CUDA_VISIBLE_DEVICES:-}}"
 MAX_STEPS="${MAX_STEPS:-}"
 EPOCHS="${EPOCHS:-6}"
 BATCH_SIZE="${BATCH_SIZE:-}"
+DRAFT_INIT_PATH="${DRAFT_INIT_PATH:-}"
 EXTRA_ARGS=()
 
 usage() {
@@ -54,6 +55,7 @@ Huấn luyện (Phase 2) DFlash Draft Model cho Qwen3-4B trên server B200 từ 
 
 Tùy chọn:
   --output-root PATH             Thư mục run root đã chạy Phase 1 (chứa features/ và checkpoints/)
+  --draft-init-path PATH         Checkpoint DFlash gốc để finetune (safetensors hoặc draft_export)
   --gpus IDS                     Danh sách GPU huấn luyện, vd: "0,1" hoặc "0,1,2,3" (mặc định: tất cả GPU)
   --num-gpus N                   Số GPU DDP workers
   --epochs INT                   Số epoch huấn luyện (mặc định: 6 theo paper gốc)
@@ -103,6 +105,10 @@ while [[ $# -gt 0 ]]; do
       TARGET_MODEL_PATH="$2"
       shift 2
       ;;
+    --draft-init-path)
+      DRAFT_INIT_PATH="$2"
+      shift 2
+      ;;
     --config)
       CONFIG="$2"
       shift 2
@@ -134,6 +140,9 @@ echo "🎯 KHỞI ĐỘNG PHASE 2: HUẤN LUYỆN DFLASH (Qwen3-4B) TRÊN B200"
 echo "================================================================================"
 echo " - Output Root (chứa Cache) : $OUTPUT_ROOT"
 echo " - Model Target             : $TARGET_MODEL_PATH"
+if [[ -n "$DRAFT_INIT_PATH" ]]; then
+  echo " - Init từ DFlash Model     : $DRAFT_INIT_PATH"
+fi
 echo " - Config YAML              : $CONFIG"
 echo " - GPUs tham gia Train      : ${CUDA_VISIBLE_DEVICES:-'Tất cả GPU'} (Tổng: $NUM_GPUS workers)"
 echo " - Checkpoint Lưu tại       : $OUTPUT_ROOT/checkpoints/"
@@ -150,6 +159,10 @@ CMD=(
   --stages train
   --epochs "$EPOCHS"
 )
+
+if [[ -n "$DRAFT_INIT_PATH" ]]; then
+  CMD+=(--draft-init-path "$DRAFT_INIT_PATH")
+fi
 
 if [[ -n "$MAX_STEPS" ]]; then
   CMD+=(--max-steps "$MAX_STEPS")

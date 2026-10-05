@@ -294,8 +294,8 @@ def apply_cli_overrides(config: RunConfig, **overrides: Any) -> RunConfig:
             continue
         if key in {"output_dir", "run_id", "device"}:
             setattr(config, key, value)
-        elif key in {"target_model_path"}:
-            config.model.target_model_path = value
+        elif key in {"target_model_path", "draft_init_path"}:
+            setattr(config.model, key, value)
         elif key in {"train_data_path", "hidden_states_path"}:
             setattr(config.data, key, value)
         elif key in {

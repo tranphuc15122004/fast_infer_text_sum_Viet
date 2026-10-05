@@ -241,6 +241,9 @@ def materialize_config(
         )
     model["target_model_path"] = str(Path(target_model).expanduser().resolve())
 
+    if getattr(args, "draft_init_path", None) is not None:
+        model["draft_init_path"] = str(Path(args.draft_init_path).expanduser().resolve())
+
     model_dtype = model.get("torch_dtype", "float32")
     feature_dtype = data.get("feature_dtype", model_dtype)
     if model_dtype != feature_dtype:
@@ -742,6 +745,7 @@ def build_commands(
                         ),
                     ]
                     if paths.checkpoints.is_dir()
+                    and not getattr(args, "draft_init_path", None)
                     and [
                         c
                         for c in paths.checkpoints.glob(
@@ -750,6 +754,11 @@ def build_commands(
                         if (c / "COMPLETE").is_file()
                         and (c / "draft_state_dict.pt").is_file()
                     ]
+                    else []
+                )
+                + (
+                    ["--draft-init-path", str(args.draft_init_path)]
+                    if getattr(args, "draft_init_path", None)
                     else []
                 )
             ),
@@ -1401,6 +1410,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-input", type=Path, required=True)
     parser.add_argument("--eval-input", type=Path, required=True)
     parser.add_argument("--target-model-path")
+    parser.add_argument(
+        "--draft-init-path",
+        type=Path,
+        default=os.environ.get("FINETUNE_DRAFT_INIT_PATH"),
+        help="path to pretrained DFlash model or draft_export to finetune from",
+    )
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--run-id")
     parser.add_argument("--nproc-per-node", type=int)

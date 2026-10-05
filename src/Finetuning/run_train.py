@@ -565,6 +565,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--run-id")
     parser.add_argument("--resume-from")
+    parser.add_argument("--draft-init-path")
     parser.add_argument("--smoke", action="store_true")
     return parser
 
@@ -575,6 +576,7 @@ def main(argv: list[str] | None = None) -> None:
     apply_cli_overrides(
         config,
         target_model_path=args.target_model_path,
+        draft_init_path=args.draft_init_path,
         train_data_path=args.train_data_path,
         hidden_states_path=args.hidden_states_path,
         output_dir=args.output_dir,
