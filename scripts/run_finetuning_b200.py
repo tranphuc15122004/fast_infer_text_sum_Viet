@@ -193,14 +193,29 @@ def _safe_run_id(value: object) -> str:
 
 def resolve_paths(args: argparse.Namespace, run_id: str) -> RunPaths:
     output_root = Path(args.output_root).expanduser().resolve()
+    feature_cache = (
+        Path(args.feature_cache_dir).expanduser().resolve()
+        if getattr(args, "feature_cache_dir", None)
+        else output_root
+    )
+    features_root = (
+        feature_cache / "features"
+        if (feature_cache / "features").is_dir()
+        else feature_cache
+    )
+    teacher_root = (
+        feature_cache / "teacher"
+        if (feature_cache / "teacher").is_dir()
+        else output_root / "teacher"
+    )
     return RunPaths(
         output_root=output_root,
-        teacher_train=output_root / "teacher" / "train.jsonl",
-        teacher_eval=output_root / "teacher" / "eval.jsonl",
-        teacher_train_report=output_root / "teacher" / "train_validation_report.json",
-        teacher_eval_report=output_root / "teacher" / "eval_validation_report.json",
-        features_train=output_root / "features" / "train",
-        features_eval=output_root / "features" / "eval",
+        teacher_train=teacher_root / "train.jsonl",
+        teacher_eval=teacher_root / "eval.jsonl",
+        teacher_train_report=teacher_root / "train_validation_report.json",
+        teacher_eval_report=teacher_root / "eval_validation_report.json",
+        features_train=features_root / "train",
+        features_eval=features_root / "eval",
         checkpoints=output_root / "checkpoints",
         run_config=output_root / "run_config.yaml",
         run_manifest=output_root / "run_manifest.json",
@@ -1425,6 +1440,11 @@ def _parser() -> argparse.ArgumentParser:
         help="loss objective type: dflash, growmtp, or dpace",
     )
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--feature-cache-dir",
+        type=Path,
+        help="Optional external directory containing features/ and teacher/ cache from Phase 1",
+    )
     parser.add_argument("--run-id")
     parser.add_argument("--nproc-per-node", type=int)
     parser.add_argument("--python", dest="python_bin", default=DEFAULT_PYTHON)

@@ -47,6 +47,7 @@ BATCH_SIZE="${BATCH_SIZE:-}"
 DRAFT_INIT_PATH="${DRAFT_INIT_PATH:-}"
 LOSS_TYPE="${LOSS_TYPE:-}"
 RUN_ID="${RUN_ID:-}"
+FEATURE_CACHE_DIR="${FEATURE_CACHE_DIR:-}"
 EXTRA_ARGS=()
 
 usage() {
@@ -120,6 +121,10 @@ while [[ $# -gt 0 ]]; do
       RUN_ID="$2"
       shift 2
       ;;
+    --feature-cache-dir)
+      FEATURE_CACHE_DIR="$2"
+      shift 2
+      ;;
     --config)
       CONFIG="$2"
       shift 2
@@ -184,6 +189,10 @@ fi
 
 if [[ -n "$RUN_ID" ]]; then
   CMD+=(--run-id "$RUN_ID")
+fi
+
+if [[ -n "$FEATURE_CACHE_DIR" ]]; then
+  CMD+=(--feature-cache-dir "$FEATURE_CACHE_DIR")
 fi
 
 if [[ -n "$MAX_STEPS" ]]; then

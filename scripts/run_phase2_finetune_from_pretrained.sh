@@ -42,26 +42,25 @@ echo " - GPUs tham gia Train       : $GPU_IDS"
 echo " - Epochs                    : $EPOCHS"
 echo "================================================================================"
 
-# 1. Chuẩn bị thư mục và symlink cache
+# 1. Chuẩn bị thư mục và dọn dẹp symlink nếu có (tránh ValueError từ OfflineFeatureDataset)
 mkdir -p "$FINETUNE_OUTPUT"
-
-if [[ -d "$PHASE1_OUTPUT/features" ]]; then
-  echo ">>> Liên kết (symlink) features cache từ Phase 1..."
-  ln -sfn "$PHASE1_OUTPUT/features" "$FINETUNE_OUTPUT/features"
-else
-  echo "❌ LỖI: Không tìm thấy $PHASE1_OUTPUT/features" >&2
-  exit 1
+if [[ -L "$FINETUNE_OUTPUT/features" ]]; then
+  rm -f "$FINETUNE_OUTPUT/features"
+fi
+if [[ -L "$FINETUNE_OUTPUT/teacher" ]]; then
+  rm -f "$FINETUNE_OUTPUT/teacher"
 fi
 
-if [[ -d "$PHASE1_OUTPUT/teacher" ]]; then
-  echo ">>> Liên kết (symlink) teacher trajectories từ Phase 1..."
-  ln -sfn "$PHASE1_OUTPUT/teacher" "$FINETUNE_OUTPUT/teacher"
+if [[ ! -d "$PHASE1_OUTPUT/features" ]]; then
+  echo "❌ LỖI: Không tìm thấy $PHASE1_OUTPUT/features" >&2
+  exit 1
 fi
 
 # 2. Khởi chạy huấn luyện
 exec bash "$ROOT/scripts/run_phase2_train_b200.sh" \
   --draft-init-path "$DFLASH_PRETRAINED" \
   --output-root "$FINETUNE_OUTPUT" \
+  --feature-cache-dir "$PHASE1_OUTPUT" \
   --run-id "qwen3-4b-finetuned" \
   --gpus "$GPU_IDS" \
   --epochs "$EPOCHS"

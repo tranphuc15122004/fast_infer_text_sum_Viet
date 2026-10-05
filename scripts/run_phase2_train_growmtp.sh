@@ -93,20 +93,18 @@ echo " - GPUs tham gia Train      : GPU $GPU_IDS"
 echo " - Epochs                   : $EPOCHS"
 echo "================================================================================"
 
-# 1. Chuẩn bị thư mục và symlink cache
+# 1. Chuẩn bị thư mục và dọn dẹp symlink nếu có (tránh ValueError từ OfflineFeatureDataset)
 mkdir -p "$GROW_OUTPUT"
-
-if [[ -d "$PHASE1_OUTPUT/features" ]]; then
-  echo ">>> Liên kết (symlink) features cache từ Phase 1..."
-  ln -sfn "$PHASE1_OUTPUT/features" "$GROW_OUTPUT/features"
-else
-  echo "❌ LỖI: Không tìm thấy $PHASE1_OUTPUT/features" >&2
-  exit 1
+if [[ -L "$GROW_OUTPUT/features" ]]; then
+  rm -f "$GROW_OUTPUT/features"
+fi
+if [[ -L "$GROW_OUTPUT/teacher" ]]; then
+  rm -f "$GROW_OUTPUT/teacher"
 fi
 
-if [[ -d "$PHASE1_OUTPUT/teacher" ]]; then
-  echo ">>> Liên kết (symlink) teacher trajectories từ Phase 1..."
-  ln -sfn "$PHASE1_OUTPUT/teacher" "$GROW_OUTPUT/teacher"
+if [[ ! -d "$PHASE1_OUTPUT/features" ]]; then
+  echo "❌ LỖI: Không tìm thấy $PHASE1_OUTPUT/features" >&2
+  exit 1
 fi
 
 # 2. Xây dựng lệnh chạy
@@ -114,6 +112,7 @@ TRAIN_CMD=(
   bash "$ROOT/scripts/run_phase2_train_b200.sh"
   --loss-type "growmtp"
   --output-root "$GROW_OUTPUT"
+  --feature-cache-dir "$PHASE1_OUTPUT"
   --run-id "qwen3-4b-growmtp"
   --gpus "$GPU_IDS"
   --epochs "$EPOCHS"
