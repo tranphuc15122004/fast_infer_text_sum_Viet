@@ -31,6 +31,7 @@ MAX_SAMPLES=100
 MAX_NEW_TOKENS=512
 OUTPUT_DIR="$ROOT/outputs/vllm_evaluation_$(date +%Y%m%d_%H%M%S)"
 SKIP_VANILLA=0
+GPU="${CUDA_VISIBLE_DEVICES:-0}"
 
 usage() {
   cat <<EOF
@@ -45,6 +46,7 @@ Sử dụng: $(basename "$0") [TÙY CHỌN]
 Tùy chọn:
   --checkpoint PATH        Đường dẫn thư mục checkpoint (hoặc file draft_state_dict.pt)
   --target-model PATH      Đường dẫn Target Model (mặc định: $TARGET_MODEL)
+  --gpu ID                 GPU ID để chạy vLLM (mặc định: $GPU)
   --datasets LIST          Danh sách dataset phân tách bằng dấu phẩy (mặc định: $DATASETS)
   --max-samples INT        Số mẫu mỗi dataset (mặc định: $MAX_SAMPLES)
   --max-new-tokens INT     Độ dài sinh tối đa (mặc định: $MAX_NEW_TOKENS)
@@ -63,6 +65,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --target-model)
       TARGET_MODEL="$2"
+      shift 2
+      ;;
+    --gpu)
+      GPU="$2"
       shift 2
       ;;
     --datasets)
@@ -94,6 +100,8 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+export CUDA_VISIBLE_DEVICES="$GPU"
 
 # Tự động tìm checkpoint mới nhất nếu người dùng không truyền
 if [[ -z "$CHECKPOINT" ]]; then
