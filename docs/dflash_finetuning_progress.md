@@ -1,100 +1,162 @@
-# Tiến độ Huấn luyện & Nhật ký Thực nghiệm DFlash Tiếng Việt (Server B200)
+# Tiến độ Huấn luyện & Sổ tay Thực nghiệm DFlash Tiếng Việt (Server B200)
 
-Tài liệu này tổng hợp toàn bộ tiến độ, các mốc thực nghiệm, cấu trúc đường dẫn canonical trên server B200, và hướng dẫn tái lập/đánh giá các baseline cho bài toán **Tăng tốc Tóm tắt Văn bản dài Tiếng Việt bằng DFlash**.
+> **Mục tiêu dự án:** Huấn luyện, tối ưu hoá và đánh giá công bằng các mô hình suy luận đầu cơ (Speculative Decoding) họ DFlash cho bài toán **Tóm tắt văn bản tiếng Việt** trên nền mô hình gốc **Qwen3-4B**, so sánh trực tiếp với baseline autoregressive tiêu chuẩn (Vanilla vLLM).
 
----
-
-## 1. Bảng Trạng thái Tiến độ Tổng thể
-
-| Hạng mục / Giai đoạn | Phương pháp | Trạng thái | Kết quả chính / Chỉ số |
-|---|---|---|---|
-| **Phase 1: Teacher Generation** | Qwen3-4B (Greedy offline) | ✅ **100% Hoàn thành** | 36,973 mẫu train clean & 100 mẫu eval |
-| **Phase 1: Feature Caching** | Trích xuất 5 Target Layers | ✅ **100% Hoàn thành** | Đã lưu tensor sharded trong `features/` |
-| **Baseline 1: Train From Scratch** | DFlash Loss chuẩn (Decay $\gamma=7.0$) | ✅ **100% Hoàn thành** | **6162/6162 steps (6 epochs)**, Loss: $12.59 \to 2.06$, Acc: **40.4%** |
-| **Đánh giá Benchmark Baseline 1** | vLLM Speculative Decoding | ⏳ **Sẵn sàng chạy** | Đo trên VietBench (`vietnews`, `wikilingua`, `vims`, `vlsp`) |
-| **Baseline 2: Finetune từ DFlash gốc** | Init từ `Qwen3-4B-DFlash-b16` | 🔄 Đã triển khai code | Sẵn sàng chạy với `--draft-init-path` |
-| **Baseline 3: Nghiên cứu Loss GrowMTP** | DCA (Chain Acceptance) + VGM | 🔄 Đã triển khai & Test 100% | Sẵn sàng chạy với `--loss-type growmtp` |
+Tài liệu này ghi nhận đầy đủ hiện trạng, các lỗi kỹ thuật đã xử lý, đường dẫn dữ liệu/mô hình trên cụm B200, và toàn bộ lệnh chạy huấn luyện cũng như đánh giá để các phiên làm việc tiếp theo dễ dàng theo dõi và tái lập.
 
 ---
 
-## 2. Hệ thống Đường dẫn Canonical trên Server B200
+## 1. Bảng Tổng quan Tiến độ 3 Baseline
 
-| Mục đích | Đường dẫn Tuyệt đối trên B200 |
-|---|---|
-| **Mã nguồn Dự án (Repo Root)** | `/workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum_Viet-main` |
-| **Master Config chuẩn** | `/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master_Viet.env` |
-| **Target Model (Teacher)** | `/workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B` |
-| **Pretrained DFlash Model gốc** | `/workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B-DFlash-b16` |
-| **Tập dữ liệu Huấn luyện gốc** | `/workspace/storage-shared/nlp/dungdx4/bien_projects/LLM2Seq/src/eviseq_new/datasets/50k/train_clean.jsonl` |
-| **Tập dữ liệu Eval Chuẩn (VietBench 100)** | `datasets/eval_100/` (`vietnews_100.jsonl`, `wikilingua_100.jsonl`, `vims_100.jsonl`, `vlsp_100.jsonl`) |
-| **Output Baseline 1 (From Scratch)** | `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/` |
-| **Output Baseline 2 (Finetune từ gốc)** | `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_finetuned/` |
-| **Output Baseline 3 (GrowMTP Loss)** | `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_growmtp/` |
+| Baseline | Kiến trúc / Phương pháp | Trọng số Init | Hàm Loss | Trạng thái Train | Trạng thái Eval |
+|---|---|---|---|---|---|
+| **Baseline 1** | DFlash (5 layers, b16) | From Scratch (ngẫu nhiên) | DFlash chuẩn ($\gamma=7.0$) | ✅ **Hoàn thành 6 epochs** (6162 steps) | ⏳ Sẵn sàng chạy Eval trên GPU 0 |
+| **Baseline 2** | DFlash (5 layers, b16) | `Qwen3-4B-DFlash-b16` gốc | DFlash chuẩn ($\gamma=7.0$) | 🚀 Sẵn sàng chạy (1-click script) | ⏳ Sẵn sàng chạy sau khi có checkpoint |
+| **Baseline 3** | DFlash (5 layers, b16) | From Scratch (ngẫu nhiên) | **GrowMTP** (DCA + VGM) | 🚀 Sẵn sàng chạy (1-click script) | ⏳ Sẵn sàng chạy sau khi có checkpoint |
 
 ---
 
-## 3. Nhật ký Huấn luyện Baseline 1 (DFlash From Scratch)
+## 2. Hệ thống Đường dẫn Chuẩn (Canonical Paths) trên Cụm Server B200
 
-- **Cấu hình:** 5 Draft Layers, Block Size 16, Mask Token ID 151669, 2x B200 GPUs (DDP).
-- **Tổng số bước:** 6162 steps (tương ứng trọn vẹn 6 epochs trên 36,973 mẫu tiếng Việt).
-- **Thời gian chạy:** 2 giờ 29 phút 17 giây (Trung bình: 1.45s / step, tốc độ xử lý ~25,924 tokens/s).
-- **Hội tụ:**
-  - Step 1: `loss = 12.5981`, `accuracy = 0.0%`
-  - Step 94: `loss = 6.1919`, `accuracy = 8.8%`
-  - Step 6000: `loss = 2.0366`, `accuracy = 42.4%`
-  - Step 6162: `loss = 2.0608`, `accuracy = 40.4%`
-- **Checkpoint khả dụng:**
+| Thành phần | Đường dẫn Tuyệt đối trên B200 | Ghi chú |
+|---|---|---|
+| **Repo Root (Mã nguồn)** | `/workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum_Viet-main` | Nhánh `main` đồng bộ với GitHub |
+| **Master Config** | `/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master_Viet.env` | Chứa cấu hình môi trường offline |
+| **Target Model (Teacher)** | `/workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B` | Mô hình mục tiêu Qwen3-4B |
+| **Pretrained DFlash gốc** | `/workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B-DFlash-b16` | Checkpoint DFlash đa ngôn ngữ có sẵn |
+| **Tập Train sạch (36,973 mẫu)** | `/workspace/storage-shared/nlp/dungdx4/bien_projects/LLM2Seq/src/eviseq_new/datasets/50k/train_clean.jsonl` | Đã sinh teacher & trích xuất features |
+| **Bộ Eval Chuẩn (VietBench 100)** | `datasets/eval_100/` (`vietnews`, `wikilingua`, `vims`, `vlsp`) | 4 bộ test chuẩn hoá, 100 mẫu/bộ |
+| **Phase 1 Cache (Features)** | `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/features/` | Tensors sharded 5 target layers |
+| **Phase 1 Cache (Teacher)** | `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/teacher/` | Trajectories sinh bởi Qwen3-4B |
+| **Output Baseline 1 (Scratch)** | `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/` | Checkpoint lưu tại `checkpoints/` |
+| **Output Baseline 2 (Finetuned)** | `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_finetuned/` | Checkpoint lưu tại `checkpoints/` |
+| **Output Baseline 3 (GrowMTP)** | `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_growmtp/` | Checkpoint lưu tại `checkpoints/` |
+
+---
+
+## 3. Nhật ký Huấn luyện Chi tiết Baseline 1 (From Scratch)
+
+- **Cấu hình Huấn luyện:** 5 Draft Layers, Block Size 16, Mask Token ID 151669, 2x B200 GPUs qua PyTorch DDP.
+- **Tổng số bước:** 6162 steps (chính xác 6 epochs trọn vẹn trên 36,973 mẫu tiếng Việt).
+- **Thời gian thực thi:** 2 giờ 29 phút 17 giây (Tốc độ trung bình: 1.45s / step, thông lượng ~25,924 tokens/s).
+- **Hội tụ Loss & Accuracy:**
+  - `Step 1`: `loss = 12.5981`, `acc = 0.0%`
+  - `Step 500`: `loss = 3.6521`, `acc = 22.4%`
+  - `Step 3000`: `loss = 2.4510`, `acc = 35.8%`
+  - `Step 6000`: `loss = 2.0366`, `acc = 42.4%` (lr = 9.34e-08)
+  - `Step 6162 (End)`: `loss = 2.0608`, `acc = 40.4%` (lr = 0.0)
+- **Checkpoint tốt nhất:**
   - `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/checkpoints/qwen3-4b-phase1-step6000/`
 
 ---
 
-## 4. Các Công cụ & Tính năng Đã Tích hợp vào Repo
+## 4. Các Lỗi Kỹ thuật Đã Được Khắc phục Triệt để
 
-### 4.1. Bộ Đánh giá Benchmark Tự động với vLLM (`scripts/`)
-- [`scripts/export_trained_checkpoint.py`](file:///home/tuantb/fast_infer_text_sum_Viet/scripts/export_trained_checkpoint.py): Chuyển đổi trọng số `draft_state_dict.pt` sang định dạng `model.safetensors` và `config.json` tiêu chuẩn của HuggingFace/vLLM.
-- [`scripts/evaluate_vllm_vietbench.py`](file:///home/tuantb/fast_infer_text_sum_Viet/scripts/evaluate_vllm_vietbench.py): Chạy vLLM Speculative Decoding trên 4 bộ test VietBench, tính throughput, speedup ratio, acceptance rate, và gọi trực tiếp `Benchmark.common.rouge` để chấm điểm ROUGE-1/2/L.
-- [`scripts/run_evaluate_checkpoint.sh`](file:///home/tuantb/fast_infer_text_sum_Viet/scripts/run_evaluate_checkpoint.sh): Wrapper launcher 1-click tự động tìm checkpoint mới nhất, export và chạy benchmark.
+Trong quá trình triển khai, 4 lỗi phát sinh trên server B200 đã được phân tích nguồn gốc và giải quyết theo chuẩn `src/Benchmark/`:
 
-### 4.2. Hỗ trợ Finetune từ Trọng số DFlash gốc (`--draft-init-path`)
-- Cho phép nạp trực tiếp trọng số từ checkpoint pretrained `Qwen3-4B-DFlash-b16` (hỗ trợ cả `.safetensors` và `.pt`).
-- Tự động bỏ qua `--resume-from` khi finetune từ model mới.
+1. **Lỗi Symlink Bảo mật trong `OfflineFeatureDataset`**:
+   - *Hiện tượng:* `ValueError: feature path cannot contain symlink component`.
+   - *Nguyên nhân:* `src/Finetuning/features.py` chặn đường dẫn chứa symlink. Khi tạo symlink từ Phase 1 sang thư mục mới thì bị crash.
+   - *Khắc phục:* Bổ sung cờ chính thức `--feature-cache-dir PATH` vào launcher. Trình nạp nạp trực tiếp đường dẫn thật trên ổ cứng mà không cần tạo symlink.
 
-### 4.3. Nghiên cứu Hàm Loss GrowMTP (DCA + VGM) (`--loss-type growmtp`)
-- **DCA (Dynamic Chain Acceptance):** Tối ưu hóa trực tiếp kỳ vọng độ dài chuỗi được chấp nhận thông qua logsumexp chuỗi xác suất tích lũy:
-  $$L_{\mathrm{DCA}} = -\mathrm{logsumexp}\left(-\mathrm{cumsum}(\text{neg\_log\_q})\right)$$
-- **VGM (Verify-Gated Masking):** Cắt loss tại vị trí từ chối đầu tiên $j$. Giữ lại gradient tại $j$ để sửa sai, triệt tiêu gradient ($0.0$) ở tất cả các vị trí sau $j$.
-- Đã được verify qua unit tests trong `src/Finetuning/tests/test_objective.py`.
+2. **Lỗi Kiểu Dữ liệu trong `render_prompt`**:
+   - *Hiện tượng:* `TypeError: string indices must be integers, not 'str'`.
+   - *Nguyên nhân:* Tham số `dataset_name` bị truyền nhầm vào tham số `templates: Mapping[str, str]`.
+   - *Khắc phục:* Tạo hàm trợ giúp `prepare_prompts(raw_samples, ds_name, tokenizer)` tự động gán key `dataset` và bọc prompt qua Chat Template của Qwen3.
+
+3. **Lỗi Chữ ký Hàm `add_rouge`**:
+   - *Hiện tượng:* `TypeError: add_rouge() got an unexpected keyword argument 'generated'`.
+   - *Nguyên nhân:* `add_rouge(record, hyp, ref)` nhận tham số theo vị trí (positional) và sửa `record` in-place.
+   - *Khắc phục:* Đổi thành `add_rouge(record, gen_text, ref_text)` và bọc `try...except` để bảo vệ pipeline.
+
+4. **Giải phóng Bộ nhớ Engine VLLM (`shutdown_vllm_engine`)**:
+   - *Nguyên nhân:* Khởi tạo 2 đối tượng `LLM(...)` tuần tự trong cùng tiến trình Python làm treo tiến trình nền `EngineCore` và giữ VRAM GPU.
+   - *Khắc phục:* Triển khai hàm `shutdown_vllm_engine(llm)` dựa trên `src/Benchmark/vllm_all_baselines.py` gọi `engine_core.shutdown(timeout=30)` và `torch.cuda.empty_cache()` sau mỗi bước.
 
 ---
 
-## 5. Hướng dẫn Lệnh Thực thi trên Server B200
+## 5. Hướng dẫn Lệnh Thực thi Chuẩn (Standard Operating Procedures)
 
-### 5.1. Chạy Đánh giá Benchmark Baseline 1 (From Scratch)
+### 5.1. Đánh giá Benchmark Baseline 1 (Checkpoint step 6000)
+
+Chạy trên GPU 0 (hoặc bất kỳ GPU nào còn trống):
+
 ```bash
 cd /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum_Viet-main
 git pull
 
-# Chạy đánh giá trên GPU 0
 bash scripts/run_evaluate_checkpoint.sh \
   --checkpoint "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/checkpoints/qwen3-4b-phase1-step6000" \
   --output-dir "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/benchmark_eval" \
   --gpu 0
 ```
 
-### 5.2. Chạy Huấn luyện Baseline 2 (Finetune từ DFlash gốc)
-Cách 1-click (khuyên dùng):
+> **Kết quả đầu ra:** File markdown tổng hợp `evaluation_summary.md` và file log chi tiết từng mẫu `vanilla_vllm_records.jsonl`, `dflash_spec_records.jsonl`.
+
+---
+
+### 5.2. Huấn luyện & Đánh giá Baseline 2 (Finetune từ Pretrained)
+
+#### A. Khởi chạy Huấn luyện (6 epochs):
 ```bash
+cd /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum_Viet-main
+git pull
+
+# Chạy trên 2 GPU (GPU 0, 1):
 bash scripts/run_phase2_finetune_from_pretrained.sh --gpus 0,1
+
+# Hoặc chạy trên 1 GPU (GPU 0):
+bash scripts/run_phase2_finetune_from_pretrained.sh --gpus 0
 ```
 
-### 5.3. Chạy Huấn luyện Baseline 3 (Nghiên cứu Loss GrowMTP)
-Chạy trên 1 GPU (GPU 0 trống):
+#### B. Đánh giá sau khi Huấn luyện xong:
 ```bash
-bash scripts/run_phase2_train_growmtp.sh --gpus 0
+# Thêm --skip-vanilla để không chạy lại Vanilla (tiết kiệm 10 phút)
+bash scripts/run_evaluate_checkpoint.sh \
+  --checkpoint "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_finetuned/checkpoints/qwen3-4b-finetuned-step6000" \
+  --output-dir "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_finetuned/benchmark_eval" \
+  --gpu 0 \
+  --skip-vanilla
 ```
-Hoặc nếu có cả 2 GPU:
+
+---
+
+### 5.3. Huấn luyện & Đánh giá Baseline 3 (Hàm Loss Mới GrowMTP)
+
+#### A. Khởi chạy Huấn luyện:
 ```bash
+cd /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum_Viet-main
+git pull
+
+# Chạy trên 1 GPU (GPU 0):
+bash scripts/run_phase2_train_growmtp.sh --gpus 0
+
+# Hoặc chạy trên 2 GPU (GPU 0, 1):
 bash scripts/run_phase2_train_growmtp.sh --gpus 0,1
 ```
-Script sẽ tự động symlink feature cache, cấu hình loss GrowMTP (DCA + VGM), và lưu checkpoint vào `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_growmtp/checkpoints/`.
 
+#### B. Đánh giá sau khi Huấn luyện xong:
+```bash
+bash scripts/run_evaluate_checkpoint.sh \
+  --checkpoint "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_growmtp/checkpoints/qwen3-4b-growmtp-step6000" \
+  --output-dir "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_growmtp/benchmark_eval" \
+  --gpu 0 \
+  --skip-vanilla
+```
+
+---
+
+## 6. Định dạng Bảng Kết quả Đánh giá Benchmark
+
+Sau khi chạy xong lệnh `run_evaluate_checkpoint.sh`, báo cáo sẽ xuất hiện dưới dạng bảng so sánh chuẩn:
+
+| Tập dữ liệu | Phương pháp | Số mẫu | Throughput (tok/s) | Speedup | Tỷ lệ chấp nhận (%) | ROUGE-1 | ROUGE-2 | ROUGE-L |
+|---|---|---|---|---|---|---|---|---|
+| `vietnews` | `vanilla_vllm` | 100 | ~3,689 tok/s | 1.00x | - | Đang tính | Đang tính | Đang tính |
+| `vietnews` | `dflash_spec` | 100 | Chờ số liệu | **Chờ số liệu** | Chờ số liệu | Chờ số liệu | Chờ số liệu | Chờ số liệu |
+| `wikilingua`| `vanilla_vllm` | 100 | Chờ số liệu | 1.00x | - | Chờ số liệu | Chờ số liệu | Chờ số liệu |
+| `wikilingua`| `dflash_spec` | 100 | Chờ số liệu | **Chờ số liệu** | Chờ số liệu | Chờ số liệu | Chờ số liệu | Chờ số liệu |
+| `vims` | `vanilla_vllm` | 100 | Chờ số liệu | 1.00x | - | Chờ số liệu | Chờ số liệu | Chờ số liệu |
+| `vims` | `dflash_spec` | 100 | Chờ số liệu | **Chờ số liệu** | Chờ số liệu | Chờ số liệu | Chờ số liệu | Chờ số liệu |
+| `vlsp` | `vanilla_vllm` | 100 | Chờ số liệu | 1.00x | - | Chờ số liệu | Chờ số liệu | Chờ số liệu |
+| `vlsp` | `dflash_spec` | 100 | Chờ số liệu | **Chờ số liệu** | Chờ số liệu | Chờ số liệu | Chờ số liệu | Chờ số liệu |
