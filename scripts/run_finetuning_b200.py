@@ -724,18 +724,18 @@ def build_commands(
                                 [
                                     c
                                     for c in paths.checkpoints.glob(
-                                        f"{str(payload.get('run_id', 'dflash'))}-step*"
+                                        f"{str(getattr(args, 'run_id', None) or config.get('run_id') or 'dflash')}-step*"
                                     )
                                     if (c / "COMPLETE").is_file()
                                     and (c / "draft_state_dict.pt").is_file()
                                 ],
                                 key=lambda item: int(
                                     item.name.removeprefix(
-                                        f"{str(payload.get('run_id', 'dflash'))}-step"
+                                        f"{str(getattr(args, 'run_id', None) or config.get('run_id') or 'dflash')}-step"
                                     )
                                 )
                                 if item.name.removeprefix(
-                                    f"{str(payload.get('run_id', 'dflash'))}-step"
+                                    f"{str(getattr(args, 'run_id', None) or config.get('run_id') or 'dflash')}-step"
                                 ).isdigit()
                                 else -1,
                             )[-1]
@@ -745,7 +745,7 @@ def build_commands(
                     and [
                         c
                         for c in paths.checkpoints.glob(
-                            f"{str(payload.get('run_id', 'dflash'))}-step*"
+                            f"{str(getattr(args, 'run_id', None) or config.get('run_id') or 'dflash')}-step*"
                         )
                         if (c / "COMPLETE").is_file()
                         and (c / "draft_state_dict.pt").is_file()
