@@ -65,8 +65,38 @@ def export_checkpoint(
 
     # Resolve target layer ids
     if target_layer_ids is None:
-        step = target_num_layers / num_draft_layers
-        target_layer_ids = [int(round(i * step)) for i in range(num_draft_layers)]
+        for candidate_cfg in (cp / "config.json", cp.parent / "config.json", cp.parent.parent / "run_manifest.json"):
+            if candidate_cfg.is_file():
+                try:
+                    cdata = json.loads(candidate_cfg.read_text(encoding="utf-8"))
+                    cand_ids = (
+                        cdata.get("target_layer_ids")
+                        or cdata.get("dflash_config", {}).get("target_layer_ids")
+                        or cdata.get("model", {}).get("target_layer_ids")
+                    )
+                    if cand_ids:
+                        target_layer_ids = list(cand_ids)
+                        print(f">>> Found target_layer_ids in {candidate_cfg.name}: {target_layer_ids}")
+                        break
+                except Exception:
+                    pass
+
+    if target_layer_ids is None:
+        try:
+            from Finetuning.model import build_target_layer_ids
+            target_layer_ids = build_target_layer_ids(target_num_layers, num_draft_layers)
+        except Exception:
+            if num_draft_layers == 1:
+                target_layer_ids = [target_num_layers // 2]
+            else:
+                start = 1
+                end = target_num_layers - 3
+                span = end - start
+                target_layer_ids = [
+                    round(start + (i * span) / (num_draft_layers - 1))
+                    for i in range(num_draft_layers)
+                ]
+        print(f">>> Resolved target_layer_ids using canonical DFlash layout: {target_layer_ids}")
 
     # Build DFlash Config JSON
     config_dict = target_config.to_dict()

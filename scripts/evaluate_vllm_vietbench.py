@@ -221,7 +221,17 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--skip-vanilla", action="store_true", help="Skip vanilla baseline run")
+    parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager execution (disable CUDA graphs / torch.compile)")
+    parser.add_argument(
+        "--enable-flashinfer-autotune",
+        action="store_true",
+        default=False,
+        help="Enable FlashInfer autotune (default: False to prevent dummy-run assertion crashes on Blackwell)",
+    )
     args = parser.parse_args()
+
+    if os.environ.get("VLLM_ENFORCE_EAGER", "0") == "1":
+        args.enforce_eager = True
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset_list = [d.strip() for d in args.datasets.split(",") if d.strip()]
@@ -243,6 +253,17 @@ def main() -> None:
 
     all_summaries: list[dict[str, Any]] = []
 
+    # If skip-vanilla is requested, attempt to load previous vanilla baseline results from output_dir
+    summary_file = args.output_dir / "evaluation_summary.json"
+    if args.skip_vanilla and summary_file.is_file():
+        try:
+            prev = json.loads(summary_file.read_text(encoding="utf-8"))
+            for p in prev:
+                if p.get("method") == "vanilla_vllm":
+                    all_summaries.append(p)
+        except Exception:
+            pass
+
     # Load tokenizer for chat template formatting
     tokenizer = None
     try:
@@ -251,18 +272,23 @@ def main() -> None:
     except Exception as exc:
         print(f"⚠️ Warning: Could not pre-load tokenizer ({exc}). Will obtain from vLLM engine.")
 
+    common_kwargs: dict[str, Any] = {
+        "model": args.model,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_model_len": args.max_model_len,
+        "trust_remote_code": True,
+        "enable_flashinfer_autotune": args.enable_flashinfer_autotune,
+    }
+    if args.enforce_eager:
+        common_kwargs["enforce_eager"] = True
+
     # 1. Run Vanilla Baseline if not skipped
     if not args.skip_vanilla:
         print("\n================================================================================")
         print("🚀 STEP 1/2: Running Vanilla vLLM Baseline (No Speculative Decoding)")
         print("================================================================================")
-        vanilla_kwargs: dict[str, Any] = {
-            "model": args.model,
-            "tensor_parallel_size": args.tensor_parallel_size,
-            "gpu_memory_utilization": args.gpu_memory_utilization,
-            "max_model_len": args.max_model_len,
-            "trust_remote_code": True,
-        }
+        vanilla_kwargs = dict(common_kwargs)
         vanilla_llm = LLM(**vanilla_kwargs)
         if tokenizer is None:
             try:
@@ -311,14 +337,8 @@ def main() -> None:
             "num_speculative_tokens": 16,
         }
         
-        dflash_kwargs: dict[str, Any] = {
-            "model": args.model,
-            "speculative_config": speculative_config,
-            "tensor_parallel_size": args.tensor_parallel_size,
-            "gpu_memory_utilization": args.gpu_memory_utilization,
-            "max_model_len": args.max_model_len,
-            "trust_remote_code": True,
-        }
+        dflash_kwargs = dict(common_kwargs)
+        dflash_kwargs["speculative_config"] = speculative_config
         try:
             import inspect
             sig = inspect.signature(LLM.__init__)
