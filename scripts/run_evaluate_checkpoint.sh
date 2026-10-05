@@ -21,6 +21,7 @@ if [[ -n "${FAST_INFER_MASTER_CONFIG:-}" && -f "$FAST_INFER_MASTER_CONFIG" ]]; t
   set +a
 fi
 
+export PYTHONPATH="$ROOT/src:${PYTHONPATH:-}"
 PYTHON_BIN="${PYTHON:-${FAST_INFER_PYTHON:-python3}}"
 TARGET_MODEL="${TARGET_MODEL_PATH:-${MODEL_QWEN3_4B:-${MODEL_TARGET:-/workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B}}}"
 DEFAULT_CHECKPOINT_DIR="/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/checkpoints"

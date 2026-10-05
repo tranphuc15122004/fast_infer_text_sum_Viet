@@ -180,7 +180,10 @@ def run_vllm_inference(
                 pass
             
         if writer is not None:
-            writer.write(record)
+            if hasattr(writer, "add"):
+                writer.add(record)
+            elif hasattr(writer, "write"):
+                writer.write(record)
         records.append(record)
 
     throughput = total_output_tokens / max(total_duration, 1e-6)
@@ -287,7 +290,11 @@ def main() -> None:
             )
             all_summaries.append(res)
             
-        vanilla_writer.close()
+        if hasattr(vanilla_writer, "close"):
+            try:
+                vanilla_writer.close()
+            except Exception:
+                pass
         shutdown_vllm_engine(vanilla_llm)
         vanilla_llm = None
 
@@ -347,7 +354,11 @@ def main() -> None:
             )
             all_summaries.append(res)
             
-        dflash_writer.close()
+        if hasattr(dflash_writer, "close"):
+            try:
+                dflash_writer.close()
+            except Exception:
+                pass
         shutdown_vllm_engine(dflash_llm)
         dflash_llm = None
 

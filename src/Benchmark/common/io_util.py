@@ -89,6 +89,14 @@ class JsonlWriter:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(safe, ensure_ascii=False) + "\n")
 
+    def write(self, record: dict) -> None:
+        """Alias for add() for writer interface compatibility."""
+        self.add(record)
+
+    def close(self) -> None:
+        """No-op for stream-like interface compatibility."""
+        pass
+
     def finalize(self, summary: dict) -> dict:
         safe = _json_safe(summary)
         with self.path.open("a", encoding="utf-8") as f:
