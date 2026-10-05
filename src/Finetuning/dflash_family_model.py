@@ -27,11 +27,12 @@ if hasattr(torch, "npu") and torch.npu.is_available():  # pragma: no cover
 _VALID_ATTENTION_BACKENDS = {"eager", "sdpa", "flex_attention"}
 _VALID_LOSS_TYPES = {
     "dflash",
+    "growmtp",
     "dpace",
     "dpace-cumulative-confidence-only",
     "dpace-continuation-value-only",
 }
-_DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
+_DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash", "growmtp"}
 
 
 def compute_accept_len(
@@ -519,6 +520,43 @@ class OnlineDFlashModel(nn.Module):
                 loss_weights = loss_weights * decay_weights
             loss_num = (neg_log_q * loss_weights).sum()
             loss_den = loss_weights.sum()
+        elif self.loss_type == "growmtp":
+            # GrowMTP: Dynamic Chain Acceptance (DCA) + Verify-Gated Masking (VGM)
+            # Offset 0 supplies the anchor embedding; offsets 1 .. block_size-1 are draft tokens.
+            draft_neg_log_q = neg_log_q[:, :, 1:]
+            draft_weight_mask = weight_mask[:, :, 1:]
+            draft_pred_ids = logits[:, :, 1:].argmax(dim=-1)
+            draft_target_ids = target_ids[:, :, 1:]
+
+            block_valid = draft_weight_mask > 0.5
+            mismatch = (draft_pred_ids != draft_target_ids) & block_valid
+            has_mismatch = mismatch.any(dim=-1)
+
+            last_valid_idx = (block_valid.sum(dim=-1) - 1).clamp_min(0)
+            first_reject_idx = torch.where(
+                has_mismatch,
+                mismatch.float().argmax(dim=-1),
+                last_valid_idx,
+            )
+
+            pos_indices = torch.arange(
+                self.block_size - 1,
+                device=hidden.device,
+            ).view(1, 1, -1)
+            # VGM: retain valid tokens up to and including the first rejection position
+            vgm_mask = block_valid & (pos_indices <= first_reject_idx.unsqueeze(-1))
+
+            # DCA: chain_l = prod_{i=1}^l alpha_i = exp(-sum_{i=1}^l neg_log_q_i)
+            # -log(sum_l chain_l) is stably computed via -logsumexp(-cumsum(neg_log_q))
+            cum_neg_log_q = torch.cumsum(draft_neg_log_q, dim=-1)
+            u = -cum_neg_log_q
+            large_neg = -1e9
+            u_masked = torch.where(vgm_mask, u, u.new_tensor(large_neg))
+            block_loss = -torch.logsumexp(u_masked, dim=-1)
+
+            valid_blocks = block_valid.any(dim=-1)
+            loss_num = (block_loss * valid_blocks.float()).sum()
+            loss_den = valid_blocks.float().sum()
         elif self.loss_type in _DPACE_LOSS_TYPES:
             with torch.no_grad():
                 target_probability = torch.exp(-neg_log_q)
@@ -583,8 +621,8 @@ class OnlineDFlashModel(nn.Module):
             "acc": (correct_num.detach(), accuracy_den.detach()),
         }
         loss_denominator = (
-            loss_den
-            if self.loss_type == "dflash"
+            loss_den.clamp_min(1.0)
+            if self.loss_type in {"dflash", "growmtp"}
             else loss_num.new_tensor(float(batch_size))
         )
         loss = loss_num / loss_denominator

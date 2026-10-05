@@ -340,3 +340,50 @@ def test_block_size_one_is_rejected_before_empty_loss_denominator() -> None:
 
     with pytest.raises(ValueError, match="block_size.*2"):
         tiny_online_dflash(block_size=1)
+
+
+def test_growmtp_objective_returns_finite_loss_and_gradients() -> None:
+    _require_objective_api()
+    model = tiny_online_dflash(loss_type="growmtp")
+    input_ids = torch.tensor([[4, 5, 6, 7, 8, 9, 10, 11]])
+    hidden = torch.randn(1, 8, 64)
+    loss_mask = torch.tensor([[0, 1, 1, 1, 0, 0, 1, 1]], dtype=torch.float32)
+
+    torch.manual_seed(42)
+    loss, accuracy, metrics = model(input_ids, hidden, loss_mask)
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(accuracy)
+    assert 0.0 <= accuracy.item() <= 1.0
+    assert metrics["loss_terms"][1].item() > 0
+
+    # Verify backward pass produces finite gradients on draft model
+    loss.backward()
+    trainable_grads = [
+        p.grad for p in model.draft_model.parameters() if p.requires_grad and p.grad is not None
+    ]
+    assert len(trainable_grads) > 0
+    for grad in trainable_grads:
+        assert torch.isfinite(grad).all()
+
+
+def test_growmtp_objective_chunking_preserves_loss_and_metrics() -> None:
+    _require_objective_api()
+    unchunked = tiny_online_dflash(loss_type="growmtp", objective_chunk_blocks=0)
+    chunked = tiny_online_dflash(loss_type="growmtp", objective_chunk_blocks=1)
+    chunked.load_state_dict(unchunked.state_dict())
+    input_ids = torch.tensor([[4, 5, 6, 7, 8, 9, 10, 11]])
+    hidden = torch.randn(1, 8, 64)
+    loss_mask = torch.tensor([[0, 1, 1, 1, 0, 0, 1, 1]], dtype=torch.float32)
+
+    torch.manual_seed(17)
+    unchunked_result = unchunked(input_ids, hidden, loss_mask)
+    torch.manual_seed(17)
+    chunked_result = chunked(input_ids, hidden, loss_mask)
+
+    assert torch.allclose(unchunked_result[0], chunked_result[0])
+    assert torch.allclose(unchunked_result[1], chunked_result[1])
+    assert torch.allclose(
+        unchunked_result[2]["accuracy_denom"], chunked_result[2]["accuracy_denom"]
+    )
+

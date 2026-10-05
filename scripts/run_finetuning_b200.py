@@ -288,6 +288,8 @@ def materialize_config(
         training["num_epochs"] = args.num_epochs
     if args.batch_size is not None:
         training["batch_size"] = args.batch_size
+    if getattr(args, "loss_type", None) is not None:
+        training["loss_type"] = args.loss_type
 
     if not isinstance(model.get("num_draft_layers"), int) or model["num_draft_layers"] < 1:
         if not isinstance(model.get("target_layer_ids"), list) or not model["target_layer_ids"]:
@@ -1415,6 +1417,12 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=os.environ.get("FINETUNE_DRAFT_INIT_PATH"),
         help="path to pretrained DFlash model or draft_export to finetune from",
+    )
+    parser.add_argument(
+        "--loss-type",
+        choices=("dflash", "growmtp", "dpace"),
+        default=os.environ.get("FINETUNE_LOSS_TYPE"),
+        help="loss objective type: dflash, growmtp, or dpace",
     )
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--run-id")

@@ -222,17 +222,14 @@ class Trainer:
         load_module = module
         if hasattr(self.strategy, "dflash_model"):
             load_module = self.strategy.dflash_model.draft_model
-        if "draft_state_dict" in state:
+        if self.draft_export_metadata is not None and (state["path"] / "draft_export").is_dir():
+            load_draft_initialization(
+                state["path"] / "draft_export",
+                load_module,
+                self.draft_export_metadata,
+            )
+        elif "draft_state_dict" in state:
             load_module.load_state_dict(state["draft_state_dict"], strict=False)
-        elif self.draft_export_metadata is not None and (state["path"] / "draft_export").is_dir():
-            try:
-                load_draft_initialization(
-                    state["path"] / "draft_export",
-                    load_module,
-                    self.draft_export_metadata,
-                )
-            except Exception:
-                pass
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])
         trainer_state = state.get("trainer_state", {})
