@@ -497,7 +497,7 @@ def main() -> None:
     ]
     
     for s in all_summaries:
-        sp_str = f"**{s.get('speedup')}x**" if s.get('speedup') else "-"
+        sp_str = f"**{s.get('speedup')}x**" if s.get('speedup') is not None else "-"
         acc_str = f"{s.get('acceptance_rate_pct')}%" if s.get('acceptance_rate_pct') is not None else "-"
         r1 = s.get("rouge1") or "-"
         r2 = s.get("rouge2") or "-"
