@@ -27,6 +27,7 @@ TARGET_MODEL="${TARGET_MODEL_PATH:-${MODEL_QWEN3_4B:-${MODEL_TARGET:-/workspace/
 DEFAULT_CHECKPOINT_DIR="/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/checkpoints"
 
 CHECKPOINT=""
+ALL_BASELINES=0
 DATASETS="vietnews,wikilingua,vims,vlsp"
 MAX_SAMPLES=100
 MAX_NEW_TOKENS=512
@@ -47,6 +48,7 @@ Sử dụng: $(basename "$0") [TÙY CHỌN]
 
 Tùy chọn:
   --checkpoint PATH        Đường dẫn thư mục checkpoint (hoặc file draft_state_dict.pt)
+  --all-baselines          Tự động đánh giá cả 3 baselines (scratch, finetuned, growmtp)
   --target-model PATH      Đường dẫn Target Model (mặc định: $TARGET_MODEL)
   --gpu ID                 GPU ID để chạy vLLM (mặc định: $GPU)
   --datasets LIST          Danh sách dataset phân tách bằng dấu phẩy (mặc định: $DATASETS)
@@ -65,6 +67,10 @@ while [[ $# -gt 0 ]]; do
     --checkpoint)
       CHECKPOINT="$2"
       shift 2
+      ;;
+    --all-baselines)
+      ALL_BASELINES=1
+      shift 1
       ;;
     --target-model)
       TARGET_MODEL="$2"
@@ -113,64 +119,146 @@ while [[ $# -gt 0 ]]; do
 done
 
 export CUDA_VISIBLE_DEVICES="$GPU"
-
-# Tự động tìm checkpoint mới nhất nếu người dùng không truyền hoặc truyền thư mục cha
-if [[ -z "$CHECKPOINT" ]]; then
-  CHECKPOINT="$DEFAULT_CHECKPOINT_DIR"
-fi
-
-if [[ -d "$CHECKPOINT" ]]; then
-  LATEST_CP="$(find "$CHECKPOINT" -maxdepth 1 -name "*-step*" -type d | sort -V | tail -n 1)"
-  if [[ -n "$LATEST_CP" ]]; then
-    echo ">>> Tự động phát hiện Checkpoint mới nhất: $LATEST_CP"
-    CHECKPOINT="$LATEST_CP"
-  fi
-fi
-
-if [[ -z "$CHECKPOINT" || ! -e "$CHECKPOINT" ]]; then
-  echo "❌ LỖI: Không tìm thấy checkpoint để đánh giá. Vui lòng truyền --checkpoint /path/to/checkpoint" >&2
-  exit 1
-fi
-
 mkdir -p "$OUTPUT_DIR"
-EXPORTED_DIR="$OUTPUT_DIR/exported_draft_model"
 
-echo "================================================================================"
-echo "🎯 BƯỚC 1: EXPORT CHECKPOINT SANG ĐỊNH DẠNG vLLM / HUGGINGFACE"
-echo "================================================================================"
-"$PYTHON_BIN" "$ROOT/scripts/export_trained_checkpoint.py" \
-  --checkpoint "$CHECKPOINT" \
-  --target-model "$TARGET_MODEL" \
-  --output-dir "$EXPORTED_DIR" \
-  --block-size 16 \
-  --num-draft-layers 5
+# Tự động tái sử dụng vanilla_vllm_records.jsonl từ lần chạy trước nếu có
+PREV_VANILLA="/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/benchmark_eval/vanilla_vllm_records.jsonl"
+if [[ ! -f "$OUTPUT_DIR/vanilla_vllm_records.jsonl" && -f "$PREV_VANILLA" ]]; then
+  echo ">>> Tự động liên kết kết quả Vanilla đã đo trước đó từ: $PREV_VANILLA"
+  cp "$PREV_VANILLA" "$OUTPUT_DIR/vanilla_vllm_records.jsonl"
+fi
+
+if [[ "$ALL_BASELINES" -eq 1 ]]; then
+  echo "================================================================================"
+  echo "🎯 BƯỚC 1: EXPORT TẤT CẢ 3 BASELINES SANG ĐỊNH DẠNG vLLM"
+  echo "================================================================================"
+  
+  BASE_DIR="/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs"
+  
+  # 1. Scratch
+  CP_SCRATCH="$(find "$BASE_DIR/qwen3_4b_phase1_Viet/checkpoints" -maxdepth 1 -name "*-step*" -type d 2>/dev/null | sort -V | tail -n 1 || true)"
+  EXP_SCRATCH="$OUTPUT_DIR/exported_scratch"
+  if [[ -n "$CP_SCRATCH" ]]; then
+    echo ">>> Exporting Scratch: $CP_SCRATCH -> $EXP_SCRATCH"
+    "$PYTHON_BIN" "$ROOT/scripts/export_trained_checkpoint.py" \
+      --checkpoint "$CP_SCRATCH" \
+      --target-model "$TARGET_MODEL" \
+      --output-dir "$EXP_SCRATCH" \
+      --block-size 16 --num-draft-layers 5
+  fi
+
+  # 2. Finetuned
+  CP_FT="$(find "$BASE_DIR/qwen3_4b_dflash_finetuned/checkpoints" -maxdepth 1 -name "*-step*" -type d 2>/dev/null | sort -V | tail -n 1 || true)"
+  EXP_FT="$OUTPUT_DIR/exported_finetuned"
+  if [[ -n "$CP_FT" ]]; then
+    echo ">>> Exporting Finetuned: $CP_FT -> $EXP_FT"
+    "$PYTHON_BIN" "$ROOT/scripts/export_trained_checkpoint.py" \
+      --checkpoint "$CP_FT" \
+      --target-model "$TARGET_MODEL" \
+      --output-dir "$EXP_FT" \
+      --block-size 16 --num-draft-layers 5
+  fi
+
+  # 3. GrowMTP
+  CP_MTP="$(find "$BASE_DIR/qwen3_4b_dflash_growmtp/checkpoints" -maxdepth 1 -name "*-step*" -type d 2>/dev/null | sort -V | tail -n 1 || true)"
+  EXP_MTP="$OUTPUT_DIR/exported_growmtp"
+  if [[ -n "$CP_MTP" ]]; then
+    echo ">>> Exporting GrowMTP: $CP_MTP -> $EXP_MTP"
+    "$PYTHON_BIN" "$ROOT/scripts/export_trained_checkpoint.py" \
+      --checkpoint "$CP_MTP" \
+      --target-model "$TARGET_MODEL" \
+      --output-dir "$EXP_MTP" \
+      --block-size 16 --num-draft-layers 5
+  fi
+
+  DRAFT_MODELS_ARG="scratch:$EXP_SCRATCH,finetuned:$EXP_FT,growmtp:$EXP_MTP"
+
+  echo ""
+  echo "================================================================================"
+  echo "🚀 BƯỚC 2: TIẾN HÀNH ĐÁNH GIÁ ĐỒNG LOẠT 3 BASELINES TRÊN VIETBENCH"
+  echo "================================================================================"
+
+  EVAL_CMD=(
+    "$PYTHON_BIN" "$ROOT/scripts/evaluate_vllm_vietbench.py"
+    --model "$TARGET_MODEL"
+    --draft-models "$DRAFT_MODELS_ARG"
+    --datasets "$DATASETS"
+    --max-samples "$MAX_SAMPLES"
+    --max-new-tokens "$MAX_NEW_TOKENS"
+    --output-dir "$OUTPUT_DIR"
+  )
+
+  if [[ "$SKIP_VANILLA" -eq 1 ]]; then
+    EVAL_CMD+=(--skip-vanilla)
+  fi
+
+  if [[ "$ENFORCE_EAGER" -eq 0 ]]; then
+    EVAL_CMD+=(--no-enforce-eager)
+  fi
+
+  "${EVAL_CMD[@]}"
+
+else
+  # Đánh giá 1 Checkpoint cụ thể
+  if [[ -z "$CHECKPOINT" ]]; then
+    CHECKPOINT="$DEFAULT_CHECKPOINT_DIR"
+  fi
+
+  if [[ -d "$CHECKPOINT" ]]; then
+    LATEST_CP="$(find "$CHECKPOINT" -maxdepth 1 -name "*-step*" -type d 2>/dev/null | sort -V | tail -n 1 || true)"
+    if [[ -n "$LATEST_CP" ]]; then
+      echo ">>> Tự động phát hiện Checkpoint mới nhất: $LATEST_CP"
+      CHECKPOINT="$LATEST_CP"
+    fi
+  fi
+
+  if [[ -z "$CHECKPOINT" || ! -e "$CHECKPOINT" ]]; then
+    echo "❌ LỖI: Không tìm thấy checkpoint để đánh giá. Vui lòng truyền --checkpoint /path/to/checkpoint hoặc dùng --all-baselines" >&2
+    exit 1
+  fi
+
+  EXPORTED_DIR="$OUTPUT_DIR/exported_draft_model"
+
+  echo "================================================================================"
+  echo "🎯 BƯỚC 1: EXPORT CHECKPOINT SANG ĐỊNH DẠNG vLLM / HUGGINGFACE"
+  echo "================================================================================"
+  "$PYTHON_BIN" "$ROOT/scripts/export_trained_checkpoint.py" \
+    --checkpoint "$CHECKPOINT" \
+    --target-model "$TARGET_MODEL" \
+    --output-dir "$EXPORTED_DIR" \
+    --block-size 16 \
+    --num-draft-layers 5
+
+  echo ""
+  echo "================================================================================"
+  echo "🚀 BƯỚC 2: TIẾN HÀNH ĐÁNH GIÁ TRÊN VIETBENCH BẰNG vLLM"
+  echo "================================================================================"
+
+  EVAL_CMD=(
+    "$PYTHON_BIN" "$ROOT/scripts/evaluate_vllm_vietbench.py"
+    --model "$TARGET_MODEL"
+    --draft-model "$EXPORTED_DIR"
+    --datasets "$DATASETS"
+    --max-samples "$MAX_SAMPLES"
+    --max-new-tokens "$MAX_NEW_TOKENS"
+    --output-dir "$OUTPUT_DIR"
+  )
+
+  if [[ "$SKIP_VANILLA" -eq 1 ]]; then
+    EVAL_CMD+=(--skip-vanilla)
+  fi
+
+  if [[ "$ENFORCE_EAGER" -eq 0 ]]; then
+    EVAL_CMD+=(--no-enforce-eager)
+  fi
+
+  "${EVAL_CMD[@]}"
+fi
 
 echo ""
 echo "================================================================================"
-echo "🚀 BƯỚC 2: TIẾN HÀNH ĐÁNH GIÁ TRÊN VIETBENCH BẰNG vLLM"
-echo "================================================================================"
-
-EVAL_CMD=(
-  "$PYTHON_BIN" "$ROOT/scripts/evaluate_vllm_vietbench.py"
-  --model "$TARGET_MODEL"
-  --draft-model "$EXPORTED_DIR"
-  --datasets "$DATASETS"
-  --max-samples "$MAX_SAMPLES"
-  --max-new-tokens "$MAX_NEW_TOKENS"
-  --output-dir "$OUTPUT_DIR"
-)
-
-if [[ "$SKIP_VANILLA" -eq 1 ]]; then
-  EVAL_CMD+=(--skip-vanilla)
-fi
-
-if [[ "$ENFORCE_EAGER" -eq 0 ]]; then
-  EVAL_CMD+=(--no-enforce-eager)
-fi
-
-"${EVAL_CMD[@]}"
-
-echo ""
-echo "================================================================================"
-echo "🎉 HOÀN TẤT ĐÁNH GIÁ! Xem kết quả chi tiết tại: $OUTPUT_DIR/evaluation_summary.md"
+echo "🎉 HOÀN TẤT ĐÁNH GIÁ! Xem kết quả chi tiết tại:"
+echo "   - Markdown Report: $OUTPUT_DIR/evaluation_summary.md"
+echo "   - JSON Report:     $OUTPUT_DIR/evaluation_summary.json"
+echo "   - CSV Report:      $OUTPUT_DIR/evaluation_summary.csv"
 echo "================================================================================"
