@@ -150,6 +150,23 @@ class Trainer:
                 f"step={record.get('step', '?')} loss={record.get('loss', '?')} "
                 f"lr={record.get('lr', '?')}\n"
             )
+        if record.get("type") == "step":
+            payload = {
+                "description": "train",
+                "n": int(record.get("step", 0)),
+                "total": int(self.total_steps),
+                "unit": "steps",
+                "loss": record.get("loss"),
+                "accuracy": record.get("accuracy"),
+                "lr": record.get("lr"),
+                "tokens_per_s": record.get("tokens_per_s"),
+                "epoch": record.get("epoch"),
+            }
+            import sys
+            sys.stdout.write(
+                f"@@FINETUNE_PROGRESS {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n"
+            )
+            sys.stdout.flush()
 
     def _save(self) -> Path:
         path = self.output_dir / f"{self.run_id}-step{self.global_step}"

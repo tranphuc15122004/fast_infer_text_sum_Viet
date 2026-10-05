@@ -705,16 +705,54 @@ def build_commands(
         ),
         (
             "train",
-            [
-                *prefix,
-                "-m",
-                "Finetuning.run_train",
-                "--config",
-                str(paths.run_config),
-                "--device",
-                "cuda",
-                "--adaptive-batch-size",
-            ],
+            (
+                [
+                    *prefix,
+                    "-m",
+                    "Finetuning.run_train",
+                    "--config",
+                    str(paths.run_config),
+                    "--device",
+                    "cuda",
+                    "--adaptive-batch-size",
+                ]
+                + (
+                    [
+                        "--resume-from",
+                        str(
+                            sorted(
+                                [
+                                    c
+                                    for c in paths.checkpoints.glob(
+                                        f"{str(payload.get('run_id', 'dflash'))}-step*"
+                                    )
+                                    if (c / "COMPLETE").is_file()
+                                    and (c / "draft_state_dict.pt").is_file()
+                                ],
+                                key=lambda item: int(
+                                    item.name.removeprefix(
+                                        f"{str(payload.get('run_id', 'dflash'))}-step"
+                                    )
+                                )
+                                if item.name.removeprefix(
+                                    f"{str(payload.get('run_id', 'dflash'))}-step"
+                                ).isdigit()
+                                else -1,
+                            )[-1]
+                        ),
+                    ]
+                    if paths.checkpoints.is_dir()
+                    and [
+                        c
+                        for c in paths.checkpoints.glob(
+                            f"{str(payload.get('run_id', 'dflash'))}-step*"
+                        )
+                        if (c / "COMPLETE").is_file()
+                        and (c / "draft_state_dict.pt").is_file()
+                    ]
+                    else []
+                )
+            ),
             paths.checkpoints,
         ),
     ])
@@ -926,16 +964,43 @@ def run_stage(
                     # fresh parent process. Keep the display aligned.
                     progress_bar.n = current
                     progress_bar.refresh()
+                postfix: dict[str, str] = {}
+                if event.get("epoch") is not None:
+                    postfix["epoch"] = str(event["epoch"])
+                if event.get("loss") is not None:
+                    try:
+                        postfix["loss"] = f"{float(event['loss']):.4f}"
+                    except (TypeError, ValueError):
+                        pass
+                if event.get("accuracy") is not None:
+                    try:
+                        postfix["acc"] = f"{float(event['accuracy']):.3f}"
+                    except (TypeError, ValueError):
+                        pass
+                if event.get("lr") is not None:
+                    try:
+                        postfix["lr"] = f"{float(event['lr']):.2e}"
+                    except (TypeError, ValueError):
+                        pass
+                if event.get("tokens_per_s") is not None:
+                    try:
+                        postfix["tok/s"] = f"{float(event['tokens_per_s']):.0f}"
+                    except (TypeError, ValueError):
+                        pass
+                if postfix:
+                    progress_bar.set_postfix(postfix)
+
                 now = time.monotonic()
-                if now - last_progress_log >= 30.0:
+                if now - last_progress_log >= 15.0:
                     pct = 100.0 if total == 0 else progress_bar.n * 100.0 / total
                     eta = "unknown"
                     rate = progress_bar.format_dict.get("rate")
                     if rate and total > progress_bar.n:
                         eta = tqdm.format_interval(int((total - progress_bar.n) / rate))
+                    metrics_str = f" [{' '.join(f'{k}={v}' for k, v in postfix.items())}]" if postfix else ""
                     console.emit(
                         "INFO",
-                        f"PROGRESS {name} {progress_bar.n}/{total} ({pct:.1f}%) eta={eta}",
+                        f"PROGRESS {name} {progress_bar.n}/{total} ({pct:.1f}%){metrics_str} eta={eta}",
                     )
                     last_progress_log = now
                 continue
