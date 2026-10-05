@@ -31,8 +31,9 @@ DIR_GROWMTP="/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4
 
 DATASETS="vietnews,wikilingua,vims,vlsp"
 MAX_SAMPLES=100
+BATCH_SIZE=1
 MAX_NEW_TOKENS=512
-OUTPUT_DIR="$ROOT/outputs/all_baselines_eval"
+OUTPUT_DIR=""
 SKIP_VANILLA=0
 ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 GPU="${CUDA_VISIBLE_DEVICES:-0}"
@@ -48,8 +49,9 @@ trên 4 bộ dữ liệu VietBench (vietnews, wikilingua, vims, vlsp) trong 1 l�
   - Lần lượt đánh giá cả 3 baseline và sinh bảng so sánh đối đầu toàn diện
 
 Tùy chọn:
+  --batch-size INT         Inference batch size (mặc định: 1 cho Latency Benchmark chuẩn)
   --gpu ID                 GPU ID để chạy vLLM (mặc định: $GPU)
-  --output-dir PATH        Thư mục lưu kết quả benchmark (mặc định: $OUTPUT_DIR)
+  --output-dir PATH        Thư mục lưu kết quả benchmark (mặc định: auto theo batch size)
   --skip-vanilla           Bỏ qua chạy lại baseline Vanilla (tái sử dụng kết quả cũ)
   --no-enforce-eager       Tắt eager mode, bật capture CUDA graphs (mất thêm ~7 phút)
   --max-samples INT        Số mẫu mỗi dataset (mặc định: $MAX_SAMPLES)
@@ -61,6 +63,10 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --batch-size)
+      BATCH_SIZE="$2"
+      shift 2
+      ;;
     --gpu)
       GPU="$2"
       shift 2
@@ -100,7 +106,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 export CUDA_VISIBLE_DEVICES="$GPU"
+
+if [[ -z "$OUTPUT_DIR" ]]; then
+  OUTPUT_DIR="$ROOT/outputs/all_baselines_eval_bs${BATCH_SIZE}_$(date +%Y%m%d_%H%M%S)"
+fi
+
 mkdir -p "$OUTPUT_DIR"
+
+PREV_VANILLA="/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/benchmark_eval_bs${BATCH_SIZE}/vanilla_vllm_records_bs${BATCH_SIZE}.jsonl"
+if [[ ! -f "$OUTPUT_DIR/vanilla_vllm_records_bs${BATCH_SIZE}.jsonl" && -f "$PREV_VANILLA" ]]; then
+  echo ">>> Tự động liên kết kết quả Vanilla (BS=${BATCH_SIZE}) đã đo trước đó từ: $PREV_VANILLA"
+  cp "$PREV_VANILLA" "$OUTPUT_DIR/vanilla_vllm_records_bs${BATCH_SIZE}.jsonl"
+fi
 
 find_latest_checkpoint() {
   local cp_dir="$1"
@@ -168,6 +185,7 @@ EVAL_CMD=(
   --draft-models "$DRAFT_MODELS_ARG"
   --datasets "$DATASETS"
   --max-samples "$MAX_SAMPLES"
+  --batch-size "$BATCH_SIZE"
   --max-new-tokens "$MAX_NEW_TOKENS"
   --output-dir "$OUTPUT_DIR"
 )
