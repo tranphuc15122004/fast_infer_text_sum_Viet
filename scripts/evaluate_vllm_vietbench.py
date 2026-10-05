@@ -122,7 +122,7 @@ def run_vllm_inference(
                 record["draft_proposed_tokens"] = int(proposed)
         
         if ref_text:
-            record = add_rouge(record, generated=gen_text, reference=ref_text)
+            add_rouge(record, gen_text, ref_text)
             
         if writer is not None:
             writer.write(record)
