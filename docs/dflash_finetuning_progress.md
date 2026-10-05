@@ -51,16 +51,23 @@ Tài liệu này ghi nhận đầy đủ hiện trạng, các lỗi kỹ thuật
 ### 3.2. Baseline 2: Finetune từ Pretrained DFlash Gốc (`Qwen3-4B-DFlash-b16`)
 - **Trọng số khởi tạo:** Nạp toàn bộ trọng số pre-trained đa ngôn ngữ từ `/workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B-DFlash-b16`.
 - **Dữ liệu chuyển tiếp:** Huấn luyện thích nghi domain tóm tắt tiếng Việt trên 36,973 mẫu văn bản chất lượng cao, tái sử dụng offline feature cache từ Phase 1.
-- **Mục tiêu:** Đánh giá lợi thế hội tụ và tốc độ chấp nhận token (acceptance rate) khi khởi động từ mô hình đã được pre-train lớn so với huấn luyện từ đầu.
+- **Tổng số bước:** 6,162 steps (6 epochs trọn vẹn).
+- **Thời gian thực thi:** 3 giờ 18 phút 44 giây (Tốc độ: 1.94s / step, thông lượng ~26,025 tokens/s).
+- **Hội tụ Cuối cùng:** `loss = 2.1351`, `accuracy = 39.7%` (0.397), `lr = 0.0`.
 - **Trạng thái:** ✅ **Hoàn thành trọn vẹn huấn luyện**.
-- **Checkpoint lưu tại:** `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_finetuned/checkpoints/`
+- **Đường dẫn Checkpoint:**
+  `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_finetuned/checkpoints/`
 
 ### 3.3. Baseline 3: Huấn luyện DFlash với Hàm Loss Mới GrowMTP (DCA + VGM)
 - **Hàm Loss:** Sử dụng chiến lược **GrowMTP** kết hợp 2 kỹ thuật:
   - **Dynamic Chain Acceptance (DCA):** Điều chỉnh trọng số loss động dựa trên xác suất chấp nhận chuỗi suy luận liên tục, ưu tiên các token kéo dài chuỗi chấp nhận.
   - **Verify-Gated Masking (VGM):** Mặt nạ có điều kiện theo cơ chế xác thực của mô hình đích, giảm thiểu việc phạt các token dự đoán hợp lý nhưng khác biệt nhỏ với teacher.
+- **Tổng số bước:** 6,162 steps (6 epochs trọn vẹn).
+- **Thời gian thực thi:** 3 giờ 19 phút 12 giây (Tốc độ: 1.94s / step, thông lượng ~25,624 tokens/s).
+- **Hội tụ Cuối cùng:** `loss = -0.7400` (GrowMTP reward-weighted loss), `accuracy = 24.6%` (0.246), `lr = 0.0`.
 - **Trạng thái:** ✅ **Hoàn thành trọn vẹn huấn luyện**.
-- **Checkpoint lưu tại:** `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_growmtp/checkpoints/`
+- **Đường dẫn Checkpoint:**
+  `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_growmtp/checkpoints/`
 
 ---
 
