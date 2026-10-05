@@ -32,6 +32,26 @@ DATASET_FILES = {
 }
 
 
+def prepare_prompts(
+    raw_samples: list[dict[str, Any]],
+    ds_name: str,
+    tokenizer: Any = None,
+) -> list[str]:
+    prompts = []
+    for r in raw_samples:
+        row = dict(r)
+        if not row.get("dataset"):
+            row["dataset"] = ds_name
+        p = render_prompt(row)
+        if tokenizer is not None:
+            try:
+                p = format_chat_prompt(tokenizer, p)
+            except Exception:
+                pass
+        prompts.append(p)
+    return prompts
+
+
 def load_dataset_samples(data_dir: Path, dataset_name: str, max_samples: int | None = None) -> list[dict[str, Any]]:
     file_name = DATASET_FILES.get(dataset_name, f"{dataset_name}_100.jsonl")
     data_path = data_dir / file_name
@@ -160,6 +180,14 @@ def main() -> None:
 
     all_summaries: list[dict[str, Any]] = []
 
+    # Load tokenizer for chat template formatting
+    tokenizer = None
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    except Exception as exc:
+        print(f"⚠️ Warning: Could not pre-load tokenizer ({exc}). Will obtain from vLLM engine.")
+
     # 1. Run Vanilla Baseline if not skipped
     if not args.skip_vanilla:
         print("\n================================================================================")
@@ -172,13 +200,18 @@ def main() -> None:
             max_model_len=args.max_model_len,
             trust_remote_code=True,
         )
+        if tokenizer is None:
+            try:
+                tokenizer = vanilla_llm.get_tokenizer()
+            except Exception:
+                pass
         
         vanilla_writer = JsonlWriter(args.output_dir / "vanilla_vllm_records.jsonl")
         
         for ds_name in dataset_list:
             raw_samples = load_dataset_samples(args.data_dir, ds_name, args.max_samples)
-            prompts = [render_prompt(r, ds_name) for r in raw_samples]
-            references = [r.get("summary", r.get("reference", "")) for r in raw_samples]
+            prompts = prepare_prompts(raw_samples, ds_name, tokenizer)
+            references = [r.get("reference", r.get("summary", "")) for r in raw_samples]
             sample_ids = [str(r.get("id", idx)) for idx, r in enumerate(raw_samples)]
             
             res = run_vllm_inference(
@@ -220,13 +253,18 @@ def main() -> None:
             max_model_len=args.max_model_len,
             trust_remote_code=True,
         )
+        if tokenizer is None:
+            try:
+                tokenizer = dflash_llm.get_tokenizer()
+            except Exception:
+                pass
         
         dflash_writer = JsonlWriter(args.output_dir / "dflash_spec_records.jsonl")
         
         for ds_name in dataset_list:
             raw_samples = load_dataset_samples(args.data_dir, ds_name, args.max_samples)
-            prompts = [render_prompt(r, ds_name) for r in raw_samples]
-            references = [r.get("summary", r.get("reference", "")) for r in raw_samples]
+            prompts = prepare_prompts(raw_samples, ds_name, tokenizer)
+            references = [r.get("reference", r.get("summary", "")) for r in raw_samples]
             sample_ids = [str(r.get("id", idx)) for idx, r in enumerate(raw_samples)]
             
             res = run_vllm_inference(
