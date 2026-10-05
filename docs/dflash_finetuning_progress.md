@@ -78,6 +78,17 @@ Trong quá trình triển khai, 4 lỗi phát sinh trên server B200 đã đư�
    - *Nguyên nhân:* `JsonlWriter` trong `src/Benchmark/common/io_util.py` sử dụng phương thức `add(record)` và `finalize(summary)`, không có `write()` và `close()`.
    - *Khắc phục:* Bổ sung alias `write = add` và `close() -> None` vào `JsonlWriter`, đồng thời trong `scripts/evaluate_vllm_vietbench.py` kiểm tra linh hoạt `hasattr(writer, "add")` và `hasattr(writer, "close")`.
 
+6. **Lỗi Assertion CUTLASS/Triton trên Blackwell B200 (`cudaErrorAssert / 40960`)**:
+   - *Hiện tượng:* `Assertion index out of bounds: 0 <= tl.broadcast_to(tmp28, [XBLOCK, R0_BLOCK]) < 40960 failed` và crash EngineCore ở `flashinfer_autotune` -> `_dummy_run`.
+   - *Nguyên nhân:*
+     1. `flashinfer_autotune` chạy dummy queries tới 16,384 tokens qua DFlash speculator, làm vỡ giới hạn tile cumsum của kernel CUTLASS DSL FlashAttention 4 trên B200 (sm_100a).
+     2. `target_layer_ids` khi export bị tính sai thành `[0, 7, 14, 22, 29]` thay vì danh sách 5 layers huấn luyện chuẩn `[1, 9, 17, 25, 33]`.
+   - *Khắc phục:*
+     1. Vô hiệu hoá dummy runs autotune bằng `enable_flashinfer_autotune=False` (giúp khởi động DFlash an toàn và bỏ qua autotune vốn không sinh config mới trên B200).
+     2. Bổ sung cờ `--enforce-eager` nếu cần bỏ qua CUDA Graph capture / torch.compile.
+     3. Khôi phục cơ chế đọc `target_layer_ids` chính xác từ `config.json` hoặc gọi `build_target_layer_ids(36, 5) -> [1, 9, 17, 25, 33]`.
+     4. Tự động tái sử dụng kết quả Vanilla đã đo từ `output-dir` khi chạy với `--skip-vanilla`.
+
 ---
 
 ## 5. Hướng dẫn Lệnh Thực thi Chuẩn (Standard Operating Procedures)
