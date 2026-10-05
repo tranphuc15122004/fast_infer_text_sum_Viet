@@ -32,7 +32,7 @@ MAX_SAMPLES=100
 MAX_NEW_TOKENS=512
 OUTPUT_DIR="$ROOT/outputs/vllm_evaluation_$(date +%Y%m%d_%H%M%S)"
 SKIP_VANILLA=0
-ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-0}"
+ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 GPU="${CUDA_VISIBLE_DEVICES:-0}"
 
 usage() {
@@ -54,7 +54,7 @@ Tùy chọn:
   --max-new-tokens INT     Độ dài sinh tối đa (mặc định: $MAX_NEW_TOKENS)
   --output-dir PATH        Thư mục lưu kết quả benchmark (mặc định: $OUTPUT_DIR)
   --skip-vanilla           Bỏ qua chạy lại baseline Vanilla (nếu chỉ muốn đo draft)
-  --enforce-eager          Chạy eager mode (tắt CUDA graphs / torch.compile)
+  --no-enforce-eager       Tắt eager mode, bật capture CUDA graphs (mất thêm ~7 phút)
   -h, --help               Hiển thị hướng dẫn này
 EOF
   exit 0
@@ -96,6 +96,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --enforce-eager)
       ENFORCE_EAGER=1
+      shift 1
+      ;;
+    --no-enforce-eager)
+      ENFORCE_EAGER=0
       shift 1
       ;;
     -h|--help)
@@ -160,8 +164,8 @@ if [[ "$SKIP_VANILLA" -eq 1 ]]; then
   EVAL_CMD+=(--skip-vanilla)
 fi
 
-if [[ "$ENFORCE_EAGER" -eq 1 ]]; then
-  EVAL_CMD+=(--enforce-eager)
+if [[ "$ENFORCE_EAGER" -eq 0 ]]; then
+  EVAL_CMD+=(--no-enforce-eager)
 fi
 
 "${EVAL_CMD[@]}"

@@ -225,7 +225,13 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--skip-vanilla", action="store_true", help="Skip vanilla baseline run")
-    parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager execution (disable CUDA graphs / torch.compile)")
+    parser.add_argument(
+        "--no-enforce-eager",
+        dest="enforce_eager",
+        action="store_false",
+        help="Disable eager mode and capture CUDA graphs (takes ~7 mins per model)",
+    )
+    parser.set_defaults(enforce_eager=True)
     parser.add_argument(
         "--enable-flashinfer-autotune",
         action="store_true",
@@ -234,8 +240,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if os.environ.get("VLLM_ENFORCE_EAGER", "0") == "1":
-        args.enforce_eager = True
+    if os.environ.get("VLLM_ENFORCE_EAGER", "1") == "0":
+        args.enforce_eager = False
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset_list = [d.strip() for d in args.datasets.split(",") if d.strip()]
@@ -257,16 +263,53 @@ def main() -> None:
 
     all_summaries: list[dict[str, Any]] = []
 
-    # If skip-vanilla is requested, attempt to load previous vanilla baseline results from output_dir
+    # Check if vanilla records or summary already exist in output_dir
+    vanilla_records_file = args.output_dir / "vanilla_vllm_records.jsonl"
     summary_file = args.output_dir / "evaluation_summary.json"
-    if args.skip_vanilla and summary_file.is_file():
+    loaded_vanilla = False
+
+    if summary_file.is_file():
         try:
             prev = json.loads(summary_file.read_text(encoding="utf-8"))
             for p in prev:
                 if p.get("method") == "vanilla_vllm":
                     all_summaries.append(p)
+                    loaded_vanilla = True
         except Exception:
             pass
+
+    if not loaded_vanilla and vanilla_records_file.is_file():
+        try:
+            lines = [json.loads(l) for l in vanilla_records_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+            from collections import defaultdict
+            by_ds = defaultdict(list)
+            for r in lines:
+                by_ds[r.get("dataset", "unknown")].append(r)
+            for ds, recs in by_ds.items():
+                tot_out = sum(r.get("output_tokens", 0) for r in recs)
+                tot_dur = sum(r.get("duration_s", 0.0) for r in recs)
+                tp = tot_out / max(tot_dur, 1e-6)
+                rg = aggregate_rouge(recs) if any("rouge1" in r for r in recs) else {}
+                all_summaries.append({
+                    "dataset": ds,
+                    "method": "vanilla_vllm",
+                    "num_samples": len(recs),
+                    "total_output_tokens": tot_out,
+                    "duration_s": round(tot_dur, 2),
+                    "throughput_tok_s": round(tp, 2),
+                    "acceptance_rate_pct": None,
+                    "rouge1": round(rg.get("rouge1", 0.0) * 100, 2) if "rouge1" in rg else None,
+                    "rouge2": round(rg.get("rouge2", 0.0) * 100, 2) if "rouge2" in rg else None,
+                    "rougeL": round(rg.get("rougeL", 0.0) * 100, 2) if "rougeL" in rg else None,
+                })
+                loaded_vanilla = True
+            if loaded_vanilla:
+                print(f"✅ Phát hiện kết quả đo Vanilla trước đó tại {vanilla_records_file.name}. Tái sử dụng {len(lines)} mẫu baseline đã đo, bỏ qua chạy lại Vanilla!")
+        except Exception as exc:
+            print(f"⚠️ Could not parse existing vanilla records: {exc}")
+
+    if loaded_vanilla:
+        args.skip_vanilla = True
 
     # Load tokenizer for chat template formatting
     tokenizer = None
