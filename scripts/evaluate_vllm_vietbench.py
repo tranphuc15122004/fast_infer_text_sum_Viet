@@ -317,14 +317,28 @@ def run_vllm_inference(
     sampling_params: Any,
     method_name: str,
     dataset_name: str,
+    batch_size: int = 1,
     writer: JsonlWriter | None = None,
 ) -> dict[str, Any]:
-    print(f"\n>>> Running vLLM inference: [{method_name}] on [{dataset_name}] ({len(prompts)} samples)...")
+    print(f"\n>>> Running vLLM inference: [{method_name}] on [{dataset_name}] ({len(prompts)} samples, BS={batch_size})...")
 
     start_time = time.perf_counter()
-    outputs = llm.generate(prompts, sampling_params)
+    outputs = []
+    chunk_durations = []
+
+    # Execute in chunks of batch_size (default: 1 for latency benchmark matching src/Benchmark)
+    step_size = max(1, batch_size)
+    with tqdm(total=len(prompts), desc=f"Evaluating [{dataset_name}] ({method_name})") as pbar:
+        for start_idx in range(0, len(prompts), step_size):
+            chunk_prompts = prompts[start_idx : start_idx + step_size]
+            t0 = time.perf_counter()
+            chunk_outs = llm.generate(chunk_prompts, sampling_params, use_tqdm=False)
+            dt = time.perf_counter() - t0
+            outputs.extend(chunk_outs)
+            chunk_durations.extend([dt / max(len(chunk_prompts), 1)] * len(chunk_outs))
+            pbar.update(len(chunk_prompts))
+
     total_duration = time.perf_counter() - start_time
-    
     peak_memory_gb = get_gpu_memory_used_gb()
 
     total_prompt_tokens = 0
@@ -348,7 +362,8 @@ def run_vllm_inference(
         total_prompt_tokens += p_tokens
         total_output_tokens += o_tokens
 
-        timing = extract_request_timing(out, total_duration, len(outputs), o_tokens)
+        req_dt = chunk_durations[i] if i < len(chunk_durations) else (total_duration / len(outputs))
+        timing = extract_request_timing(out, req_dt, 1, o_tokens)
         spec_metrics = extract_spec_metrics(out, method_name)
 
         if spec_metrics.get("draft_tokens_accepted") is not None:
@@ -364,7 +379,7 @@ def run_vllm_inference(
             "input_tokens": p_tokens,
             "retained_tokens": p_tokens,
             "output_tokens": o_tokens,
-            "batch_size": 1,
+            "batch_size": batch_size,
             "selector_latency_ms": None,
             "server_startup_ms": None,
             "queue_wait_ms": timing.get("queue_wait_ms"),
@@ -441,6 +456,7 @@ def run_vllm_inference(
         "method": method_name,
         "model": model_name,
         "num_samples": len(prompts),
+        "batch_size": batch_size,
         "total_input_tokens": total_prompt_tokens,
         "total_output_tokens": total_output_tokens,
         "duration_s": round(total_duration, 2),
@@ -481,6 +497,7 @@ def main() -> None:
     parser.add_argument("--datasets", default="vietnews,wikilingua,vims,vlsp", help="Comma-separated datasets")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "outputs" / "vllm_vietbench_eval")
     parser.add_argument("--max-samples", type=int, default=100, help="Max samples per dataset (default: 100)")
+    parser.add_argument("--batch-size", type=int, default=1, help="Inference batch size (default: 1 for latency benchmark)")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--max-model-len", type=int, default=12288)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
@@ -524,19 +541,30 @@ def main() -> None:
 
     all_summaries: list[dict[str, Any]] = []
 
-    # Check if vanilla records exist in output_dir
-    vanilla_records_file = args.output_dir / "vanilla_vllm_records.jsonl"
+    # Check if vanilla records exist in output_dir for this specific batch size
+    vanilla_records_file = args.output_dir / f"vanilla_vllm_records_bs{args.batch_size}.jsonl"
+    if not vanilla_records_file.is_file() and args.batch_size == 1:
+        # Check standard name as fallback
+        alt_file = args.output_dir / "vanilla_vllm_records.jsonl"
+        if alt_file.is_file():
+            # Check if alt_file was actually run at BS=1
+            try:
+                first_line = json.loads(alt_file.read_text(encoding="utf-8").splitlines()[0])
+                if first_line.get("batch_size") == 1:
+                    vanilla_records_file = alt_file
+            except Exception:
+                pass
+
     summary_file = args.output_dir / "evaluation_summary.json"
     loaded_vanilla = False
 
-    # Stale / corrupted summary cleaner:
-    # If summary_file has corrupted throughput (>50k tok/s) or duration <= 0.1s, ignore it!
+    # Check if valid vanilla summary already exists in evaluation_summary.json for this batch_size
     if summary_file.is_file():
         try:
             prev = json.loads(summary_file.read_text(encoding="utf-8"))
             valid_prev_vanilla = []
             for p in prev:
-                if p.get("method") == "vanilla_vllm":
+                if p.get("method") == "vanilla_vllm" and p.get("batch_size", 1) == args.batch_size:
                     tp = p.get("throughput_tok_s") or 0.0
                     dur = p.get("duration_s") or 0.0
                     if 0.1 < dur and 10.0 <= tp <= 50000.0 and p.get("mean_e2e_ms") is not None:
@@ -544,6 +572,7 @@ def main() -> None:
             if len(valid_prev_vanilla) >= len(dataset_list):
                 all_summaries.extend(valid_prev_vanilla)
                 loaded_vanilla = True
+                print(f"✅ Phát hiện kết quả đo Vanilla (BS={args.batch_size}) hợp lệ trong {summary_file.name}, bỏ qua chạy lại Vanilla!")
         except Exception:
             pass
 
@@ -554,13 +583,6 @@ def main() -> None:
             by_ds = defaultdict(list)
             for r in lines:
                 by_ds[r.get("dataset", "unknown")].append(r)
-            
-            # Ground-truth measured baseline durations (seconds per 100 samples) on B200 from initial vanilla runs:
-            # vietnews: 2.45s (6,838 tok/s)
-            # wikilingua: 1.43s (10,381 tok/s)
-            # vims: 4.44s (3,554 tok/s)
-            # vlsp: 4.25s (4,272 tok/s)
-            dur_map = {"vietnews": 2.45, "wikilingua": 1.43, "vims": 4.44, "vlsp": 4.25}
 
             for ds, recs in by_ds.items():
                 seen_ids = set()
@@ -575,27 +597,33 @@ def main() -> None:
                 tot_out = sum(r.get("output_tokens", 0) for r in recs)
                 tot_in = sum(r.get("input_tokens", r.get("prompt_tokens", 0)) for r in recs)
                 
-                # Use ground-truth measured duration on B200
-                tot_dur = dur_map.get(ds, 3.0) * (len(recs) / 100.0)
-                tp = tot_out / max(tot_dur, 1e-6)
-                rg = aggregate_rouge(recs) if any("rouge1" in r for r in recs) else {}
+                ttft_vals = [r["ttft_ms"] for r in recs if r.get("ttft_ms") is not None]
+                tpot_vals = [r["tpot_ms"] for r in recs if r.get("tpot_ms") is not None]
+                e2e_vals = [r["e2e_ms"] for r in recs if r.get("e2e_ms") is not None]
+                
+                tot_dur = sum((r.get("e2e_ms", 0.0) / 1000.0) for r in recs)
+                if tot_dur <= 0.0:
+                    tot_dur = sum(r.get("duration_s", 0.0) for r in recs)
 
-                mean_e2e = round((tot_dur / len(recs)) * 1000.0, 2)
-                mean_tpot = round((tot_dur * 1000.0) / max(tot_out, 1), 4)
-                mean_ttft = round(mean_e2e * 0.35, 2)
+                mean_ttft = round(sum(ttft_vals) / len(ttft_vals), 2) if ttft_vals else None
+                mean_tpot = round(sum(tpot_vals) / len(tpot_vals), 4) if tpot_vals else None
+                mean_e2e = round(sum(e2e_vals) / len(e2e_vals), 2) if e2e_vals else None
+                tp = round(tot_out / max(tot_dur, 1e-6), 2) if tot_dur > 0 else 0.0
+                rg = aggregate_rouge(recs) if any("rouge1" in r for r in recs) else {}
 
                 all_summaries.append({
                     "dataset": ds,
                     "method": "vanilla_vllm",
                     "model": "Qwen3-4B",
                     "num_samples": len(recs),
+                    "batch_size": args.batch_size,
                     "total_input_tokens": tot_in,
                     "total_output_tokens": tot_out,
                     "duration_s": round(tot_dur, 2),
                     "mean_ttft_ms": mean_ttft,
                     "mean_tpot_ms": mean_tpot,
                     "mean_e2e_ms": mean_e2e,
-                    "throughput_tok_s": round(tp, 2),
+                    "throughput_tok_s": tp,
                     "qps": round(len(recs) / max(tot_dur, 1e-6), 2),
                     "peak_memory_gb": 16.5,
                     "acceptance_rate_pct": None,
@@ -609,7 +637,7 @@ def main() -> None:
                 })
                 loaded_vanilla = True
             if loaded_vanilla:
-                print(f"✅ Phát hiện kết quả đo Vanilla trước đó tại {vanilla_records_file.name}. Tái sử dụng {len(recs)} mẫu baseline chuẩn hoá, bỏ qua chạy lại Vanilla!")
+                print(f"✅ Phát hiện kết quả đo Vanilla tại {vanilla_records_file.name}. Tái sử dụng {len(recs)} mẫu baseline chuẩn hoá, bỏ qua chạy lại Vanilla!")
         except Exception as exc:
             print(f"⚠️ Could not parse existing vanilla records: {exc}")
 
@@ -638,7 +666,7 @@ def main() -> None:
     # 1. Run Vanilla Baseline if not skipped
     if not args.skip_vanilla:
         print("\n================================================================================")
-        print("🚀 STEP 1/2: Running Vanilla vLLM Baseline (No Speculative Decoding)")
+        print(f"🚀 STEP 1/2: Running Vanilla vLLM Baseline (No Speculative Decoding, BS={args.batch_size})")
         print("================================================================================")
         vanilla_kwargs = dict(common_kwargs)
         vanilla_llm = LLM(**vanilla_kwargs)
@@ -648,7 +676,7 @@ def main() -> None:
             except Exception:
                 pass
         
-        vanilla_writer = JsonlWriter(args.output_dir / "vanilla_vllm_records.jsonl")
+        vanilla_writer = JsonlWriter(vanilla_records_file)
         
         for ds_name in dataset_list:
             raw_samples = load_dataset_samples(args.data_dir, ds_name, args.max_samples)
@@ -664,6 +692,7 @@ def main() -> None:
                 sampling_params=sampling_params,
                 method_name="vanilla_vllm",
                 dataset_name=ds_name,
+                batch_size=args.batch_size,
                 writer=vanilla_writer,
             )
             all_summaries.append(res)
@@ -694,7 +723,7 @@ def main() -> None:
 
     for idx, (method_label, draft_path) in enumerate(draft_specs, start=1):
         print("\n================================================================================")
-        print(f"⚡ RUNNING SPECULATIVE EVALUATION [{idx}/{len(draft_specs)}]: [{method_label}]")
+        print(f"⚡ RUNNING SPECULATIVE EVALUATION [{idx}/{len(draft_specs)}]: [{method_label}] (BS={args.batch_size})")
         print(f"   Draft Model: {draft_path}")
         print("================================================================================")
         
@@ -716,7 +745,7 @@ def main() -> None:
             except Exception:
                 pass
         
-        dflash_writer = JsonlWriter(args.output_dir / f"{method_label}_records.jsonl")
+        dflash_writer = JsonlWriter(args.output_dir / f"{method_label}_records_bs{args.batch_size}.jsonl")
         
         for ds_name in dataset_list:
             raw_samples = load_dataset_samples(args.data_dir, ds_name, args.max_samples)
@@ -732,6 +761,7 @@ def main() -> None:
                 sampling_params=sampling_params,
                 method_name=method_label,
                 dataset_name=ds_name,
+                batch_size=args.batch_size,
                 writer=dflash_writer,
             )
             all_summaries.append(res)
@@ -746,7 +776,7 @@ def main() -> None:
 
     # 3. Calculate Speedup and Comparative Metrics
     print("\n================================================================================")
-    print("📊 BÁO CÁO TỔNG KẾT VIETBENCH BENCHMARK")
+    print(f"📊 BÁO CÁO TỔNG KẾT VIETBENCH BENCHMARK (Batch Size = {args.batch_size})")
     print("================================================================================")
     
     vanilla_map = {s["dataset"]: s for s in all_summaries if s["method"] == "vanilla_vllm"}
@@ -784,13 +814,14 @@ def main() -> None:
 
     # Write Markdown Table
     md_lines = [
-        "# Báo cáo Đánh giá VietBench (vLLM Speculative Decoding)",
+        f"# Báo cáo Đánh giá VietBench (vLLM Speculative Decoding - Batch Size = {args.batch_size})",
         "",
-        "| Dataset | Phương pháp | Mẫu | TTFT (ms) | TPOT (ms) | E2E (ms) | Throughput (tok/s) | Speedup (Thru) | Speedup (Lat) | Accept Rate (%) | Avg Accept Len (τ) | ROUGE-1 | ROUGE-2 | ROUGE-L | VRAM (GB) |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Dataset | Phương pháp | Mẫu | BS | TTFT (ms) | TPOT (ms) | E2E (ms) | Throughput (tok/s) | Speedup (Thru) | Speedup (Lat) | Accept Rate (%) | Avg Accept Len (τ) | ROUGE-1 | ROUGE-2 | ROUGE-L | VRAM (GB) |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     
     for s in all_summaries:
+        bs_str = str(s.get("batch_size", args.batch_size))
         ttft_str = f"{s.get('mean_ttft_ms'):.1f}" if s.get('mean_ttft_ms') is not None else "-"
         tpot_str = f"{s.get('mean_tpot_ms'):.2f}" if s.get('mean_tpot_ms') is not None else "-"
         e2e_str = f"{s.get('mean_e2e_ms'):.1f}" if s.get('mean_e2e_ms') is not None else "-"
@@ -805,7 +836,7 @@ def main() -> None:
         vram_str = f"{s.get('peak_memory_gb'):.2f}" if s.get('peak_memory_gb') is not None else "-"
 
         md_lines.append(
-            f"| `{s['dataset']}` | `{s['method']}` | {s['num_samples']} | {ttft_str} | {tpot_str} | {e2e_str} | {tp_str} | {sp_thru} | {sp_lat} | {acc_str} | {tau_str} | {r1} | {r2} | {rL} | {vram_str} |"
+            f"| `{s['dataset']}` | `{s['method']}` | {s['num_samples']} | {bs_str} | {ttft_str} | {tpot_str} | {e2e_str} | {tp_str} | {sp_thru} | {sp_lat} | {acc_str} | {tau_str} | {r1} | {r2} | {rL} | {vram_str} |"
         )
     
     report_text = "\n".join(md_lines)
@@ -819,7 +850,7 @@ def main() -> None:
 
     csv_path = args.output_dir / "evaluation_summary.csv"
     csv_fields = [
-        "dataset", "method", "model", "num_samples", "duration_s",
+        "dataset", "method", "model", "num_samples", "batch_size", "duration_s",
         "mean_ttft_ms", "mean_tpot_ms", "mean_e2e_ms",
         "throughput_tok_s", "speedup_throughput", "speedup_latency", "speedup_tpot",
         "acceptance_rate_pct", "avg_accept_length", "accepted_draft_tokens_per_step",

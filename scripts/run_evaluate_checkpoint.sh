@@ -30,8 +30,9 @@ CHECKPOINT=""
 ALL_BASELINES=0
 DATASETS="vietnews,wikilingua,vims,vlsp"
 MAX_SAMPLES=100
+BATCH_SIZE=1
 MAX_NEW_TOKENS=512
-OUTPUT_DIR="$ROOT/outputs/vllm_evaluation_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR=""
 SKIP_VANILLA=0
 ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 GPU="${CUDA_VISIBLE_DEVICES:-0}"
@@ -49,12 +50,13 @@ Sử dụng: $(basename "$0") [TÙY CHỌN]
 Tùy chọn:
   --checkpoint PATH        Đường dẫn thư mục checkpoint (hoặc file draft_state_dict.pt)
   --all-baselines          Tự động đánh giá cả 3 baselines (scratch, finetuned, growmtp)
+  --batch-size INT         Inference batch size (mặc định: 1 cho Latency Benchmark chuẩn)
   --target-model PATH      Đường dẫn Target Model (mặc định: $TARGET_MODEL)
   --gpu ID                 GPU ID để chạy vLLM (mặc định: $GPU)
   --datasets LIST          Danh sách dataset phân tách bằng dấu phẩy (mặc định: $DATASETS)
   --max-samples INT        Số mẫu mỗi dataset (mặc định: $MAX_SAMPLES)
   --max-new-tokens INT     Độ dài sinh tối đa (mặc định: $MAX_NEW_TOKENS)
-  --output-dir PATH        Thư mục lưu kết quả benchmark (mặc định: $OUTPUT_DIR)
+  --output-dir PATH        Thư mục lưu kết quả benchmark (mặc định: auto theo batch size)
   --skip-vanilla           Bỏ qua chạy lại baseline Vanilla (nếu chỉ muốn đo draft)
   --no-enforce-eager       Tắt eager mode, bật capture CUDA graphs (mất thêm ~7 phút)
   -h, --help               Hiển thị hướng dẫn này
@@ -71,6 +73,10 @@ while [[ $# -gt 0 ]]; do
     --all-baselines)
       ALL_BASELINES=1
       shift 1
+      ;;
+    --batch-size)
+      BATCH_SIZE="$2"
+      shift 2
       ;;
     --target-model)
       TARGET_MODEL="$2"
@@ -119,13 +125,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 export CUDA_VISIBLE_DEVICES="$GPU"
+
+if [[ -z "$OUTPUT_DIR" ]]; then
+  OUTPUT_DIR="$ROOT/outputs/vllm_evaluation_bs${BATCH_SIZE}_$(date +%Y%m%d_%H%M%S)"
+fi
+
 mkdir -p "$OUTPUT_DIR"
 
-# Tự động tái sử dụng vanilla_vllm_records.jsonl từ lần chạy trước nếu có
-PREV_VANILLA="/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/benchmark_eval/vanilla_vllm_records.jsonl"
-if [[ ! -f "$OUTPUT_DIR/vanilla_vllm_records.jsonl" && -f "$PREV_VANILLA" ]]; then
-  echo ">>> Tự động liên kết kết quả Vanilla đã đo trước đó từ: $PREV_VANILLA"
-  cp "$PREV_VANILLA" "$OUTPUT_DIR/vanilla_vllm_records.jsonl"
+# Tự động tái sử dụng vanilla_vllm_records_bs${BATCH_SIZE}.jsonl từ lần chạy trước nếu có đúng batch size
+PREV_VANILLA="/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/benchmark_eval_bs${BATCH_SIZE}/vanilla_vllm_records_bs${BATCH_SIZE}.jsonl"
+if [[ ! -f "$OUTPUT_DIR/vanilla_vllm_records_bs${BATCH_SIZE}.jsonl" && -f "$PREV_VANILLA" ]]; then
+  echo ">>> Tự động liên kết kết quả Vanilla (BS=${BATCH_SIZE}) đã đo trước đó từ: $PREV_VANILLA"
+  cp "$PREV_VANILLA" "$OUTPUT_DIR/vanilla_vllm_records_bs${BATCH_SIZE}.jsonl"
 fi
 
 if [[ "$ALL_BASELINES" -eq 1 ]]; then
@@ -175,7 +186,7 @@ if [[ "$ALL_BASELINES" -eq 1 ]]; then
 
   echo ""
   echo "================================================================================"
-  echo "🚀 BƯỚC 2: TIẾN HÀNH ĐÁNH GIÁ ĐỒNG LOẠT 3 BASELINES TRÊN VIETBENCH"
+  echo "🚀 BƯỚC 2: TIẾN HÀNH ĐÁNH GIÁ ĐỒNG LOẠT 3 BASELINES TRÊN VIETBENCH (BS=${BATCH_SIZE})"
   echo "================================================================================"
 
   EVAL_CMD=(
@@ -184,6 +195,7 @@ if [[ "$ALL_BASELINES" -eq 1 ]]; then
     --draft-models "$DRAFT_MODELS_ARG"
     --datasets "$DATASETS"
     --max-samples "$MAX_SAMPLES"
+    --batch-size "$BATCH_SIZE"
     --max-new-tokens "$MAX_NEW_TOKENS"
     --output-dir "$OUTPUT_DIR"
   )
@@ -231,7 +243,7 @@ else
 
   echo ""
   echo "================================================================================"
-  echo "🚀 BƯỚC 2: TIẾN HÀNH ĐÁNH GIÁ TRÊN VIETBENCH BẰNG vLLM"
+  echo "🚀 BƯỚC 2: TIẾN HÀNH ĐÁNH GIÁ TRÊN VIETBENCH BẰNG vLLM (BS=${BATCH_SIZE})"
   echo "================================================================================"
 
   EVAL_CMD=(
@@ -240,6 +252,7 @@ else
     --draft-model "$EXPORTED_DIR"
     --datasets "$DATASETS"
     --max-samples "$MAX_SAMPLES"
+    --batch-size "$BATCH_SIZE"
     --max-new-tokens "$MAX_NEW_TOKENS"
     --output-dir "$OUTPUT_DIR"
   )
@@ -257,7 +270,7 @@ fi
 
 echo ""
 echo "================================================================================"
-echo "🎉 HOÀN TẤT ĐÁNH GIÁ! Xem kết quả chi tiết tại:"
+echo "🎉 HOÀN TẤT ĐÁNH GIÁ (BS=${BATCH_SIZE})! Xem kết quả chi tiết tại:"
 echo "   - Markdown Report: $OUTPUT_DIR/evaluation_summary.md"
 echo "   - JSON Report:     $OUTPUT_DIR/evaluation_summary.json"
 echo "   - CSV Report:      $OUTPUT_DIR/evaluation_summary.csv"
