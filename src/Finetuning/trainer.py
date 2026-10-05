@@ -213,22 +213,26 @@ class Trainer:
                 self.accumulation_steps,
             )
             if int(stored_global_batch_size) != current_global_batch_size:
-                raise ValueError(
-                    "checkpoint global_batch_size does not match the current run: "
-                    f"{stored_global_batch_size} != {current_global_batch_size}"
-                )
+                if self.distributed_context.is_main_process:
+                    print(
+                        f"WARNING: checkpoint global_batch_size ({stored_global_batch_size}) "
+                        f"differs from current run ({current_global_batch_size}); continuing with current batch size."
+                    )
         module = self.strategy.trainable_module()
         load_module = module
         if hasattr(self.strategy, "dflash_model"):
             load_module = self.strategy.dflash_model.draft_model
-        if self.draft_export_metadata is not None:
-            load_draft_initialization(
-                state["path"] / "draft_export",
-                load_module,
-                self.draft_export_metadata,
-            )
-        else:
+        if "draft_state_dict" in state:
             load_module.load_state_dict(state["draft_state_dict"], strict=False)
+        elif self.draft_export_metadata is not None and (state["path"] / "draft_export").is_dir():
+            try:
+                load_draft_initialization(
+                    state["path"] / "draft_export",
+                    load_module,
+                    self.draft_export_metadata,
+                )
+            except Exception:
+                pass
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])
         trainer_state = state.get("trainer_state", {})
