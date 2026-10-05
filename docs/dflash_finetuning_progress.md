@@ -82,34 +82,19 @@ bash scripts/run_evaluate_checkpoint.sh \
 ```
 
 ### 5.2. Chạy Huấn luyện Baseline 2 (Finetune từ DFlash gốc)
+Cách 1-click (khuyên dùng):
 ```bash
-FINETUNE_OUTPUT="/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_finetuned"
-DFLASH_PRETRAINED="/workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B-DFlash-b16"
-
-mkdir -p "$FINETUNE_OUTPUT"
-ln -sfn "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/features" "$FINETUNE_OUTPUT/features"
-ln -sfn "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/teacher" "$FINETUNE_OUTPUT/teacher"
-
-bash scripts/run_phase2_train_b200.sh \
-  --draft-init-path "$DFLASH_PRETRAINED" \
-  --output-root "$FINETUNE_OUTPUT" \
-  --run-id "qwen3-4b-finetuned" \
-  --gpus 0,1 \
-  --epochs 6
+bash scripts/run_phase2_finetune_from_pretrained.sh --gpus 0,1
 ```
 
 ### 5.3. Chạy Huấn luyện Baseline 3 (Nghiên cứu Loss GrowMTP)
+Chạy trên 1 GPU (GPU 0 trống):
 ```bash
-GROW_OUTPUT="/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_growmtp"
-
-mkdir -p "$GROW_OUTPUT"
-ln -sfn "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/features" "$GROW_OUTPUT/features"
-ln -sfn "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/teacher" "$GROW_OUTPUT/teacher"
-
-bash scripts/run_phase2_train_b200.sh \
-  --loss-type growmtp \
-  --output-root "$GROW_OUTPUT" \
-  --run-id "qwen3-4b-growmtp" \
-  --gpus 0,1 \
-  --epochs 6
+bash scripts/run_phase2_train_growmtp.sh --gpus 0
 ```
+Hoặc nếu có cả 2 GPU:
+```bash
+bash scripts/run_phase2_train_growmtp.sh --gpus 0,1
+```
+Script sẽ tự động symlink feature cache, cấu hình loss GrowMTP (DCA + VGM), và lưu checkpoint vào `/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_growmtp/checkpoints/`.
+

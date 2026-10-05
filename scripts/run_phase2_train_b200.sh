@@ -46,6 +46,7 @@ EPOCHS="${EPOCHS:-6}"
 BATCH_SIZE="${BATCH_SIZE:-}"
 DRAFT_INIT_PATH="${DRAFT_INIT_PATH:-}"
 LOSS_TYPE="${LOSS_TYPE:-}"
+RUN_ID="${RUN_ID:-}"
 EXTRA_ARGS=()
 
 usage() {
@@ -115,6 +116,10 @@ while [[ $# -gt 0 ]]; do
       LOSS_TYPE="$2"
       shift 2
       ;;
+    --run-id)
+      RUN_ID="$2"
+      shift 2
+      ;;
     --config)
       CONFIG="$2"
       shift 2
@@ -175,6 +180,10 @@ fi
 
 if [[ -n "$LOSS_TYPE" ]]; then
   CMD+=(--loss-type "$LOSS_TYPE")
+fi
+
+if [[ -n "$RUN_ID" ]]; then
+  CMD+=(--run-id "$RUN_ID")
 fi
 
 if [[ -n "$MAX_STEPS" ]]; then
