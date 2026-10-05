@@ -1397,9 +1397,11 @@ def _write_run_manifest(
         "config_sha256",
         "train_input",
         "eval_input",
-        "target_model_path",
-    }
-    if paths.run_manifest.exists():
+    has_checkpoints = (
+        paths.checkpoints.is_dir()
+        and any((c / "COMPLETE").is_file() for c in paths.checkpoints.glob("*-step*"))
+    )
+    if paths.run_manifest.exists() and has_checkpoints:
         try:
             previous = json.loads(paths.run_manifest.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
