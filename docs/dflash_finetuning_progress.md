@@ -73,6 +73,11 @@ Trong quá trình triển khai, 4 lỗi phát sinh trên server B200 đã đư�
    - *Nguyên nhân:* Khởi tạo 2 đối tượng `LLM(...)` tuần tự trong cùng tiến trình Python làm treo tiến trình nền `EngineCore` và giữ VRAM GPU.
    - *Khắc phục:* Triển khai hàm `shutdown_vllm_engine(llm)` dựa trên `src/Benchmark/vllm_all_baselines.py` gọi `engine_core.shutdown(timeout=30)` và `torch.cuda.empty_cache()` sau mỗi bước.
 
+5. **Tương thích Giao diện Ghi Record (`JsonlWriter.write` và `.close`)**:
+   - *Hiện tượng:* `AttributeError: 'JsonlWriter' object has no attribute 'write'`.
+   - *Nguyên nhân:* `JsonlWriter` trong `src/Benchmark/common/io_util.py` sử dụng phương thức `add(record)` và `finalize(summary)`, không có `write()` và `close()`.
+   - *Khắc phục:* Bổ sung alias `write = add` và `close() -> None` vào `JsonlWriter`, đồng thời trong `scripts/evaluate_vllm_vietbench.py` kiểm tra linh hoạt `hasattr(writer, "add")` và `hasattr(writer, "close")`.
+
 ---
 
 ## 5. Hướng dẫn Lệnh Thực thi Chuẩn (Standard Operating Procedures)
