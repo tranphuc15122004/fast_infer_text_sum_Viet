@@ -110,14 +110,16 @@ done
 
 export CUDA_VISIBLE_DEVICES="$GPU"
 
-# Tự động tìm checkpoint mới nhất nếu người dùng không truyền
+# Tự động tìm checkpoint mới nhất nếu người dùng không truyền hoặc truyền thư mục cha
 if [[ -z "$CHECKPOINT" ]]; then
-  if [[ -d "$DEFAULT_CHECKPOINT_DIR" ]]; then
-    LATEST_CP="$(find "$DEFAULT_CHECKPOINT_DIR" -maxdepth 1 -name "*-step*" -type d | sort -V | tail -n 1)"
-    if [[ -n "$LATEST_CP" ]]; then
-      CHECKPOINT="$LATEST_CP"
-      echo ">>> Tự động phát hiện Checkpoint mới nhất: $CHECKPOINT"
-    fi
+  CHECKPOINT="$DEFAULT_CHECKPOINT_DIR"
+fi
+
+if [[ -d "$CHECKPOINT" ]]; then
+  LATEST_CP="$(find "$CHECKPOINT" -maxdepth 1 -name "*-step*" -type d | sort -V | tail -n 1)"
+  if [[ -n "$LATEST_CP" ]]; then
+    echo ">>> Tự động phát hiện Checkpoint mới nhất: $LATEST_CP"
+    CHECKPOINT="$LATEST_CP"
   fi
 fi
 

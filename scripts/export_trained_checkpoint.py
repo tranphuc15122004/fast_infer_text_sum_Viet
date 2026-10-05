@@ -43,10 +43,12 @@ def export_checkpoint(
     elif cp.is_file() and cp.suffix == ".pt":
         state_dict_path = cp
     else:
-        # Search inside subdirectories
+        # Search inside subdirectories and sort by name/step to pick the latest
         candidates = list(cp.glob("**/draft_state_dict.pt"))
         if candidates:
-            state_dict_path = candidates[0]
+            import re
+            candidates.sort(key=lambda p: [int(s) for s in re.findall(r"\d+", str(p))] if re.findall(r"\d+", str(p)) else [0])
+            state_dict_path = candidates[-1]
 
     if state_dict_path is None or not state_dict_path.is_file():
         raise FileNotFoundError(f"Cannot find draft_state_dict.pt in {cp}")
