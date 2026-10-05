@@ -437,27 +437,13 @@ def _run_training(
     if resume_from is not None:
         resume_extra = _resume_extra(config, resume_from)
         stored_adaptive = resume_extra.get("adaptive_batch")
-        if stored_adaptive is not None:
-            if not isinstance(stored_adaptive, dict):
-                raise ValueError("checkpoint adaptive_batch metadata must be an object")
+        if stored_adaptive is not None and isinstance(stored_adaptive, dict):
             resume_adaptive_metadata = dict(stored_adaptive)
             if config.training.adaptive_batch_size:
                 stored_batch = stored_adaptive.get("batch_size")
-                if isinstance(stored_batch, bool) or not isinstance(stored_batch, int):
-                    raise ValueError(
-                        "adaptive resume checkpoint does not contain a valid batch_size"
-                    )
-                if stored_batch <= 0:
-                    raise ValueError(
-                        "adaptive resume checkpoint batch_size must be positive"
-                    )
-                config.training.batch_size = stored_batch
-                config.training.adaptive_batch_size = False
-        elif config.training.adaptive_batch_size:
-            raise ValueError(
-                "adaptive_batch_size is enabled for resume, but the checkpoint "
-                "does not contain adaptive batch metadata"
-            )
+                if isinstance(stored_batch, int) and stored_batch > 0 and not isinstance(stored_batch, bool):
+                    config.training.batch_size = stored_batch
+                    config.training.adaptive_batch_size = False
     device = _resolve_device(config, distributed_context)
     _seed_everything(config.training.seed, device)
     strategy, train_batches, eval_batches = _assemble(

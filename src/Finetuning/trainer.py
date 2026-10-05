@@ -222,10 +222,6 @@ class Trainer:
         if hasattr(self.strategy, "dflash_model"):
             load_module = self.strategy.dflash_model.draft_model
         if self.draft_export_metadata is not None:
-            # A DFlash resume must preserve the frozen target, selected target
-            # layers and draft architecture.  The embedded export provides a
-            # strict state-dict and metadata boundary; silently using
-            # ``strict=False`` here could otherwise produce a corrupted run.
             load_draft_initialization(
                 state["path"] / "draft_export",
                 load_module,
