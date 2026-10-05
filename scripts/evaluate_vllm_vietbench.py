@@ -64,6 +64,32 @@ def load_dataset_samples(data_dir: Path, dataset_name: str, max_samples: int | N
     return rows
 
 
+def shutdown_vllm_engine(llm: Any) -> None:
+    """Cleanly terminate vLLM engine, free memory and kill worker processes."""
+    if llm is None:
+        return
+    try:
+        if hasattr(llm, "llm_engine") and hasattr(llm.llm_engine, "engine_core"):
+            llm.llm_engine.engine_core.shutdown(timeout=30)
+    except Exception:
+        pass
+    try:
+        llm.shutdown()
+    except Exception:
+        pass
+    import gc
+    import torch
+    del llm
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+    time.sleep(1.0)
+
+
 def run_vllm_inference(
     llm: Any,
     prompts: list[str],
@@ -89,13 +115,13 @@ def run_vllm_inference(
     total_draft_proposed = 0
     
     for i, out in enumerate(outputs):
-        prompt_text = prompts[i]
+        prompt_text = prompts[i] if i < len(prompts) else ""
         ref_text = references[i] if i < len(references) else ""
         sample_id = sample_ids[i] if i < len(sample_ids) else str(i)
         
-        gen_text = out.outputs[0].text
-        p_tokens = len(out.prompt_token_ids)
-        o_tokens = len(out.outputs[0].token_ids)
+        gen_text = out.outputs[0].text if (out.outputs and len(out.outputs) > 0) else ""
+        p_tokens = len(out.prompt_token_ids) if getattr(out, "prompt_token_ids", None) else 0
+        o_tokens = len(out.outputs[0].token_ids) if (out.outputs and hasattr(out.outputs[0], "token_ids")) else 0
         total_prompt_tokens += p_tokens
         total_output_tokens += o_tokens
         
@@ -109,20 +135,49 @@ def run_vllm_inference(
             "reference": ref_text,
         }
         
-        # Extract speculative metrics if present
-        metrics = getattr(out.outputs[0], "metrics", None)
-        if metrics is not None:
-            accepted = getattr(metrics, "num_accepted_tokens", getattr(metrics, "draft_tokens_accepted", None))
-            proposed = getattr(metrics, "num_proposed_tokens", getattr(metrics, "draft_tokens_proposed", None))
-            if accepted is not None:
-                total_draft_accepted += int(accepted)
-                record["draft_accepted_tokens"] = int(accepted)
-            if proposed is not None:
-                total_draft_proposed += int(proposed)
-                record["draft_proposed_tokens"] = int(proposed)
+        # Robust speculative metrics extraction across vLLM variants
+        accepted = None
+        proposed = None
+        if out.outputs and len(out.outputs) > 0:
+            comp = out.outputs[0]
+            spec_metrics = getattr(comp, "spec_decode_metrics", None)
+            if spec_metrics is not None:
+                for k in ("draft_tokens_accepted", "num_accepted_tokens", "accepted_draft_tokens", "num_draft_tokens_accepted"):
+                    v = getattr(spec_metrics, k, None)
+                    if v is not None:
+                        accepted = v
+                        break
+                for k in ("draft_tokens_proposed", "num_proposed_tokens", "proposed_draft_tokens", "num_draft_tokens"):
+                    v = getattr(spec_metrics, k, None)
+                    if v is not None:
+                        proposed = v
+                        break
+            if accepted is None or proposed is None:
+                req_metrics = getattr(comp, "metrics", None) or getattr(out, "metrics", None)
+                if req_metrics is not None:
+                    for k in ("draft_tokens_accepted", "num_accepted_tokens", "accepted_draft_tokens"):
+                        v = getattr(req_metrics, k, None)
+                        if v is not None:
+                            accepted = v
+                            break
+                    for k in ("draft_tokens_proposed", "num_proposed_tokens", "proposed_draft_tokens"):
+                        v = getattr(req_metrics, k, None)
+                        if v is not None:
+                            proposed = v
+                            break
+        
+        if accepted is not None:
+            total_draft_accepted += int(accepted)
+            record["draft_accepted_tokens"] = int(accepted)
+        if proposed is not None:
+            total_draft_proposed += int(proposed)
+            record["draft_proposed_tokens"] = int(proposed)
         
         if ref_text:
-            add_rouge(record, gen_text, ref_text)
+            try:
+                add_rouge(record, gen_text, ref_text)
+            except Exception:
+                pass
             
         if writer is not None:
             writer.write(record)
@@ -168,6 +223,11 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset_list = [d.strip() for d in args.datasets.split(",") if d.strip()]
 
+    # Ensure offline execution and optimal V2 model runner on B200
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
+
     try:
         from vllm import LLM, SamplingParams
     except ImportError as exc:
@@ -193,13 +253,14 @@ def main() -> None:
         print("\n================================================================================")
         print("🚀 STEP 1/2: Running Vanilla vLLM Baseline (No Speculative Decoding)")
         print("================================================================================")
-        vanilla_llm = LLM(
-            model=args.model,
-            tensor_parallel_size=args.tensor_parallel_size,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            max_model_len=args.max_model_len,
-            trust_remote_code=True,
-        )
+        vanilla_kwargs: dict[str, Any] = {
+            "model": args.model,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "max_model_len": args.max_model_len,
+            "trust_remote_code": True,
+        }
+        vanilla_llm = LLM(**vanilla_kwargs)
         if tokenizer is None:
             try:
                 tokenizer = vanilla_llm.get_tokenizer()
@@ -227,10 +288,8 @@ def main() -> None:
             all_summaries.append(res)
             
         vanilla_writer.close()
-        del vanilla_llm
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        shutdown_vllm_engine(vanilla_llm)
+        vanilla_llm = None
 
     # 2. Run DFlash Speculative Decoding
     if args.draft_model:
@@ -245,14 +304,23 @@ def main() -> None:
             "num_speculative_tokens": 16,
         }
         
-        dflash_llm = LLM(
-            model=args.model,
-            speculative_config=speculative_config,
-            tensor_parallel_size=args.tensor_parallel_size,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            max_model_len=args.max_model_len,
-            trust_remote_code=True,
-        )
+        dflash_kwargs: dict[str, Any] = {
+            "model": args.model,
+            "speculative_config": speculative_config,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "max_model_len": args.max_model_len,
+            "trust_remote_code": True,
+        }
+        try:
+            import inspect
+            sig = inspect.signature(LLM.__init__)
+            if "per_request_spec_decode_metrics" in sig.parameters:
+                dflash_kwargs["per_request_spec_decode_metrics"] = "detailed"
+        except Exception:
+            pass
+
+        dflash_llm = LLM(**dflash_kwargs)
         if tokenizer is None:
             try:
                 tokenizer = dflash_llm.get_tokenizer()
@@ -280,9 +348,8 @@ def main() -> None:
             all_summaries.append(res)
             
         dflash_writer.close()
-        del dflash_llm
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        shutdown_vllm_engine(dflash_llm)
+        dflash_llm = None
 
     # 3. Generate Comparative Report
     print("\n================================================================================")
