@@ -212,6 +212,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate DFlash with vLLM on VietBench")
     parser.add_argument("--model", required=True, help="Target model path (e.g. Qwen3-4B)")
     parser.add_argument("--draft-model", help="Draft model path (exported DFlash checkpoint)")
+    parser.add_argument(
+        "--draft-models",
+        help="Comma-separated label:path pairs, e.g. 'scratch:/path1,finetuned:/path2,growmtp:/path3'",
+    )
     parser.add_argument("--data-dir", type=Path, default=ROOT / "datasets" / "eval_100")
     parser.add_argument("--datasets", default="vietnews,wikilingua,vims,vlsp", help="Comma-separated datasets")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "outputs" / "vllm_vietbench_eval")
@@ -325,15 +329,31 @@ def main() -> None:
         vanilla_llm = None
 
     # 2. Run DFlash Speculative Decoding
-    if args.draft_model:
+    draft_specs: list[tuple[str, Path]] = []
+    if args.draft_models:
+        for item in args.draft_models.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" in item:
+                lbl, p = item.split(":", 1)
+                draft_specs.append((lbl.strip(), Path(p.strip())))
+            else:
+                p = Path(item)
+                draft_specs.append((p.name, p))
+    elif args.draft_model:
+        draft_specs.append(("dflash_spec", Path(args.draft_model)))
+
+    for idx, (method_label, draft_path) in enumerate(draft_specs, start=1):
         print("\n================================================================================")
-        print("⚡ STEP 2/2: Running DFlash Speculative Decoding in vLLM")
+        print(f"⚡ RUNNING SPECULATIVE EVALUATION [{idx}/{len(draft_specs)}]: [{method_label}]")
+        print(f"   Draft Model: {draft_path}")
         print("================================================================================")
         
         # Speculative config for DFlash
         speculative_config = {
             "method": "dflash",
-            "model": str(args.draft_model),
+            "model": str(draft_path),
             "num_speculative_tokens": 16,
         }
         
@@ -354,7 +374,7 @@ def main() -> None:
             except Exception:
                 pass
         
-        dflash_writer = JsonlWriter(args.output_dir / "dflash_spec_records.jsonl")
+        dflash_writer = JsonlWriter(args.output_dir / f"{method_label}_records.jsonl")
         
         for ds_name in dataset_list:
             raw_samples = load_dataset_samples(args.data_dir, ds_name, args.max_samples)
@@ -368,7 +388,7 @@ def main() -> None:
                 references,
                 sample_ids,
                 sampling_params=sampling_params,
-                method_name="dflash_spec",
+                method_name=method_label,
                 dataset_name=ds_name,
                 writer=dflash_writer,
             )

@@ -112,22 +112,40 @@ Trong quá trình triển khai, 4 lỗi phát sinh trên server B200 đã đư�
 
 ---
 
-## 5. Hướng dẫn Đánh giá Benchmark 3 Baseline trên VietBench
+## 5. Hướng dẫn Đánh giá Benchmark trên VietBench
 
-Cả 3 baseline hiện đã **huấn luyện xong thành công**. Tiến hành đánh giá trên 4 bộ test VietBench (100 mẫu/bộ) bằng vLLM:
+Cả 3 baseline hiện đã **huấn luyện xong thành công**. Có 2 cách thực thi:
 
-### 5.1. Đánh giá Baseline 1 (From Scratch)
-Chạy trên GPU 0 (hoặc GPU trống bất kỳ):
+### 5.1. Cách Khuyến nghị: Đánh giá Gộp Toàn bộ 3 Baseline trong 1 Lệnh Duy Nhất (1-Click)
+Script `scripts/run_evaluate_all_baselines.sh` sẽ tự động:
+1. Export cả 3 checkpoint (Scratch, Finetuned, GrowMTP) sang định dạng vLLM.
+2. Chạy Vanilla vLLM một lần duy nhất (hoặc bỏ qua với `--skip-vanilla`).
+3. Lần lượt đo cả 3 draft models trên 4 bộ dữ liệu VietBench (100 mẫu/bộ).
+4. Xuất một bảng so sánh tổng hợp đối đầu duy nhất so sánh cả 4 phương pháp.
+
 ```bash
 cd /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum_Viet-main
 git pull origin main
 
+# Chạy đánh giá toàn bộ (thêm --enforce-eager để hoàn thành trong 2-3 phút thay vì chờ 20 phút):
+bash scripts/run_evaluate_all_baselines.sh \
+  --output-dir "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/all_baselines_eval" \
+  --gpu 0 \
+  --enforce-eager
+```
+> *Mẹo siêu tốc:* Nếu muốn kết quả đo đạc chính xác với CUDA graph capture tối đa của Blackwell, bỏ cờ `--enforce-eager`.
+
+---
+
+### 5.2. Cách Đánh giá Riêng lẻ Từng Baseline (Tùy chọn)
+
+#### A. Đánh giá Riêng Baseline 1 (From Scratch):
+```bash
 bash scripts/run_evaluate_checkpoint.sh \
   --checkpoint "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/checkpoints" \
   --output-dir "/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_phase1_Viet/benchmark_eval" \
   --gpu 0
 ```
-> *Lưu ý: Nếu Vanilla vLLM đã chạy thành công ở lần trước trong thư mục này, thêm `--skip-vanilla` để bỏ qua 10 phút chạy lại Vanilla.*
 
 ---
 
