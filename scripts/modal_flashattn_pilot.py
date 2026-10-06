@@ -14,11 +14,23 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-import modal
+SERVER_MODE = os.environ.get("FA4_EXECUTION_BACKEND") == "server"
+if SERVER_MODE:
+    modal = None
+else:
+    try:
+        import modal
+    except ImportError:  # The server-native runner does not require the Modal SDK.
+        modal = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-REMOTE_ROOT = Path("/workspace/fast_infer_text_sum_Viet")
+USE_MODAL = modal is not None and not SERVER_MODE
+REMOTE_ROOT = (
+    PROJECT_ROOT
+    if SERVER_MODE
+    else Path("/workspace/fast_infer_text_sum_Viet")
+)
 REMOTE_SRC = REMOTE_ROOT / "src"
 DATASETS = ("vietnews", "wikilingua", "vims", "vlsp")
 METHODS = ("vanilla_hf", "eagle3", "dflash", "domino", "dspark")
@@ -31,22 +43,35 @@ REMOTE_DATA_FILES = {
     for name in DATASETS
 }
 
-TARGET_MODEL = os.environ.get("MODAL_QWEN3_MODEL", "Qwen/Qwen3-4B")
-MODEL_REPOS = {
-    "vanilla_hf": TARGET_MODEL,
-    "eagle3": os.environ.get(
-        "MODAL_EAGLE3_MODEL_REPO", "AngelSlim/Qwen3-4B_eagle3"
-    ),
-    "dflash": os.environ.get(
-        "MODAL_DFLASH_MODEL_REPO", "z-lab/Qwen3-4B-DFlash-b16"
-    ),
-    "domino": os.environ.get(
-        "MODAL_DOMINO_MODEL_REPO", "Huang2020/Qwen3-4B-Domino-b16"
-    ),
-    "dspark": os.environ.get(
-        "MODAL_DSPARK_MODEL_REPO", "deepseek-ai/dspark_qwen3_4b_block7"
-    ),
-}
+TARGET_MODEL = (
+    os.environ.get("MODEL_TARGET", "")
+    if SERVER_MODE
+    else os.environ.get("MODAL_QWEN3_MODEL", "Qwen/Qwen3-4B")
+)
+if SERVER_MODE:
+    MODEL_REPOS = {
+        "vanilla_hf": TARGET_MODEL,
+        "eagle3": os.environ.get("MODEL_EAGLE_DRAFT", ""),
+        "dflash": os.environ.get("MODEL_DFLASH_DRAFT", ""),
+        "domino": os.environ.get("MODEL_DOMINO_DRAFT", ""),
+        "dspark": os.environ.get("MODEL_DSPARK_DRAFT", ""),
+    }
+else:
+    MODEL_REPOS = {
+        "vanilla_hf": TARGET_MODEL,
+        "eagle3": os.environ.get(
+            "MODAL_EAGLE3_MODEL_REPO", "AngelSlim/Qwen3-4B_eagle3"
+        ),
+        "dflash": os.environ.get(
+            "MODAL_DFLASH_MODEL_REPO", "z-lab/Qwen3-4B-DFlash-b16"
+        ),
+        "domino": os.environ.get(
+            "MODAL_DOMINO_MODEL_REPO", "Huang2020/Qwen3-4B-Domino-b16"
+        ),
+        "dspark": os.environ.get(
+            "MODAL_DSPARK_MODEL_REPO", "deepseek-ai/dspark_qwen3_4b_block7"
+        ),
+    }
 GPU = os.environ.get("MODAL_GPU", "B200")
 MAX_INPUT_TOKENS = int(os.environ.get("MODAL_MAX_INPUT_TOKENS", "8192"))
 DEFAULT_MAX_NEW_TOKENS = int(os.environ.get("MODAL_MAX_NEW_TOKENS", "512"))
@@ -55,8 +80,11 @@ ATTENTION = "flash_attention_4"
 OUTPUT_VOLUME_NAME = os.environ.get(
     "MODAL_FA4_OUTPUT_VOLUME", "fast-infer-viet-fa4-results"
 )
-OUTPUT_VOLUME = modal.Volume.from_name(OUTPUT_VOLUME_NAME, create_if_missing=True)
-REMOTE_OUTPUT_ROOT = Path("/fa4-results")
+REMOTE_OUTPUT_ROOT = (
+    Path(os.environ.get("FA4_OUTPUT_ROOT", PROJECT_ROOT / "outputs/fa4_native_benchmark"))
+    if SERVER_MODE
+    else Path("/fa4-results")
+)
 ARTIFACT_FILENAMES = (
     "results.jsonl",
     "run_report.json",
@@ -84,98 +112,116 @@ PINNED_VERSIONS = {
     "nvidia-cutlass-dsl": "4.7.1",
 }
 
-app = modal.App("fast-infer-viet-native-flashattn-benchmark")
+class _LocalApp:
+    def function(self, **_kwargs):
+        return lambda function: function
 
-image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:13.0.2-devel-ubuntu24.04", add_python="3.12"
+    def local_entrypoint(self, **_kwargs):
+        return lambda function: function
+
+
+class _LocalVolume:
+    def commit(self) -> None:
+        return None
+
+
+if USE_MODAL:
+    app = modal.App("fast-infer-viet-native-flashattn-benchmark")
+    OUTPUT_VOLUME = modal.Volume.from_name(OUTPUT_VOLUME_NAME, create_if_missing=True)
+    image = (
+        modal.Image.from_registry(
+            "nvidia/cuda:13.0.2-devel-ubuntu24.04", add_python="3.12"
+        )
+        .entrypoint([])
+        .apt_install("git", "build-essential")
+        .pip_install(
+            "torch==2.13.0",
+            extra_options=(
+                "--index-url https://download.pytorch.org/whl/cu130 "
+                "--extra-index-url https://pypi.org/simple"
+            ),
+        )
+        .pip_install(
+            "flash-attn-4==4.0.0b19",
+            "nvidia-cutlass-dsl==4.7.1",
+            "nvidia-cutlass-dsl-libs-base==4.7.1",
+            "nvidia-cutlass-dsl-libs-core==4.7.1",
+            "nvidia-cutlass-dsl-libs-cu13==4.7.1",
+            "cuda-bindings==13.4.1",
+            "cuda-python==13.4.1",
+            "cuda-core==1.2.0",
+            "cuda-pathfinder==1.8.1",
+            "cuda-toolkit==13.0.3.0",
+            "apache-tvm-ffi==0.1.11",
+            "quack-kernels==0.6.5",
+            "torch_c_dlpack_ext==0.1.5",
+            "triton==3.7.1",
+            "einops==0.8.2",
+            "ninja==1.13.0",
+            extra_options="--pre",
+        )
+        .pip_install(
+            "transformers==5.12.1",
+            "tokenizers==0.22.2",
+            "accelerate==1.15.0",
+            "huggingface_hub==1.31.0",
+            "safetensors==0.8.0",
+            "numpy==2.3.5",
+            "regex==2026.9.10",
+            "sentencepiece==0.2.2",
+            "tqdm==4.70.1",
+            "psutil==7.2.2",
+            "packaging==26.3",
+        )
+        .add_local_dir(
+            str(PROJECT_ROOT / "src"),
+            remote_path=str(REMOTE_SRC),
+            copy=True,
+            ignore=["**/*vllm*"],
+        )
+        .add_local_dir(
+            str(PROJECT_ROOT / "externals" / "dflash"),
+            remote_path=str(REMOTE_ROOT / "externals" / "dflash"),
+            copy=True,
+        )
+        .add_local_dir(
+            str(PROJECT_ROOT / "externals" / "Domino" / "code"),
+            remote_path=str(REMOTE_ROOT / "externals" / "Domino" / "code"),
+            copy=True,
+        )
+        .add_local_dir(
+            str(PROJECT_ROOT / "externals" / "DeepSpec"),
+            remote_path=str(REMOTE_ROOT / "externals" / "DeepSpec"),
+            copy=True,
+        )
+        .add_local_dir(
+            str(PROJECT_ROOT / "externals" / "EAGLE"),
+            remote_path=str(REMOTE_ROOT / "externals" / "EAGLE"),
+            copy=True,
+        )
+        .env(
+            {
+                "PYTHONPATH": str(REMOTE_SRC),
+                "HF_HUB_DISABLE_TELEMETRY": "1",
+                "TOKENIZERS_PARALLELISM": "false",
+                "PYTHONUNBUFFERED": "1",
+                "HF_HOME": "/root/.cache/huggingface",
+            }
+        )
     )
-    .entrypoint([])
-    .apt_install("git", "build-essential")
-    .pip_install(
-        "torch==2.13.0",
-        extra_options=(
-            "--index-url https://download.pytorch.org/whl/cu130 "
-            "--extra-index-url https://pypi.org/simple"
-        ),
-    )
-    .pip_install(
-        "flash-attn-4==4.0.0b19",
-        "nvidia-cutlass-dsl==4.7.1",
-        "nvidia-cutlass-dsl-libs-base==4.7.1",
-        "nvidia-cutlass-dsl-libs-core==4.7.1",
-        "nvidia-cutlass-dsl-libs-cu13==4.7.1",
-        "cuda-bindings==13.4.1",
-        "cuda-python==13.4.1",
-        "cuda-core==1.2.0",
-        "cuda-pathfinder==1.8.1",
-        "cuda-toolkit==13.0.3.0",
-        "apache-tvm-ffi==0.1.11",
-        "quack-kernels==0.6.5",
-        "torch_c_dlpack_ext==0.1.5",
-        "triton==3.7.1",
-        "einops==0.8.2",
-        "ninja==1.13.0",
-        extra_options="--pre",
-    )
-    .pip_install(
-        "transformers==5.12.1",
-        "tokenizers==0.22.2",
-        "accelerate==1.15.0",
-        "huggingface_hub==1.31.0",
-        "safetensors==0.8.0",
-        "numpy==2.3.5",
-        "regex==2026.9.10",
-        "sentencepiece==0.2.2",
-        "tqdm==4.70.1",
-        "psutil==7.2.2",
-        "packaging==26.3",
-    )
-    .add_local_dir(
-        str(PROJECT_ROOT / "src"),
-        remote_path=str(REMOTE_SRC),
-        copy=True,
-        ignore=["**/*vllm*"],
-    )
-    .add_local_dir(
-        str(PROJECT_ROOT / "externals" / "dflash"),
-        remote_path=str(REMOTE_ROOT / "externals" / "dflash"),
-        copy=True,
-    )
-    .add_local_dir(
-        str(PROJECT_ROOT / "externals" / "Domino" / "code"),
-        remote_path=str(REMOTE_ROOT / "externals" / "Domino" / "code"),
-        copy=True,
-    )
-    .add_local_dir(
-        str(PROJECT_ROOT / "externals" / "DeepSpec"),
-        remote_path=str(REMOTE_ROOT / "externals" / "DeepSpec"),
-        copy=True,
-    )
-    .add_local_dir(
-        str(PROJECT_ROOT / "externals" / "EAGLE"),
-        remote_path=str(REMOTE_ROOT / "externals" / "EAGLE"),
-        copy=True,
-    )
-    .env(
-        {
-            "PYTHONPATH": str(REMOTE_SRC),
-            "HF_HUB_DISABLE_TELEMETRY": "1",
-            "TOKENIZERS_PARALLELISM": "false",
-            "PYTHONUNBUFFERED": "1",
-            "HF_HOME": "/root/.cache/huggingface",
-        }
-    )
-)
-for _dataset, _local_file in LOCAL_DATA_FILES.items():
+    for _dataset, _local_file in LOCAL_DATA_FILES.items():
+        image = image.add_local_file(
+            str(_local_file), remote_path=str(REMOTE_DATA_FILES[_dataset]), copy=True
+        )
     image = image.add_local_file(
-        str(_local_file), remote_path=str(REMOTE_DATA_FILES[_dataset]), copy=True
+        str(PROJECT_ROOT / "datasets" / "eval_100" / "manifest.json"),
+        remote_path=str(REMOTE_ROOT / "datasets" / "eval_100" / "manifest.json"),
+        copy=True,
     )
-image = image.add_local_file(
-    str(PROJECT_ROOT / "datasets" / "eval_100" / "manifest.json"),
-    remote_path=str(REMOTE_ROOT / "datasets" / "eval_100" / "manifest.json"),
-    copy=True,
-)
+else:
+    app = _LocalApp()
+    OUTPUT_VOLUME = _LocalVolume()
+    image = None
 
 
 def _install_fa4_compat() -> None:
@@ -186,11 +232,13 @@ def _install_fa4_compat() -> None:
     _install_flash_attention_4_cutlass_compat()
 
     # FA4 4.0.0b19 still imports this primitive from QuACK, while QuACK 0.6.5
-    # removed that export.  The upstream compatibility fix calls the same
-    # CuTe primitive directly; provide that alias without modifying site-packages.
-    import cutlass.cute.arch as cute_arch
-    import quack.activation as quack_activation
-
+    # removed that export. The B200 server's FA4 b15 stack does not need this
+    # optional alias. Keep it process-local when the Modal package pair is used.
+    try:
+        import cutlass.cute.arch as cute_arch
+        import quack.activation as quack_activation
+    except ImportError:
+        return
     if not hasattr(quack_activation, "sub_packed_f32x2"):
         quack_activation.sub_packed_f32x2 = cute_arch.sub_packed_f32x2
 
@@ -1357,7 +1405,7 @@ def run_flashattn_benchmark(
     from Benchmark.common.rouge import add_rouge, aggregate_rouge
 
     if not torch.cuda.is_available():
-        raise RuntimeError("Modal worker did not expose a CUDA GPU")
+        raise RuntimeError("Benchmark process did not expose a CUDA GPU")
     if torch.cuda.get_device_capability(0)[0] < 10:
         raise RuntimeError("FA4 benchmark requires a Blackwell-class GPU (SM100+)")
     if mode not in {"smoke", "representative", "full"}:
@@ -1378,7 +1426,8 @@ def run_flashattn_benchmark(
     if not run_id.replace("-", "").replace("_", "").isalnum():
         raise ValueError("run-id may contain only letters, numbers, hyphen and underscore")
     actual_versions = _version_snapshot()
-    _validate_pins(actual_versions)
+    if USE_MODAL:
+        _validate_pins(actual_versions)
     try:
         import flash_attn.cute  # noqa: F401
     except Exception as exc:
@@ -1388,7 +1437,9 @@ def run_flashattn_benchmark(
         torch, actual_versions, methods=selected_methods
     )
     baseline_config = validate_flashattn_runtime(
-        runtime, methods=selected_methods
+        runtime,
+        methods=selected_methods,
+        allow_installed_vllm=SERVER_MODE,
     )
     runtime["fa4_tree_mask_gpu_probe"] = _fa4_tree_mask_gpu_probe(torch)
     runtime["dataset_validation"] = validate_output_dir(
@@ -2189,6 +2240,7 @@ def run_flashattn_benchmark(
                 actual_runtime,
                 methods=selected_methods,
                 require_dispatch_proof=True,
+                allow_installed_vllm=SERVER_MODE,
             )
         except ValueError as exc:
             runtime_validation = {
@@ -2231,7 +2283,8 @@ def run_flashattn_benchmark(
         "started_at_utc": started_at_utc,
         "finished_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "evaluation_runtime_seconds": round(time.perf_counter() - started_perf, 3),
-        "method": "modal_native_fa4_all_baselines",
+        "method": "native_transformers_fa4_all_baselines",
+        "execution_backend": "server" if SERVER_MODE else "modal",
         "status": run_status,
         "backend": "transformers_native",
         "attention_backend": ATTENTION,
@@ -2309,7 +2362,7 @@ def run_flashattn_benchmark(
         "measurement_limitations": [
             "Native HF does not expose one common server-side request timeline; queue wait, batch wait and server-reported E2E are null.",
             "Vanilla and DSpark use CUDA-event duration of the initial target forward as their prefill proxy; speculative methods use their native TTFT timer when available.",
-            "Timing is specific to the pinned checkpoint, prompt, Modal GPU allocation and package versions.",
+            "Timing is specific to the checkpoint, prompt, GPU allocation and installed package versions.",
         ],
     }
 

@@ -2,8 +2,8 @@
 
 `src/Benchmark` chứa adapter inference, runtime guard, schema kết quả và metric
 cho benchmark tóm tắt văn bản tiếng Việt. Pipeline so sánh năm baseline trên
-GPU Modal Blackwell là **native Transformers + FlashAttention-4 (FA4)**; không
-dùng vLLM:
+GPU B200 là **native Transformers + FlashAttention-4 (FA4)**; inference không
+import hay gọi vLLM:
 
 | Method | Cơ chế | Model draft |
 |---|---|---|
@@ -13,10 +13,11 @@ dùng vLLM:
 | `domino` | Parallel block + causal correction | Domino block 16 |
 | `dspark` | Learned parallel speculative decoding | DSpark block 7 |
 
-Runner chính: [`scripts/modal_flashattn_pilot.py`](../../scripts/modal_flashattn_pilot.py);
-runbook đầy đủ: [`docs/flashattn4_benchmark.md`](../../docs/flashattn4_benchmark.md).
-Tên file pilot được giữ để tương thích các lệnh Modal đã dùng trước đó; CLI hỗ
-trợ smoke, representative và full benchmark.
+Lệnh chạy trực tiếp trên server B200 là `scripts/run_fa4_benchmark.sh`; runner
+dùng Python 3.12, model path trong master config `_Viet`, dữ liệu trong repo và
+FA4 đã cài trên server. Modal được tách riêng qua
+`scripts/run_fa4_modal_benchmark.sh`. Runbook:
+[`docs/flashattn4_benchmark.md`](../../docs/flashattn4_benchmark.md).
 
 ## Contract chung
 
@@ -32,16 +33,16 @@ trợ smoke, representative và full benchmark.
 - Output ghi theo schema `Benchmark.common.benchmark_runtime` và kết thúc bằng
   summary record qua `JsonlWriter`.
 
-## Lệnh Modal
+## Lệnh server B200
 
 ```bash
-# Kiểm tra FA4/GPU/package pins/tree mask, không sinh output
+# Kiểm tra FA4/GPU/tree mask và eval_100; không nạp model checkpoint
 bash scripts/run_fa4_benchmark.sh --preflight-only
 
-# Smoke tất cả baseline trên một dataset
+# Smoke đủ năm baseline trên một mẫu của mỗi dataset
 bash scripts/run_fa4_benchmark.sh \
-  --mode smoke --datasets vietnews --samples-per-dataset 1 \
-  --max-new-tokens 32
+  --mode smoke --datasets all --samples-per-dataset 1 \
+  --max-new-tokens 64
 
 # 20 mẫu/dataset, chọn quantile độ dài có tính xác định
 bash scripts/run_fa4_benchmark.sh \
@@ -51,6 +52,10 @@ bash scripts/run_fa4_benchmark.sh \
 bash scripts/run_fa4_benchmark.sh \
   --mode full --datasets all --max-new-tokens 512 --repetitions 1
 ```
+
+Launcher đọc `config/master.path`, source master config duy nhất cho repo này,
+và dùng `FI_GPU_IDS` để chọn GPU. Có thể truyền `FAST_INFER_MASTER_CONFIG` để
+ghi đè config; không cài package hoặc tải model khi chạy benchmark.
 
 Tùy chọn CLI gồm dataset/method selection, sample cap, input/output token cap,
 warmup tokens, repetitions, seed, retry, run ID/resume, CUDA launch debugging,
@@ -82,8 +87,8 @@ không thay đổi output model để khiến gate pass.
 
 ## Artifacts và các runner khác
 
-Modal lưu checkpoint trên Volume `fast-infer-viet-fa4-results` và tải kết quả
-sang `outputs/modal_flashattn_benchmark/<run-id>/`:
+Chạy trên server ghi checkpoint và artifact trực tiếp dưới
+`outputs/fa4_native_benchmark/<run-id>/`:
 
 - `results.jsonl`, `run_report.json`, `report_vi.md`, `metrics_summary.csv`;
 - `warmup.jsonl`, `events.jsonl`, `samples.jsonl`, `excluded_samples.jsonl`;
@@ -91,5 +96,5 @@ sang `outputs/modal_flashattn_benchmark/<run-id>/`:
 
 `vllm_all_baselines.py`, `run_vllm_all.sh` và kết quả vLLM cũ vẫn nằm trong repo
 để tái hiện lịch sử; chúng không phải pipeline FA4 hiện hành. `run_longbench_200.py`
-là orchestration cho các baseline LongBench khác và không thay cho runner Modal
-này.
+là orchestration cho các baseline LongBench khác và không thay cho runner FA4
+này. Modal vẫn có launcher riêng để tái hiện run trên Modal.

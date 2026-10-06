@@ -176,6 +176,25 @@ def test_runtime_rejects_vllm_even_if_not_imported():
         validate_flashattn_runtime(runtime, methods=METHODS)
 
 
+def test_native_server_may_have_vllm_installed_but_must_not_import_it():
+    runtime = _runtime()
+    runtime["installed_distributions"].append("vllm")
+
+    result = validate_flashattn_runtime(
+        runtime, methods=METHODS, allow_installed_vllm=True
+    )
+
+    assert result["passed"] is True
+    assert result["vllm_installed"] is True
+    assert result["vllm_imported"] is False
+
+    runtime["imported_modules"].append("vllm")
+    with pytest.raises(ValueError, match="must not be imported"):
+        validate_flashattn_runtime(
+            runtime, methods=METHODS, allow_installed_vllm=True
+        )
+
+
 def test_runtime_rejects_vllm_plugin_distribution_and_import():
     runtime = _runtime()
     runtime["installed_distributions"].append("fast-infer-viet-vllm-plugin")

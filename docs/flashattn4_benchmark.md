@@ -1,90 +1,105 @@
 # Benchmark native Transformers với FlashAttention-4
 
-Runner `scripts/modal_flashattn_pilot.py` triển khai một benchmark batch-1 trên
-GPU Blackwell của Modal cho năm method trong `src/Benchmark`:
-`vanilla_hf`, `eagle3`, `dflash`, `domino`, `dspark`. Target là Qwen3-4B; mọi
-target và draft attention đều phải dispatch qua FA4, nếu có fallback thì runtime
-gate báo lỗi. Runner không nạp vLLM.
+Runner so sánh năm method `vanilla_hf`, `eagle3`, `dflash`, `domino`, `dspark`
+trực tiếp trên GPU B200 của server. Cả target và draft đều phải dispatch qua
+FlashAttention-4 (FA4); runtime gate dừng run nếu phát hiện attention fallback.
+Inference chạy bằng Transformers native, batch size 1, greedy decoding, không
+import hay gọi vLLM. Runner dùng Python 3.12 và package FA4 đã cài trên server;
+nó không tạo virtualenv, cài package, hoặc tải checkpoint từ internet.
 
-Các file JSONL trong `datasets/eval_100/` là nguồn dữ liệu. Tất cả method dùng
-cùng prompt, tokenized input, seed, greedy decoding và ngân sách token. Mẫu được
-chọn theo quantile độ dài có tính xác định; full mode dùng đủ 100 mẫu của mỗi
-dataset được chọn. Nếu input dài hơn giới hạn, runner giữ head và suffix của
-prompt bằng cùng helper truncation dùng trong benchmark chung, đồng thời ghi số
-token nguồn và cờ truncation.
+Target và draft checkpoint được lấy từ master config mà `config/master.path`
+trỏ tới. Bốn JSONL dưới `datasets/eval_100/` là dữ liệu chung, mỗi file có 100
+mẫu. Mọi method dùng cùng tokenizer, prompt tiếng Việt, seed và ngân sách token.
+Representative chọn 20 mẫu/dataset phủ dải độ dài; full chạy đủ 100 mẫu/dataset.
+Input dài hơn giới hạn sẽ được truncate bằng helper dùng chung và ghi lại số
+token nguồn cùng cờ truncation.
 
-## Chạy
+## Chạy trên server B200
 
-Trước tiên kiểm tra GPU, package pins, khả năng import FA4 và kernel tree mask:
+Chạy từ thư mục checkout repo Việt trên server. Mặc định launcher đọc
+`config/master.path`; để chỉ rõ master config `_Viet`, truyền path làm đối số
+đầu tiên hoặc đặt `FAST_INFER_MASTER_CONFIG`:
 
 ```bash
-bash scripts/run_fa4_benchmark.sh --preflight-only
+cd /workspace/storage-shared/nlp/dungdx4/phuc_projects
+export FAST_INFER_MASTER_CONFIG=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master_Viet.env
 ```
 
-Smoke nhanh một dataset qua đủ năm method:
+Preflight kiểm tra Python 3.12, FA4 import qua compatibility shim của repo,
+B200 (SM100+), kernel tree-mask của EAGLE và tính toàn vẹn của `eval_100/`; nó
+không nạp model checkpoint:
 
 ```bash
-bash scripts/run_fa4_benchmark.sh \
-  --mode smoke --datasets vietnews --samples-per-dataset 1 \
-  --max-new-tokens 32
+FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh --preflight-only
 ```
 
-Benchmark representative mặc định 20 mẫu/dataset; full mặc định đủ 100:
+Sau khi preflight pass, smoke chạy một mẫu mỗi dataset qua đủ năm baseline:
 
 ```bash
-bash scripts/run_fa4_benchmark.sh \
+FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh \
+  --mode smoke --datasets all --samples-per-dataset 1 \
+  --max-new-tokens 64
+```
+
+Representative chạy 20 mẫu cho mỗi dataset được chọn. Có thể bắt đầu với một
+dataset để kiểm tra thời gian và mức dùng VRAM; lệnh dưới đây chạy cả bốn:
+
+```bash
+FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh \
   --mode representative --datasets all --max-new-tokens 512
+```
 
-bash scripts/run_fa4_benchmark.sh \
+Full dùng đủ 100 mẫu/dataset:
+
+```bash
+FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh \
   --mode full --datasets all --max-new-tokens 512 --repetitions 1
 ```
 
-Chọn tập/method hoặc đổi model repository qua các biến `MODAL_QWEN3_MODEL`,
-`MODAL_EAGLE3_MODEL_REPO`, `MODAL_DFLASH_MODEL_REPO`,
-`MODAL_DOMINO_MODEL_REPO`, `MODAL_DSPARK_MODEL_REPO`. `--methods` phải có cả
-`vanilla_hf` và `dflash` vì đây là cặp reference tối thiểu của runner.
+`FI_GPU_IDS=0` dùng GPU vật lý số 0. Có thể bỏ nếu master config đã chọn đúng
+GPU hoặc scheduler đã gán `CUDA_VISIBLE_DEVICES`. Mỗi method được nạp và chạy
+tuần tự trên cùng một GPU, vì vậy có thể chạy khi chỉ GPU 0 đang rảnh; runner
+không chia một run sang nhiều card.
 
-Các tham số chính: `--samples-per-dataset 0` chọn toàn bộ eligible rows,
-`--max-input-tokens`, `--warmup-tokens`, `--repetitions`, `--seed`,
-`--sample-retries`, `--checkpoint-interval`, `--run-id`, `--resume`,
-`--direct-target-audit`, `--verifier-audit`, `--output-dir`. Mặc định mỗi mẫu
-được warmup riêng bằng 8 token; kết quả đo lặp được giữ qua `repeat_index` và
-tổng hợp trên từng sample/repeat.
+Các option chính: `--datasets`, `--methods`, `--samples-per-dataset`,
+`--max-input-tokens`, `--max-new-tokens`, `--warmup-tokens`, `--repetitions`,
+`--seed`, `--sample-retries`, `--checkpoint-interval`, `--run-id`, `--resume`,
+`--direct-target-audit`, `--verifier-audit`, `--preflight-only`, `--output-dir`.
+Mặc định output nằm dưới `outputs/fa4_native_benchmark/<run-id>/`; có thể nối
+log ra file bằng `2>&1 | tee <log-file>`. Khi resume phải truyền cùng run ID
+và cấu hình như lần chạy trước.
+
+Nếu vLLM nằm trong shared Python environment vì các job khác, điều đó không làm
+benchmark này thành vLLM: runtime guard ghi nhận package có cài nhưng yêu cầu
+không module vLLM nào được import trong process benchmark. Không gỡ hoặc cài lại
+package toàn cục.
 
 ## Metric và artifact
 
-Mỗi sample/repeat có output IDs/text, model, input/output tokens, memory peak,
+Mỗi sample/repeat lưu output IDs/text, model, input/output tokens, peak memory,
 E2E, prefill/TTFT, decode, TPOT, throughput, QPS, draft/verification time,
 acceptance counters, ROUGE-1/2/L, ROUGE-Lsum, BLEU-1..4, length ratio,
-repetition/quality guard, exact greedy match và token LCS overlap với Vanilla.
-Summary báo mean/median/p90/std, DSR, ESR và metric riêng theo dataset cùng
-metric gộp. DSR/ESR chỉ ghép cùng sample và repeat; ESR dùng số token output
-chung là độ dài nhỏ hơn của cặp. Speedup được đo trung thực, có thể dưới 1.
+repetition/quality guard, exact greedy match và token LCS với Vanilla. Summary
+báo mean/median/p90/std, DSR, ESR và metric theo từng dataset. DSR/ESR ghép cùng
+sample và repeat; ESR tính trên số token output nhỏ hơn của cặp. Speedup báo theo
+số đo thực tế, có thể nhỏ hơn 1.
 
-`prefill_ms` lấy native TTFT của baseline nếu có; với Vanilla và DSpark dùng
+`prefill_ms` dùng native TTFT nếu baseline cung cấp; Vanilla và DSpark dùng
 CUDA-event duration của target forward đầu tiên. `tpot_ms` là
-`(e2e_ms - prefill_ms) / (output_tokens - 1)`. Queue wait, server startup,
-batch wait và server-reported E2E là `null` vì runner không chạy request server.
-Không so sánh các metric proxy này với server-side timing như thể chúng cùng
-measurement boundary.
+`(e2e_ms - prefill_ms) / (output_tokens - 1)`. Queue wait, server startup, batch
+wait và server-reported E2E để `null` vì đây không phải server request API.
 
-Modal ghi tiến độ/checkpoint lên Volume `fast-infer-viet-fa4-results`; sau khi
-hoàn tất, launcher tải artifact về `outputs/modal_flashattn_benchmark/<run-id>/`:
+Artifact trong mỗi run directory gồm `results.jsonl` (sample records và summary
+cuối), `run_report.json`, `report_vi.md`, `metrics_summary.csv`, `warmup.jsonl`,
+`events.jsonl`, `samples.jsonl`, `excluded_samples.jsonl`, `progress.json`,
+`state.json` và `results.partial.jsonl`.
 
-- `results.jsonl`: mọi sample/repeat và summary cuối.
-- `run_report.json`, `report_vi.md`, `metrics_summary.csv`.
-- `warmup.jsonl`, `events.jsonl`, `samples.jsonl`, `excluded_samples.jsonl`.
-- `progress.json`, `state.json`, `results.partial.jsonl` để resume/kiểm toán.
+## Chạy qua Modal
 
-Nếu Modal ngắt một run, dùng lại `--run-id <id> --resume` với đúng cấu hình.
-Chỉ skip cell đã có kết quả thành công; cell lỗi được chạy lại theo số lần
-`--sample-retries`. Trước khi dùng full run cho paper, chạy smoke trên đúng
-checkpoint, xem runtime gate, sample coverage, quality guard, greedy parity và
-đối chiếu report/JSONL.
-
-Nếu inference đã hoàn tất nhưng máy local ngắt trước khi tải kết quả, khôi phục
-artifact mà không chạy lại model bằng:
+Modal là đường chạy riêng, không sử dụng GPU server. Nếu cần gọi lại Modal, dùng
+launcher tương thích này:
 
 ```bash
-bash scripts/run_fa4_benchmark.sh --download-only --run-id <run-id>
+bash scripts/run_fa4_modal_benchmark.sh \
+  --mode smoke --datasets vietnews --samples-per-dataset 1 --max-new-tokens 32
 ```

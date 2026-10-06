@@ -154,7 +154,7 @@ def install_attention_dispatch_tracking(registry: Any) -> None:
 
 
 def resolve_flashattn_methods(value: str) -> tuple[str, ...]:
-    """Resolve the subset for the Modal comparison, always including its pair."""
+    """Resolve a native FA4 method subset, including the Vanilla/DFlash pair."""
 
     specification = str(value).strip()
     if specification.lower() == "all":
@@ -195,12 +195,15 @@ def validate_flashattn_runtime(
     *,
     methods: Iterable[str],
     require_dispatch_proof: bool = False,
+    allow_installed_vllm: bool = False,
 ) -> dict[str, Any]:
-    """Fail closed unless the run is batch-1, vLLM-free, and FA4 for each method.
+    """Fail closed unless the run is batch-1, does not import vLLM, and uses FA4.
 
     ``require_dispatch_proof`` additionally checks that each selected method's
     target path, and every speculative draft path, actually entered FA4 during
-    inference without an observed alternate attention backend.
+    inference without an observed alternate attention backend. Some shared
+    server environments install vLLM for unrelated jobs; ``allow_installed_vllm``
+    permits that package to be present while still rejecting any vLLM import.
     """
 
     installed = {
@@ -211,11 +214,14 @@ def validate_flashattn_runtime(
         str(value).strip().lower()
         for value in runtime.get("imported_modules", [])
     }
-    if any("vllm" in value for value in installed):
+    vllm_installed = "vllm" in installed
+    vllm_plugins_installed = any("vllm" in value and value != "vllm" for value in installed)
+    if vllm_plugins_installed or (vllm_installed and not allow_installed_vllm):
         raise ValueError(
             "vLLM must not be installed in the native FA4 runtime, including adapter plugins"
         )
-    if any("vllm" in value for value in imported):
+    vllm_imported = any("vllm" in value for value in imported)
+    if vllm_imported:
         raise ValueError(
             "vLLM modules or plugins must not be imported in the native FA4 runtime"
         )
@@ -296,8 +302,8 @@ def validate_flashattn_runtime(
         "passed": True,
         "batch_size": 1,
         "attention_backend": EXPECTED_ATTENTION_BACKEND,
-        "vllm_installed": False,
-        "vllm_imported": False,
+        "vllm_installed": vllm_installed,
+        "vllm_imported": vllm_imported,
         "methods": checked,
     }
 
