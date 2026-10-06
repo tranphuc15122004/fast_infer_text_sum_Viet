@@ -179,6 +179,7 @@ def test_runtime_rejects_vllm_even_if_not_imported():
 def test_native_server_may_have_vllm_installed_but_must_not_import_it():
     runtime = _runtime()
     runtime["installed_distributions"].append("vllm")
+    runtime["installed_distributions"].append("vllm-flash-attn")
 
     result = validate_flashattn_runtime(
         runtime, methods=METHODS, allow_installed_vllm=True
@@ -186,6 +187,7 @@ def test_native_server_may_have_vllm_installed_but_must_not_import_it():
 
     assert result["passed"] is True
     assert result["vllm_installed"] is True
+    assert result["vllm_related_distributions"] == ["vllm", "vllm-flash-attn"]
     assert result["vllm_imported"] is False
 
     runtime["imported_modules"].append("vllm")

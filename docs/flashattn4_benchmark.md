@@ -10,9 +10,10 @@ nó không tạo virtualenv, cài package, hoặc tải checkpoint từ internet
 Target và draft checkpoint được lấy từ master config mà `config/master.path`
 trỏ tới. Bốn JSONL dưới `datasets/eval_100/` là dữ liệu chung, mỗi file có 100
 mẫu. Mọi method dùng cùng tokenizer, prompt tiếng Việt, seed và ngân sách token.
-Representative chọn 20 mẫu/dataset phủ dải độ dài; full chạy đủ 100 mẫu/dataset.
-Input dài hơn giới hạn sẽ được truncate bằng helper dùng chung và ghi lại số
-token nguồn cùng cờ truncation.
+Mặc định representative chọn 20 mẫu/dataset phủ dải độ dài; lệnh bên dưới
+override còn hai mẫu/dataset. Full chạy đủ 100 mẫu/dataset. Input dài hơn giới
+hạn sẽ được truncate bằng helper dùng chung và ghi lại số token nguồn cùng cờ
+truncation.
 
 ## Chạy trên server B200
 
@@ -33,20 +34,22 @@ không nạp model checkpoint:
 FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh --preflight-only
 ```
 
-Sau khi preflight pass, smoke chạy một mẫu mỗi dataset qua đủ năm baseline:
+Sau khi preflight pass, smoke nhanh một mẫu của riêng `vietnews` qua đủ năm
+baseline:
 
 ```bash
 FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh \
-  --mode smoke --datasets all --samples-per-dataset 1 \
+  --mode smoke --datasets vietnews --samples-per-dataset 1 \
   --max-new-tokens 64
 ```
 
-Representative chạy 20 mẫu cho mỗi dataset được chọn. Có thể bắt đầu với một
-dataset để kiểm tra thời gian và mức dùng VRAM; lệnh dưới đây chạy cả bốn:
+Representative dưới đây chạy hai mẫu/dataset trên cả bốn dataset (tám prompt,
+đủ năm baseline):
 
 ```bash
 FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh \
-  --mode representative --datasets all --max-new-tokens 512
+  --mode representative --datasets all --samples-per-dataset 2 \
+  --max-new-tokens 512
 ```
 
 Full dùng đủ 100 mẫu/dataset:
@@ -69,10 +72,10 @@ Mặc định output nằm dưới `outputs/fa4_native_benchmark/<run-id>/`; có
 log ra file bằng `2>&1 | tee <log-file>`. Khi resume phải truyền cùng run ID
 và cấu hình như lần chạy trước.
 
-Nếu vLLM nằm trong shared Python environment vì các job khác, điều đó không làm
-benchmark này thành vLLM: runtime guard ghi nhận package có cài nhưng yêu cầu
-không module vLLM nào được import trong process benchmark. Không gỡ hoặc cài lại
-package toàn cục.
+Nếu vLLM hoặc distribution liên quan nằm trong shared Python environment vì
+các job khác, điều đó không làm benchmark này thành vLLM: runtime guard ghi tên
+các distribution đang cài nhưng yêu cầu không module vLLM nào được import trong
+process benchmark. Không gỡ hoặc cài lại package toàn cục.
 
 ## Metric và artifact
 

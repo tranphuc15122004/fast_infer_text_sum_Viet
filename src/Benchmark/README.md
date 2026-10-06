@@ -39,14 +39,15 @@ FA4 đã cài trên server. Modal được tách riêng qua
 # Kiểm tra FA4/GPU/tree mask và eval_100; không nạp model checkpoint
 bash scripts/run_fa4_benchmark.sh --preflight-only
 
-# Smoke đủ năm baseline trên một mẫu của mỗi dataset
+# Smoke đủ năm baseline trên một mẫu VietNews
 bash scripts/run_fa4_benchmark.sh \
-  --mode smoke --datasets all --samples-per-dataset 1 \
+  --mode smoke --datasets vietnews --samples-per-dataset 1 \
   --max-new-tokens 64
 
-# 20 mẫu/dataset, chọn quantile độ dài có tính xác định
+# 2 mẫu/dataset, phủ đầu ngắn và đầu dài theo độ dài
 bash scripts/run_fa4_benchmark.sh \
-  --mode representative --datasets all --max-new-tokens 512
+  --mode representative --datasets all --samples-per-dataset 2 \
+  --max-new-tokens 512
 
 # 100 mẫu/dataset trên bốn dataset
 bash scripts/run_fa4_benchmark.sh \

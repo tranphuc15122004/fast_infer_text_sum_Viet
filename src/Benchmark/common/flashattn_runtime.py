@@ -202,8 +202,9 @@ def validate_flashattn_runtime(
     ``require_dispatch_proof`` additionally checks that each selected method's
     target path, and every speculative draft path, actually entered FA4 during
     inference without an observed alternate attention backend. Some shared
-    server environments install vLLM for unrelated jobs; ``allow_installed_vllm``
-    permits that package to be present while still rejecting any vLLM import.
+    server environments install vLLM and related distributions for unrelated
+    jobs; ``allow_installed_vllm`` permits them to be present while still
+    rejecting any vLLM import.
     """
 
     installed = {
@@ -214,11 +215,14 @@ def validate_flashattn_runtime(
         str(value).strip().lower()
         for value in runtime.get("imported_modules", [])
     }
-    vllm_installed = "vllm" in installed
-    vllm_plugins_installed = any("vllm" in value and value != "vllm" for value in installed)
-    if vllm_plugins_installed or (vllm_installed and not allow_installed_vllm):
+    vllm_related_distributions = sorted(
+        value for value in installed if "vllm" in value
+    )
+    vllm_installed = bool(vllm_related_distributions)
+    if vllm_installed and not allow_installed_vllm:
         raise ValueError(
-            "vLLM must not be installed in the native FA4 runtime, including adapter plugins"
+            "vLLM must not be installed in the native FA4 runtime, including adapter "
+            f"plugins; found {vllm_related_distributions}"
         )
     vllm_imported = any("vllm" in value for value in imported)
     if vllm_imported:
@@ -303,6 +307,7 @@ def validate_flashattn_runtime(
         "batch_size": 1,
         "attention_backend": EXPECTED_ATTENTION_BACKEND,
         "vllm_installed": vllm_installed,
+        "vllm_related_distributions": vllm_related_distributions,
         "vllm_imported": vllm_imported,
         "methods": checked,
     }
