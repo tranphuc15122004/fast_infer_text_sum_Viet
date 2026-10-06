@@ -176,6 +176,18 @@ def test_runtime_rejects_vllm_even_if_not_imported():
         validate_flashattn_runtime(runtime, methods=METHODS)
 
 
+def test_runtime_rejects_vllm_plugin_distribution_and_import():
+    runtime = _runtime()
+    runtime["installed_distributions"].append("fast-infer-viet-vllm-plugin")
+    with pytest.raises(ValueError, match="including adapter plugins"):
+        validate_flashattn_runtime(runtime, methods=METHODS)
+
+    runtime = _runtime()
+    runtime["imported_modules"].append("Benchmark.common.vllm_pilot_plugin")
+    with pytest.raises(ValueError, match="vLLM modules or plugins"):
+        validate_flashattn_runtime(runtime, methods=METHODS)
+
+
 def test_runtime_rejects_a_baseline_that_fell_back_to_eager():
     runtime = _runtime()
     runtime["methods"]["dspark"]["target_attention"] = "eager"

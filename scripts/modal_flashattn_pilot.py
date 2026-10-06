@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Batch-one native Transformers FA4 comparison of all baselines on Modal."""
+"""Full batch-one native Transformers FA4 benchmark for all Vietnamese baselines."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import csv
+from contextlib import contextmanager
 import os
 import statistics
 import time
@@ -46,10 +48,28 @@ MODEL_REPOS = {
     ),
 }
 GPU = os.environ.get("MODAL_GPU", "B200")
-MAX_INPUT_TOKENS = 8192
-DEFAULT_MAX_NEW_TOKENS = 256
+MAX_INPUT_TOKENS = int(os.environ.get("MODAL_MAX_INPUT_TOKENS", "8192"))
+DEFAULT_MAX_NEW_TOKENS = int(os.environ.get("MODAL_MAX_NEW_TOKENS", "512"))
 DFLASH_BLOCK_SIZE = 16
 ATTENTION = "flash_attention_4"
+OUTPUT_VOLUME_NAME = os.environ.get(
+    "MODAL_FA4_OUTPUT_VOLUME", "fast-infer-viet-fa4-results"
+)
+OUTPUT_VOLUME = modal.Volume.from_name(OUTPUT_VOLUME_NAME, create_if_missing=True)
+REMOTE_OUTPUT_ROOT = Path("/fa4-results")
+ARTIFACT_FILENAMES = (
+    "results.jsonl",
+    "run_report.json",
+    "report_vi.md",
+    "metrics_summary.csv",
+    "warmup.jsonl",
+    "events.jsonl",
+    "samples.jsonl",
+    "excluded_samples.jsonl",
+    "progress.json",
+    "state.json",
+    "results.partial.jsonl",
+)
 
 PINNED_VERSIONS = {
     "torch": "2.13.0",
@@ -64,7 +84,7 @@ PINNED_VERSIONS = {
     "nvidia-cutlass-dsl": "4.7.1",
 }
 
-app = modal.App("fast-infer-viet-native-flashattn-pilot")
+app = modal.App("fast-infer-viet-native-flashattn-benchmark")
 
 image = (
     modal.Image.from_registry(
@@ -111,7 +131,12 @@ image = (
         "psutil==7.2.2",
         "packaging==26.3",
     )
-    .add_local_dir(str(PROJECT_ROOT / "src"), remote_path=str(REMOTE_SRC), copy=True)
+    .add_local_dir(
+        str(PROJECT_ROOT / "src"),
+        remote_path=str(REMOTE_SRC),
+        copy=True,
+        ignore=["**/*vllm*"],
+    )
     .add_local_dir(
         str(PROJECT_ROOT / "externals" / "dflash"),
         remote_path=str(REMOTE_ROOT / "externals" / "dflash"),
@@ -146,6 +171,11 @@ for _dataset, _local_file in LOCAL_DATA_FILES.items():
     image = image.add_local_file(
         str(_local_file), remote_path=str(REMOTE_DATA_FILES[_dataset]), copy=True
     )
+image = image.add_local_file(
+    str(PROJECT_ROOT / "datasets" / "eval_100" / "manifest.json"),
+    remote_path=str(REMOTE_ROOT / "datasets" / "eval_100" / "manifest.json"),
+    copy=True,
+)
 
 
 def _install_fa4_compat() -> None:
@@ -442,25 +472,32 @@ def _dispatch_config_fields(totals: dict[str, Any]) -> dict[str, Any]:
     return fields
 
 
-def _prepare_samples(tokenizer, *, sample_count: int, max_input_tokens: int) -> list[dict[str, Any]]:
+def _prepare_samples(
+    tokenizer,
+    *,
+    datasets: tuple[str, ...],
+    samples_per_dataset: int,
+    max_input_tokens: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     from Benchmark.common.benchmark_data import read_jsonl, render_prompt
-    from Benchmark.common.flashattn_runtime import (
-        select_median_samples,
-        select_smoke_datasets,
-    )
+    from Benchmark.common.fa4_benchmark import select_length_spread
     from Benchmark.common.input_utils import truncate_input_ids
     from Benchmark.common.prompt_format import format_chat_prompt
 
-    selected_datasets = select_smoke_datasets(DATASETS, sample_count)
-    candidates: list[dict[str, Any]] = []
-    for dataset in DATASETS:
-        for row in read_jsonl(REMOTE_DATA_FILES[dataset]):
+    selected: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    for dataset in datasets:
+        candidates: list[dict[str, Any]] = []
+        data_path = REMOTE_DATA_FILES[dataset]
+        dataset_sha256 = hashlib.sha256(data_path.read_bytes()).hexdigest()
+        for row in read_jsonl(data_path):
             prompt = format_chat_prompt(tokenizer, render_prompt(row))
             input_ids = tokenizer(
                 prompt,
                 return_tensors="pt",
                 add_special_tokens=False,
             ).input_ids
+            source_input_tokens = int(input_ids.shape[1])
             input_ids = truncate_input_ids(input_ids, max_input_tokens).contiguous()
             answers = row.get("answers")
             reference = row.get("reference")
@@ -473,20 +510,38 @@ def _prepare_samples(tokenizer, *, sample_count: int, max_input_tokens: int) -> 
                     "dataset": dataset,
                     "sample_id": str(row.get("id", row.get("source_index", ""))),
                     "input_tokens": int(input_ids.shape[1]),
+                    "source_input_tokens": source_input_tokens,
+                    "was_truncated": int(input_ids.shape[1]) < source_input_tokens,
                     "input_ids": input_ids,
                     "reference": str(reference or ""),
                     "prompt": prompt,
+                    "source_index": row.get("source_index"),
+                    "length_bin": row.get("length_bin"),
                     "source_sha256": hashlib.sha256(
                         json.dumps(row, sort_keys=True, ensure_ascii=False).encode("utf-8")
                     ).hexdigest(),
+                    "dataset_sha256": dataset_sha256,
                 }
             )
-    selected = select_median_samples(
-        candidates,
-        datasets=selected_datasets,
-        max_input_tokens=max_input_tokens,
-    )
-    return sorted(selected, key=lambda row: (DATASETS.index(row["dataset"]), row["sample_id"]))
+        if not candidates:
+            raise ValueError(f"no samples found for dataset={dataset}")
+        dataset_selected = select_length_spread(candidates, samples_per_dataset)
+        selected.extend(dataset_selected)
+        selected_ids = {row["sample_id"] for row in dataset_selected}
+        for candidate in candidates:
+            if candidate["sample_id"] not in selected_ids:
+                excluded.append(
+                    {
+                        "dataset": dataset,
+                        "sample_id": candidate["sample_id"],
+                        "input_tokens": candidate["input_tokens"],
+                        "reason": "outside_deterministic_length_spread_sample",
+                    }
+                )
+    return sorted(
+        selected,
+        key=lambda row: (DATASETS.index(row["dataset"]), row["input_tokens"], row["sample_id"]),
+    ), excluded
 
 
 def _target_model(model_name: str, *, dtype, device):
@@ -530,17 +585,74 @@ def _time_call(torch, fn):
     return result, (time.perf_counter() - start) * 1000.0
 
 
-def _warm_method(torch, method: str, context: dict[str, Any], samples: list[dict[str, Any]], max_new_tokens: int):
+def _warm_method(
+    torch,
+    method: str,
+    context: dict[str, Any],
+    samples: list[dict[str, Any]],
+    *,
+    max_new_tokens: int,
+    warmup_tokens: int,
+) -> list[dict[str, Any]]:
+    warmup_records = []
     for sample in samples:
-        _call_method(
+        input_ids = sample["input_ids"].to("cuda:0")
+        result, elapsed_ms = _time_call(
             torch,
-            method,
-            context,
-            sample["input_ids"].to("cuda:0"),
-            max_new_tokens=min(8, max_new_tokens),
-            warmup=True,
+            lambda: _call_method(
+                torch,
+                method,
+                context,
+                input_ids,
+                max_new_tokens=min(warmup_tokens, max_new_tokens),
+                warmup=True,
+            ),
+        )
+        payload = _output_payload(method, result, input_ids, elapsed_ms, context)
+        warmup_records.append(
+            {
+                "method": method,
+                "dataset": sample["dataset"],
+                "sample_id": f"{sample['dataset']}:{sample['sample_id']}",
+                "warmup_tokens_requested": min(warmup_tokens, max_new_tokens),
+                "warmup_tokens_generated": len(payload["output_ids"]),
+                "warmup_e2e_ms": round(elapsed_ms, 3),
+            }
         )
     torch.cuda.synchronize("cuda:0")
+    return warmup_records
+
+
+@contextmanager
+def _capture_first_target_forward_ms(torch, model):
+    """Capture GPU execution time of the initial target forward without syncs per call."""
+    original_forward = model.forward
+    captured: dict[str, Any] = {}
+
+    def wrapped_forward(*args, **kwargs):
+        if "start_event" in captured:
+            return original_forward(*args, **kwargs)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        try:
+            output = original_forward(*args, **kwargs)
+        finally:
+            end_event.record()
+            captured["start_event"] = start_event
+            captured["end_event"] = end_event
+        return output
+
+    model.forward = wrapped_forward
+    try:
+        yield captured
+    finally:
+        model.forward = original_forward
+        if "start_event" in captured:
+            torch.cuda.synchronize("cuda:0")
+            captured["first_forward_ms"] = float(
+                captured["start_event"].elapsed_time(captured["end_event"])
+            )
 
 
 def _call_method(
@@ -554,7 +666,7 @@ def _call_method(
 ):
     from transformers import set_seed
 
-    set_seed(42)
+    set_seed(int(context.get("seed", 42)))
     model = context["target"]
     stop_token_ids = context["stop_token_ids"]
     if method == "vanilla_hf":
@@ -1113,6 +1225,14 @@ def _output_payload(
     if method in {"dflash", "domino"}:
         output_ids = result.output_ids
         ttft_ms = float(getattr(result, "time_to_first_token", 0.0) or 0.0) * 1000.0
+        phases = {
+            name: (
+                float(getattr(result, name))
+                if getattr(result, name, None) is not None
+                else None
+            )
+            for name in ("draft_latency_ms", "verification_latency_ms")
+        }
         acceptance_lengths = list(getattr(result, "acceptance_lengths", []) or [])
         steps = len(acceptance_lengths)
         if method == "dflash":
@@ -1133,6 +1253,14 @@ def _output_payload(
         steps = int(getattr(result, "verify_count", len(acceptance_lengths)))
         accepted = sum(int(value) for value in (getattr(result, "accepted_draft_lengths", []) or []))
         proposed = sum(int(value) for value in (getattr(result, "proposal_lengths", []) or []))
+        phases = {
+            name: (
+                float(getattr(result, name))
+                if getattr(result, name, None) is not None
+                else None
+            )
+            for name in ("prefill_ms", "decode_ms", "draft_latency_ms", "verification_latency_ms")
+        }
     elif method == "eagle3":
         output_ids, _, _, _elapsed_s, acceptance_lengths, phases = result
         phases = dict(phases or {})
@@ -1157,18 +1285,41 @@ def _safe_mean(values: list[float]) -> float | None:
     return round(statistics.mean(values), 4) if values else None
 
 
-@app.function(image=image, gpu=GPU, cpu=16, memory=65536, timeout=14400, max_containers=1)
-def run_flashattn_smoke(
+@app.function(
+    image=image,
+    gpu=GPU,
+    cpu=16,
+    memory=65536,
+    timeout=86400,
+    max_containers=1,
+    volumes={str(REMOTE_OUTPUT_ROOT): OUTPUT_VOLUME},
+)
+def run_flashattn_benchmark(
     *,
-    sample_count: int = 2,
+    mode: str = "smoke",
+    datasets: str = "all",
+    samples_per_dataset: int | None = None,
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     max_input_tokens: int = MAX_INPUT_TOKENS,
     methods: str = "all",
+    warmup_tokens: int = 8,
+    repetitions: int = 1,
+    seed: int = 42,
+    sample_retries: int = 1,
+    checkpoint_interval: int = 20,
+    run_id: str = "",
+    resume: bool = False,
+    direct_target_audit: bool = False,
+    verifier_audit: bool = False,
+    preflight_only: bool = False,
     debug_cuda_launch_blocking: bool = False,
 ) -> dict[str, Any]:
-    """Compare selected methods on the same batch-one prompts on one GPU."""
+    """Benchmark selected datasets/methods with paired batch-one requests."""
     import gc
     import sys
+
+    started_perf = time.perf_counter()
+    started_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     sys.path.insert(0, str(REMOTE_SRC))
     os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
@@ -1187,6 +1338,12 @@ def run_flashattn_smoke(
         build_status_record,
         runtime_metadata,
     )
+    from Benchmark.common.fa4_benchmark import (
+        finalize_fa4_records,
+        parse_selection,
+        resolve_sample_limit,
+    )
+    from Benchmark.common.benchmark_data import validate_output_dir
     from Benchmark.common.flashattn_runtime import (
         AttentionDispatchTracker,
         first_token_mismatch,
@@ -1195,19 +1352,31 @@ def run_flashattn_smoke(
         resolve_flashattn_methods,
         validate_flashattn_runtime,
     )
-    from Benchmark.common.io_util import JsonlWriter
+    from Benchmark.common.io_util import JsonlWriter, validate_schema
     from Benchmark.common.quality_guard import repetition_metrics
     from Benchmark.common.rouge import add_rouge, aggregate_rouge
 
     if not torch.cuda.is_available():
         raise RuntimeError("Modal worker did not expose a CUDA GPU")
     if torch.cuda.get_device_capability(0)[0] < 10:
-        raise RuntimeError("FA4 smoke requires a Blackwell-class GPU (SM100+)")
-    if sample_count < 1 or sample_count > len(DATASETS):
-        raise ValueError(f"sample_count must be in [1, {len(DATASETS)}]")
+        raise RuntimeError("FA4 benchmark requires a Blackwell-class GPU (SM100+)")
+    if mode not in {"smoke", "representative", "full"}:
+        raise ValueError("mode must be smoke, representative, or full")
+    if max_new_tokens < 1 or max_input_tokens < 1:
+        raise ValueError("max-new-tokens and max-input-tokens must be positive")
+    if warmup_tokens < 1 or repetitions < 1 or sample_retries < 0:
+        raise ValueError("warmup-tokens/repetitions must be positive; sample-retries >= 0")
+    if checkpoint_interval < 1:
+        raise ValueError("checkpoint-interval must be positive")
+    if resume and not run_id:
+        raise ValueError("resume requires an explicit run-id")
+    selected_datasets = parse_selection(datasets, DATASETS, "dataset")
     selected_methods = resolve_flashattn_methods(methods)
-    if max_new_tokens < 32:
-        raise ValueError("max_new_tokens must be at least 32 for a meaningful smoke")
+    sample_limit = resolve_sample_limit(mode, samples_per_dataset, available=100)
+    if not run_id:
+        run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + os.urandom(3).hex()
+    if not run_id.replace("-", "").replace("_", "").isalnum():
+        raise ValueError("run-id may contain only letters, numbers, hyphen and underscore")
     actual_versions = _version_snapshot()
     _validate_pins(actual_versions)
     try:
@@ -1222,14 +1391,38 @@ def run_flashattn_smoke(
         runtime, methods=selected_methods
     )
     runtime["fa4_tree_mask_gpu_probe"] = _fa4_tree_mask_gpu_probe(torch)
+    runtime["dataset_validation"] = validate_output_dir(
+        REMOTE_ROOT / "datasets" / "eval_100", expected_count=100
+    )
+
+    if preflight_only:
+        return {
+            "run_id": run_id,
+            "summary": {
+                "status": "preflight_passed",
+                "run_id": run_id,
+                "runtime_validation": baseline_config,
+                "runtime": runtime,
+                "versions": actual_versions,
+                "gpu": runtime.get("gpu_name"),
+                "attention_backend": ATTENTION,
+                "batch_size": 1,
+                "methods": list(selected_methods),
+                "datasets": list(selected_datasets),
+            },
+            "records": [],
+            "jsonl": "",
+            "artifact_files": {},
+        }
 
     device = torch.device("cuda:0")
     tokenizer = AutoTokenizer.from_pretrained(TARGET_MODEL)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    samples = _prepare_samples(
+    samples, excluded_samples = _prepare_samples(
         tokenizer,
-        sample_count=sample_count,
+        datasets=selected_datasets,
+        samples_per_dataset=sample_limit,
         max_input_tokens=max_input_tokens,
     )
     runtime["selected_samples"] = [
@@ -1237,27 +1430,200 @@ def run_flashattn_smoke(
             "dataset": row["dataset"],
             "sample_id": row["sample_id"],
             "input_tokens": row["input_tokens"],
+            "source_input_tokens": row["source_input_tokens"],
+            "was_truncated": row["was_truncated"],
             "source_sha256": row["source_sha256"],
         }
         for row in samples
     ]
 
+    selected_sample_manifest = [
+        {
+            "dataset": row["dataset"],
+            "sample_id": row["sample_id"],
+            "source_sha256": row["source_sha256"],
+            "input_tokens": row["input_tokens"],
+        }
+        for row in samples
+    ]
+    experiment_config = {
+        "schema_version": 1,
+        "mode": mode,
+        "datasets": list(selected_datasets),
+        "methods": list(selected_methods),
+        "sample_limit_per_dataset": sample_limit,
+        "selected_samples_sha256": hashlib.sha256(
+            json.dumps(
+                selected_sample_manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "models": {method: MODEL_REPOS[method] for method in selected_methods},
+        "max_input_tokens": max_input_tokens,
+        "max_new_tokens": max_new_tokens,
+        "warmup_tokens": warmup_tokens,
+        "repetitions": repetitions,
+        "seed": seed,
+        "batch_size": 1,
+        "dtype": "bfloat16",
+        "attention_backend": ATTENTION,
+        "direct_target_audit": direct_target_audit,
+        "verifier_audit": verifier_audit,
+        "package_versions": actual_versions,
+    }
+    experiment_signature = hashlib.sha256(
+        json.dumps(
+            experiment_config,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
     records: list[dict[str, Any]] = []
-    raw: dict[tuple[str, str], dict[str, Any]] = {}
-    target_only_raw: dict[tuple[str, str], list[int]] = {}
+    raw: dict[tuple[str, str, int], dict[str, Any]] = {}
+    target_only_raw: dict[tuple[str, str, int], list[int]] = {}
     verifier_audit_raw: dict[tuple[str, str], dict[str, Any]] = {}
     method_configs: dict[str, dict[str, Any]] = {}
     failures: dict[str, str] = {}
     gpu_context_lost = False
+    remote_run_dir = REMOTE_OUTPUT_ROOT / run_id
+    remote_run_dir.mkdir(parents=True, exist_ok=True)
+    partial_path = remote_run_dir / "results.partial.jsonl"
+    warmup_path = remote_run_dir / "warmup.jsonl"
+    events_path = remote_run_dir / "events.jsonl"
+    state_path = remote_run_dir / "state.json"
+    samples_path = remote_run_dir / "samples.jsonl"
+    excluded_path = remote_run_dir / "excluded_samples.jsonl"
+
+    def append_jsonl(path: Path, row: dict[str, Any]) -> None:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+
+    def write_json(path: Path, value: Any) -> None:
+        path.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+
+    def read_jsonl(path: Path) -> list[dict[str, Any]]:
+        if not path.is_file():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def persist_state() -> None:
+        write_json(
+            state_path,
+            {
+                "experiment_config": experiment_config,
+                "experiment_signature": experiment_signature,
+                "method_configs": method_configs,
+                "failures": failures,
+            },
+        )
+
+    if resume:
+        if not state_path.is_file():
+            raise ValueError(
+                "cannot safely resume this run: state.json with an experiment signature is missing"
+            )
+        saved_state = json.loads(state_path.read_text(encoding="utf-8"))
+        if saved_state.get("experiment_signature") != experiment_signature:
+            raise ValueError(
+                "resume configuration does not match the original run; use its exact "
+                "dataset/model/token/repetition/audit settings or choose a new run-id"
+            )
+        records = read_jsonl(partial_path)
+        if not records:
+            records = [
+                row for row in read_jsonl(remote_run_dir / "results.jsonl")
+                if row.get("scope") == "sample"
+            ]
+        method_configs.update(saved_state.get("method_configs", {}))
+        for row in records:
+            if row.get("status") == "success" and row.get("output_token_ids") is not None:
+                key = (
+                    str(row["method"]),
+                    str(row["sample_id"]),
+                    int(row.get("repeat_index", 0)),
+                )
+                raw[key] = {
+                    "output_ids": [int(value) for value in row["output_token_ids"]],
+                    "elapsed_ms": float(row["e2e_ms"]),
+                    "acceptance_lengths": row.get("acceptance_lengths", []),
+                    "draft_tokens_accepted": row.get("draft_tokens_accepted"),
+                    "draft_tokens_proposed": row.get("draft_tokens_proposed"),
+                    "verification_steps": row.get("verification_steps"),
+                    "phases": {},
+                }
+    else:
+        if any(path.exists() for path in (partial_path, remote_run_dir / "results.jsonl")):
+            raise FileExistsError(
+                f"run directory already contains results: {remote_run_dir}; pass resume=true or a new run-id"
+            )
+        samples_path.write_text("", encoding="utf-8")
+        excluded_path.write_text("", encoding="utf-8")
+        partial_path.write_text("", encoding="utf-8")
+        warmup_path.write_text("", encoding="utf-8")
+        events_path.write_text("", encoding="utf-8")
+        for sample in samples:
+            append_jsonl(
+                samples_path,
+                {
+                    key: sample.get(key)
+                    for key in (
+                        "dataset", "sample_id", "source_index", "input_tokens",
+                        "source_input_tokens", "was_truncated", "source_sha256", "dataset_sha256",
+                    )
+                },
+            )
+        for row in excluded_samples:
+            append_jsonl(excluded_path, row)
+        persist_state()
+        OUTPUT_VOLUME.commit()
+
+    append_jsonl(
+        events_path,
+        {
+            "event": "run_started",
+            "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "run_id": run_id,
+            "mode": mode,
+            "datasets": selected_datasets,
+            "methods": selected_methods,
+            "sample_count": len(samples),
+            "repetitions": repetitions,
+            "resume": resume,
+        },
+    )
+    OUTPUT_VOLUME.commit()
 
     for method in selected_methods:
         print(f"[FA4] loading {method}: {MODEL_REPOS[method]}", flush=True)
         context = None
         tracker = None
         dispatch_totals = _new_dispatch_totals()
-        method_record_start = len(records)
         try:
+            model_load_started = time.perf_counter()
             context = _load_method(torch, method, tokenizer, device)
+            context["seed"] = seed
+            method_model_load_ms = (time.perf_counter() - model_load_started) * 1000.0
+            append_jsonl(
+                events_path,
+                {
+                    "event": "method_loaded",
+                    "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "method": method,
+                    "model": MODEL_REPOS[method],
+                    "model_load_ms": round(method_model_load_ms, 3),
+                },
+            )
             method_configs[method] = {
                 "target_attention": _assert_fa4(context["target"], method, "target"),
                 "draft_attention": (
@@ -1292,7 +1658,17 @@ def run_flashattn_smoke(
                 context["target"], _dispatch_draft_model(method, context)
             )
             with tracker.recording():
-                _warm_method(torch, method, context, samples, max_new_tokens)
+                warmup_rows = _warm_method(
+                    torch,
+                    method,
+                    context,
+                    samples,
+                    max_new_tokens=max_new_tokens,
+                    warmup_tokens=warmup_tokens,
+                )
+            for warmup_row in warmup_rows:
+                append_jsonl(warmup_path, warmup_row)
+            OUTPUT_VOLUME.commit()
             warm_dispatch = tracker.snapshot()
             _assert_method_dispatch(method, warm_dispatch)
             tracker.reset()
@@ -1323,194 +1699,303 @@ def run_flashattn_smoke(
                 )
             print(f"[FA4] warmup complete: {method}", flush=True)
             for sample in samples:
-                input_ids = sample["input_ids"].to(device)
-                torch.cuda.reset_peak_memory_stats(device)
-                tracker.reset()
-                dflash_dispatch_before = None
-                if method == "dflash":
-                    dflash_dispatch_before = dflash_fa4_attention_stats(
-                        context["dflash_model_module"]
+                sample_id = f"{sample['dataset']}:{sample['sample_id']}"
+                for repeat_index in range(repetitions):
+                    raw_key = (method, sample_id, repeat_index)
+                    previous = next(
+                        (
+                            row for row in records
+                            if row.get("method") == method
+                            and row.get("sample_id") == sample_id
+                            and int(row.get("repeat_index", 0)) == repeat_index
+                        ),
+                        None,
                     )
-                with tracker.recording():
-                    result, elapsed_ms = _time_call(
-                        torch,
-                        lambda method=method, context=context, input_ids=input_ids: _call_method(
+                    if previous is not None and previous.get("status") == "success":
+                        continue
+                    if previous is not None:
+                        records.remove(previous)
+                    sample_error = None
+                    sample_error_traceback = None
+                    for attempt in range(sample_retries + 1):
+                        try:
+                            input_ids = sample["input_ids"].to(device)
+                            torch.cuda.reset_peak_memory_stats(device)
+                            tracker.reset()
+                            dflash_dispatch_before = None
+                            if method == "dflash":
+                                dflash_dispatch_before = dflash_fa4_attention_stats(
+                                    context["dflash_model_module"]
+                                )
+                            with _capture_first_target_forward_ms(
+                                torch, context["target"]
+                            ) as first_forward:
+                                with tracker.recording():
+                                    result, elapsed_ms = _time_call(
+                                        torch,
+                                        lambda method=method, context=context, input_ids=input_ids: _call_method(
+                                            torch,
+                                            method,
+                                            context,
+                                            input_ids,
+                                            max_new_tokens=max_new_tokens,
+                                        ),
+                                    )
+                            attention_dispatch = tracker.snapshot()
+                            _assert_method_dispatch(method, attention_dispatch)
+                            _add_dispatch_stats(dispatch_totals, attention_dispatch)
+                            payload = _output_payload(
+                                method, result, input_ids, elapsed_ms, context
+                            )
+                            payload["first_target_forward_ms"] = first_forward.get(
+                                "first_forward_ms"
+                            )
+                            payload["attention_dispatch"] = attention_dispatch
+                            if method == "dflash":
+                                dflash_dispatch_after = dflash_fa4_attention_stats(
+                                    context["dflash_model_module"]
+                                )
+                                payload["dflash_fa4_dispatch_calls"] = (
+                                    dflash_dispatch_after["fa4_dispatch_calls"]
+                                    - dflash_dispatch_before["fa4_dispatch_calls"]
+                                )
+                                payload["dflash_sdpa_fallback_calls"] = (
+                                    dflash_dispatch_after["sdpa_fallback_calls"]
+                                    - dflash_dispatch_before["sdpa_fallback_calls"]
+                                )
+                                if (
+                                    payload["dflash_fa4_dispatch_calls"] <= 0
+                                    or payload["dflash_sdpa_fallback_calls"] != 0
+                                ):
+                                    raise RuntimeError(
+                                        "measured DFlash request did not use exclusive FA4 draft attention: "
+                                        f"fa4={payload['dflash_fa4_dispatch_calls']}, "
+                                        f"sdpa={payload['dflash_sdpa_fallback_calls']}"
+                                    )
+
+                            generated_ids = payload["output_ids"]
+                            text = tokenizer.decode(
+                                generated_ids,
+                                skip_special_tokens=True,
+                                clean_up_tokenization_spaces=False,
+                            ).strip()
+                            num_output_tokens = len(generated_ids)
+                            peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+                            prefill = payload["ttft_ms"]
+                            if prefill is None:
+                                prefill = payload.get("first_target_forward_ms")
+                            if prefill is not None:
+                                prefill = max(0.0, float(prefill))
+                            decode_ms = (
+                                max(0.0, float(elapsed_ms) - prefill)
+                                if prefill is not None else None
+                            )
+                            timing = {
+                                "prefill_ms": round(prefill, 3) if prefill is not None else None,
+                                "ttft_ms": round(prefill, 3) if prefill is not None else None,
+                                "decode_ms": round(decode_ms, 3) if decode_ms is not None else None,
+                                "e2e_ms": round(elapsed_ms, 3),
+                                "server_reported_e2e_ms": None,
+                                "peak_memory_gb": round(peak_gb, 4),
+                                "model_load_ms": round(method_model_load_ms, 3),
+                                "qps": round(1000.0 / elapsed_ms, 4) if elapsed_ms > 0 else None,
+                                "draft_latency_ms": payload["phases"].get("draft_latency_ms"),
+                                "verification_latency_ms": payload["phases"].get("verification_latency_ms"),
+                                "verification_steps": payload["verification_steps"],
+                                "draft_tokens_accepted": payload["draft_tokens_accepted"],
+                                "draft_tokens_proposed": payload["draft_tokens_proposed"],
+                                "draft_proposal_unit": "eagle_tree_node" if method == "eagle3" else "linear_draft_slot",
+                            }
+                            if num_output_tokens > 1 and decode_ms is not None and decode_ms > 0:
+                                timing["tpot_ms"] = round(decode_ms / (num_output_tokens - 1), 4)
+                                timing["decode_throughput_tok_s"] = round(
+                                    (num_output_tokens - 1) / (decode_ms / 1000.0), 4
+                                )
+                            if method != "vanilla_hf":
+                                from Benchmark.common.speculative_metrics import normalize_speculative_acceptance
+
+                                timing.update(
+                                    normalize_speculative_acceptance(
+                                        verification_steps=payload["verification_steps"],
+                                        draft_tokens_accepted=payload["draft_tokens_accepted"],
+                                        draft_tokens_proposed=payload["draft_tokens_proposed"],
+                                        fallback_avg_accept_length=(
+                                            statistics.mean(payload["acceptance_lengths"])
+                                            if payload["acceptance_lengths"] else None
+                                        ),
+                                    )
+                                )
+                            metadata = runtime_metadata()
+                            config = {
+                                "device": str(device),
+                                "gpu_name": metadata.get("gpu_name"),
+                                "dtype": "bfloat16",
+                                "attention_backend": ATTENTION,
+                                "seed": seed,
+                                "temperature": 0.0,
+                                "max_new_tokens": max_new_tokens,
+                                "warmup_runs": len(samples),
+                                "batch_size": 1,
+                                "measurement_scope": "e2e_and_initial_target_forward",
+                                "extra_metrics": {
+                                    "backend": "transformers_native",
+                                    "draft_model": context["draft_name"],
+                                    "target_attention": method_configs[method]["target_attention"],
+                                    "draft_attention": method_configs[method]["draft_attention"],
+                                    "attention_dispatch": attention_dispatch,
+                                    "target_attention_dispatch": attention_dispatch.get("target_attention_dispatch"),
+                                    "target_attention_dispatch_calls": attention_dispatch.get("target_attention_dispatch_calls"),
+                                    "target_fallback_attention_calls": attention_dispatch.get("target_fallback_attention_calls"),
+                                    "draft_attention_dispatch": attention_dispatch.get("draft_attention_dispatch"),
+                                    "draft_attention_dispatch_calls": attention_dispatch.get("draft_attention_dispatch_calls"),
+                                    "draft_fallback_attention_calls": attention_dispatch.get("draft_fallback_attention_calls"),
+                                    "unattributed_attention_calls": attention_dispatch.get("unattributed_attention_calls"),
+                                    "dflash_block_size": DFLASH_BLOCK_SIZE if method == "dflash" else None,
+                                    "draft_sdpa_fallback_calls": payload.get("dflash_sdpa_fallback_calls"),
+                                    "eagle_tree": context.get("eagle_tree"),
+                                    "eagle_target_weight_audit": context.get("target_load_audit"),
+                                    "greedy": True,
+                                    "repeat_index": repeat_index,
+                                    "initial_target_forward_measurement": (
+                                        "native_method_ttft" if payload["ttft_ms"] is not None
+                                        else "cuda_event_first_target_forward"
+                                    ),
+                                    "tree_mask_probe_passed": runtime["fa4_tree_mask_gpu_probe"]["passed"],
+                                },
+                            }
+                            record = build_sample_record(
+                                method=method,
+                                dataset=sample["dataset"],
+                                sample_id=sample_id,
+                                model=TARGET_MODEL,
+                                input_tokens=sample["input_tokens"],
+                                output_tokens=num_output_tokens,
+                                timing=timing,
+                                config=config,
+                                text=text,
+                                reference_output=sample["reference"],
+                            )
+                            record.update(
+                                {
+                                    "repeat_index": repeat_index,
+                                    "source_input_tokens": sample["source_input_tokens"],
+                                    "input_was_truncated": sample["was_truncated"],
+                                    "output_token_ids": generated_ids,
+                                    "model_load_ms": round(method_model_load_ms, 3),
+                                    "qps": timing["qps"],
+                                    "tpot_ms": timing.get("tpot_ms"),
+                                    "decode_throughput_tok_s": timing.get("decode_throughput_tok_s"),
+                                    "status": "success" if generated_ids else "invalid_output",
+                                    "repetition_flag": None,
+                                    "quality_valid": None,
+                                }
+                            )
+                            if payload["acceptance_lengths"]:
+                                record["acceptance_lengths"] = [int(value) for value in payload["acceptance_lengths"]]
+                            add_rouge(record, text, sample["reference"])
+                            from Benchmark.common.metrics import add_semantic
+                            add_semantic(record, text, sample["reference"])
+                            quality = repetition_metrics(text)
+                            record["repetition_flag"] = bool(quality["repetition_flag"])
+                            record["quality_valid"] = bool(
+                                text.strip() and num_output_tokens >= 4 and not quality["repetition_flag"]
+                            )
+                            record["extra_metrics"].update(
+                                {
+                                    "quality": quality,
+                                    "quality_nonrepetitive": record["quality_valid"],
+                                    "output_token_ids_match_reference_vanilla": None,
+                                    "first_target_forward_ms": payload.get("first_target_forward_ms"),
+                                }
+                            )
+                            records.append(record)
+                            raw[raw_key] = payload
+                            append_jsonl(partial_path, record)
+                            append_jsonl(
+                                events_path,
+                                {
+                                    "event": "sample_finished",
+                                    "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                    "method": method,
+                                    "dataset": sample["dataset"],
+                                    "sample_id": sample_id,
+                                    "repeat_index": repeat_index,
+                                    "status": record["status"],
+                                    "attempt": attempt + 1,
+                                },
+                            )
+                            if len(records) % checkpoint_interval == 0:
+                                OUTPUT_VOLUME.commit()
+                            print(
+                                f"[FA4] {method} {sample_id} r{repeat_index}: {num_output_tokens} tokens, "
+                                f"{elapsed_ms:.1f} ms, {record['throughput_tok_s']} tok/s",
+                                flush=True,
+                            )
+                            sample_error = None
+                            break
+                        except Exception as exc:
+                            sample_error = exc
+                            sample_error_traceback = traceback.format_exc()
+                            if is_cuda_context_failure(exc):
+                                gpu_context_lost = True
+                                break
+                            if attempt < sample_retries:
+                                print(
+                                    f"[FA4] retry {attempt + 1}/{sample_retries} {method} {sample_id} r{repeat_index}: "
+                                    f"{type(exc).__name__}: {exc}",
+                                    flush=True,
+                                )
+                                gc.collect()
+                                torch.cuda.empty_cache()
+                    if sample_error is not None:
+                        error_text = f"{type(sample_error).__name__}: {sample_error}"
+                        failure_record = build_status_record(
+                            method=method,
+                            dataset=sample["dataset"],
+                            sample_id=sample_id,
+                            status="runtime_error",
+                            reason=error_text,
+                            model=TARGET_MODEL,
+                            config={
+                                "device": str(device),
+                                "gpu_name": runtime.get("gpu_name"),
+                                "dtype": "bfloat16",
+                                "attention_backend": ATTENTION,
+                                "seed": seed,
+                                "temperature": 0.0,
+                                "max_new_tokens": max_new_tokens,
+                                "batch_size": 1,
+                            },
+                        )
+                        failure_record.update(
+                            {
+                                "repeat_index": repeat_index,
+                                "source_input_tokens": sample["source_input_tokens"],
+                                "input_was_truncated": sample["was_truncated"],
+                                "error_traceback": sample_error_traceback,
+                            }
+                        )
+                        records.append(failure_record)
+                        append_jsonl(partial_path, failure_record)
+                        OUTPUT_VOLUME.commit()
+                        print(f"[FA4] sample failed {method} {sample_id}: {error_text}", flush=True)
+                    if gpu_context_lost:
+                        break
+                if gpu_context_lost:
+                    break
+            if method != "vanilla_hf" and not gpu_context_lost:
+                for sample in samples:
+                    sample_id = f"{sample['dataset']}:{sample['sample_id']}"
+                    if direct_target_audit:
+                        target_only_raw[(method, sample_id, 0)] = _direct_target_greedy(
                             torch,
                             method,
                             context,
-                            input_ids,
+                            sample["input_ids"].to(device),
                             max_new_tokens=max_new_tokens,
-                        ),
-                    )
-                attention_dispatch = tracker.snapshot()
-                _assert_method_dispatch(method, attention_dispatch)
-                _add_dispatch_stats(dispatch_totals, attention_dispatch)
-                payload = _output_payload(
-                    method, result, input_ids, elapsed_ms, context
-                )
-                payload["attention_dispatch"] = attention_dispatch
-                sample_id = f"{sample['dataset']}:{sample['sample_id']}"
-                if method == "dflash":
-                    dflash_dispatch_after = dflash_fa4_attention_stats(
-                        context["dflash_model_module"]
-                    )
-                    payload["dflash_fa4_dispatch_calls"] = (
-                        dflash_dispatch_after["fa4_dispatch_calls"]
-                        - dflash_dispatch_before["fa4_dispatch_calls"]
-                    )
-                    payload["dflash_sdpa_fallback_calls"] = (
-                        dflash_dispatch_after["sdpa_fallback_calls"]
-                        - dflash_dispatch_before["sdpa_fallback_calls"]
-                    )
-                    if (
-                        payload["dflash_fa4_dispatch_calls"] <= 0
-                        or payload["dflash_sdpa_fallback_calls"] != 0
-                    ):
-                        raise RuntimeError(
-                            "measured DFlash request did not use exclusive FA4 draft attention: "
-                            f"fa4={payload['dflash_fa4_dispatch_calls']}, "
-                            f"sdpa={payload['dflash_sdpa_fallback_calls']}"
                         )
-                generated_ids = payload["output_ids"]
-                text = tokenizer.decode(
-                    generated_ids,
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                ).strip()
-                num_output_tokens = len(generated_ids)
-                peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
-                ttft = payload["ttft_ms"]
-                timing = {
-                    "prefill_ms": round(float(ttft), 3) if ttft is not None else None,
-                    "ttft_ms": round(float(ttft), 3) if ttft is not None else None,
-                    # Vanilla HF exposes no direct TTFT hook. Keep comparisons
-                    # on measured end-to-end latency instead of mixing a full
-                    # generation time with method-specific decode estimates.
-                    "decode_ms": None,
-                    "e2e_ms": round(elapsed_ms, 3),
-                    "peak_memory_gb": round(peak_gb, 4),
-                    "draft_latency_ms": round(float(payload["phases"].get("draft_latency_ms", 0.0)), 3)
-                    if payload["phases"].get("draft_latency_ms") is not None
-                    else None,
-                    "verification_latency_ms": round(float(payload["phases"].get("verification_latency_ms", 0.0)), 3)
-                    if payload["phases"].get("verification_latency_ms") is not None
-                    else None,
-                    "verification_steps": payload["verification_steps"],
-                    "draft_tokens_accepted": payload["draft_tokens_accepted"],
-                    "draft_tokens_proposed": payload["draft_tokens_proposed"],
-                    "draft_proposal_unit": "eagle_tree_node" if method == "eagle3" else "linear_draft_slot",
-                }
-                if method != "vanilla_hf":
-                    from Benchmark.common.speculative_metrics import normalize_speculative_acceptance
-
-                    acceptance = normalize_speculative_acceptance(
-                        verification_steps=payload["verification_steps"],
-                        draft_tokens_accepted=payload["draft_tokens_accepted"],
-                        draft_tokens_proposed=payload["draft_tokens_proposed"],
-                        fallback_avg_accept_length=(
-                            statistics.mean(payload["acceptance_lengths"])
-                            if payload["acceptance_lengths"]
-                            else None
-                        ),
-                    )
-                    timing.update(acceptance)
-                metadata = runtime_metadata()
-                config = {
-                    "device": str(device),
-                    "gpu_name": metadata.get("gpu_name"),
-                    "dtype": "bfloat16",
-                    "attention_backend": ATTENTION,
-                    "seed": 42,
-                    "temperature": 0.0,
-                    "max_new_tokens": max_new_tokens,
-                    "warmup_runs": len(samples),
-                    "batch_size": 1,
-                    "measurement_scope": "e2e_only",
-                    "extra_metrics": {
-                        "draft_model": context["draft_name"],
-                        "target_attention": method_configs[method]["target_attention"],
-                        "draft_attention": method_configs[method]["draft_attention"],
-                        "attention_dispatch": attention_dispatch,
-                        "target_attention_dispatch": attention_dispatch.get(
-                            "target_attention_dispatch"
-                        ),
-                        "target_attention_dispatch_calls": attention_dispatch.get(
-                            "target_attention_dispatch_calls"
-                        ),
-                        "target_fallback_attention_calls": attention_dispatch.get(
-                            "target_fallback_attention_calls"
-                        ),
-                        "draft_attention_dispatch": attention_dispatch.get(
-                            "draft_attention_dispatch"
-                        ),
-                        "draft_attention_dispatch_calls": attention_dispatch.get(
-                            "draft_attention_dispatch_calls"
-                        ),
-                        "draft_fallback_attention_calls": attention_dispatch.get(
-                            "draft_fallback_attention_calls"
-                        ),
-                        "unattributed_attention_calls": attention_dispatch.get(
-                            "unattributed_attention_calls"
-                        ),
-                        "dflash_block_size": (
-                            DFLASH_BLOCK_SIZE if method == "dflash" else None
-                        ),
-                        "draft_sdpa_fallback_calls": payload.get(
-                            "dflash_sdpa_fallback_calls"
-                        ),
-                        "eagle_tree": context.get("eagle_tree"),
-                        "eagle_target_weight_audit": context.get("target_load_audit"),
-                        "greedy": True,
-                        "tree_mask_probe_passed": runtime["fa4_tree_mask_gpu_probe"]["passed"],
-                    },
-                }
-                record = build_sample_record(
-                    method=method,
-                    dataset=sample["dataset"],
-                    sample_id=sample_id,
-                    model=TARGET_MODEL,
-                    input_tokens=sample["input_tokens"],
-                    output_tokens=num_output_tokens,
-                    timing=timing,
-                    config=config,
-                    text=text,
-                    reference_output=sample["reference"],
-                )
-                if payload["acceptance_lengths"]:
-                    record["acceptance_lengths"] = [
-                        int(value) for value in payload["acceptance_lengths"]
-                    ]
-                add_rouge(record, text, sample["reference"])
-                quality = repetition_metrics(text)
-                record["extra_metrics"].update(
-                    {
-                        "quality": quality,
-                        "quality_nonrepetitive": (
-                            int(quality["word_count"]) >= 4
-                            and not bool(quality["repetition_flag"])
-                        ),
-                        "output_token_ids_match_reference_vanilla": None,
-                    }
-                )
-                records.append(record)
-                raw[(method, sample_id)] = payload
-                print(
-                    f"[FA4] {method} {sample_id}: {num_output_tokens} tokens, "
-                    f"{elapsed_ms:.1f} ms, {record['throughput_tok_s']} tok/s",
-                    flush=True,
-                )
-            if method != "vanilla_hf":
-                for sample in samples:
-                    sample_id = f"{sample['dataset']}:{sample['sample_id']}"
-                    target_only_raw[(method, sample_id)] = _direct_target_greedy(
-                        torch,
-                        method,
-                        context,
-                        sample["input_ids"].to(device),
-                        max_new_tokens=max_new_tokens,
-                    )
-                    vanilla_payload = raw.get(("vanilla_hf", sample_id))
-                    if method in {"domino", "dspark"} and vanilla_payload is not None:
+                    vanilla_payload = raw.get(("vanilla_hf", sample_id, 0))
+                    if verifier_audit and method in {"domino", "dspark"} and vanilla_payload is not None:
                         try:
                             verifier_audit_raw[(method, sample_id)] = (
                                 _audit_target_verifier_predictions(
@@ -1529,6 +2014,8 @@ def run_flashattn_smoke(
                                 )
                             }
             method_configs[method].update(_dispatch_config_fields(dispatch_totals))
+            persist_state()
+            OUTPUT_VOLUME.commit()
         except Exception as exc:
             failures[method] = f"{type(exc).__name__}: {exc}"
             gpu_context_lost = is_cuda_context_failure(exc)
@@ -1536,15 +2023,17 @@ def run_flashattn_smoke(
             print(traceback.format_exc(), flush=True)
             for sample in samples:
                 sample_id = f"{sample['dataset']}:{sample['sample_id']}"
-                if any(
-                    row.get("method") == method
-                    and row.get("sample_id") == sample_id
-                    and row.get("status") == "success"
-                    for row in records[method_record_start:]
-                ):
-                    continue
-                records.append(
-                    build_status_record(
+                for repeat_index in range(repetitions):
+                    existing_success = any(
+                        row.get("method") == method
+                        and row.get("sample_id") == sample_id
+                        and int(row.get("repeat_index", 0)) == repeat_index
+                        and row.get("status") == "success"
+                        for row in records
+                    )
+                    if existing_success:
+                        continue
+                    failure_record = build_status_record(
                         method=method,
                         dataset=sample["dataset"],
                         sample_id=sample_id,
@@ -1553,16 +2042,27 @@ def run_flashattn_smoke(
                         model=TARGET_MODEL,
                         config={
                             "device": str(device),
-                            "gpu_name": torch.cuda.get_device_name(0),
+                            "gpu_name": runtime.get("gpu_name"),
                             "dtype": "bfloat16",
                             "attention_backend": ATTENTION,
-                            "seed": 42,
+                            "seed": seed,
                             "temperature": 0.0,
                             "max_new_tokens": max_new_tokens,
                             "batch_size": 1,
                         },
                     )
-                )
+                    failure_record.update(
+                        {
+                            "repeat_index": repeat_index,
+                            "source_input_tokens": sample["source_input_tokens"],
+                            "input_was_truncated": sample["was_truncated"],
+                            "error_traceback": traceback.format_exc(),
+                        }
+                    )
+                    records.append(failure_record)
+                    append_jsonl(partial_path, failure_record)
+            persist_state()
+            OUTPUT_VOLUME.commit()
         finally:
             if context is not None:
                 for value in context.values():
@@ -1584,8 +2084,15 @@ def run_flashattn_smoke(
                 failures[skipped_method] = reason
                 for sample in samples:
                     sample_id = f"{sample['dataset']}:{sample['sample_id']}"
-                    records.append(
-                        build_status_record(
+                    for repeat_index in range(repetitions):
+                        if any(
+                            row.get("method") == skipped_method
+                            and row.get("sample_id") == sample_id
+                            and int(row.get("repeat_index", 0)) == repeat_index
+                            for row in records
+                        ):
+                            continue
+                        failure_record = build_status_record(
                             method=skipped_method,
                             dataset=sample["dataset"],
                             sample_id=sample_id,
@@ -1597,152 +2104,83 @@ def run_flashattn_smoke(
                                 "gpu_name": runtime.get("gpu_name"),
                                 "dtype": "bfloat16",
                                 "attention_backend": ATTENTION,
-                                "seed": 42,
+                                "seed": seed,
                                 "temperature": 0.0,
                                 "max_new_tokens": max_new_tokens,
                                 "batch_size": 1,
                             },
                         )
-                    )
+                        failure_record["repeat_index"] = repeat_index
+                        records.append(failure_record)
+                        append_jsonl(partial_path, failure_record)
+                OUTPUT_VOLUME.commit()
             break
 
-    for sample in samples:
-        sample_id = f"{sample['dataset']}:{sample['sample_id']}"
-        vanilla = raw.get(("vanilla_hf", sample_id))
-        vanilla_record = next(
-            (
-                row
-                for row in records
-                if row.get("method") == "vanilla_hf"
-                and row.get("sample_id") == sample_id
-                and row.get("status") == "success"
-            ),
-            None,
+    # Keep optional verifier diagnostics on sample records before paired aggregation.
+    for record in records:
+        if record.get("status") != "success":
+            continue
+        method = str(record.get("method", ""))
+        sample_id = str(record.get("sample_id", ""))
+        record.setdefault("extra_metrics", {}).update(
+            verifier_audit_raw.get((method, sample_id), {})
         )
-        for method in selected_methods:
-            record = next(
+        repeat_index = int(record.get("repeat_index", 0))
+        direct_target = target_only_raw.get((method, sample_id, repeat_index))
+        if direct_target is not None:
+            reference = next(
                 (
-                    row
+                    row.get("output_token_ids", [])
                     for row in records
-                    if row.get("method") == method
+                    if row.get("method") == "vanilla_hf"
+                    and row.get("dataset") == record.get("dataset")
                     and row.get("sample_id") == sample_id
+                    and int(row.get("repeat_index", 0)) == repeat_index
                     and row.get("status") == "success"
                 ),
-                None,
+                [],
             )
-            payload = raw.get((method, sample_id))
-            if record is None or payload is None or vanilla is None or vanilla_record is None:
-                continue
-            mismatch_index = first_token_mismatch(
-                vanilla["output_ids"], payload["output_ids"]
+            record["extra_metrics"]["direct_target_greedy_exact_match"] = (
+                first_token_mismatch(reference, direct_target) is None
             )
-            exact_match = mismatch_index is None
-            vanilla_ms = float(vanilla_record["e2e_ms"])
-            method_ms = float(record["e2e_ms"])
-            record["extra_metrics"].update(
+            record["extra_metrics"]["direct_target_greedy_first_mismatch_token"] = (
+                first_token_mismatch(reference, direct_target)
+            )
+
+    finalized = finalize_fa4_records(
+        records,
+        methods=selected_methods,
+        datasets=selected_datasets,
+        repetitions=repetitions,
+        expected_samples=len(samples),
+        reference_method="vanilla_hf",
+    )
+    records = finalized["records"]
+    metric_bundle = finalized
+    expected_cells = finalized["expected_records"]
+    execution_complete = finalized["execution_complete"]
+    execution_pass = finalized["execution_pass"]
+    quality_pass = finalized["quality_pass"]
+    exact_match_by_method = finalized["exact_match_by_method"]
+    exact_match_all = finalized["exact_match_all"]
+    speedup_by_method = finalized["speedup_by_method"]
+    speedup_all_over_one = finalized["speedup_all_over_one"]
+    failure_count = finalized["failure_count"]
+    schema_violations = []
+    for record in records:
+        schema_errors = validate_schema(
+            record, spec=record.get("method") != "vanilla_hf"
+        )
+        if schema_errors:
+            schema_violations.append(
                 {
-                    "paired_greedy_exact_match": exact_match,
-                    "paired_greedy_first_mismatch_token": mismatch_index,
-                    "paired_greedy_reference_token_id_at_mismatch": (
-                        vanilla["output_ids"][mismatch_index]
-                        if mismatch_index is not None
-                        and mismatch_index < len(vanilla["output_ids"])
-                        else None
-                    ),
-                    "paired_greedy_candidate_token_id_at_mismatch": (
-                        payload["output_ids"][mismatch_index]
-                        if mismatch_index is not None
-                        and mismatch_index < len(payload["output_ids"])
-                        else None
-                    ),
-                    "direct_target_greedy_exact_match": (
-                        first_token_mismatch(
-                            vanilla["output_ids"],
-                            target_only_raw[(method, sample_id)],
-                        )
-                        is None
-                        if (method, sample_id) in target_only_raw
-                        else None
-                    ),
-                    "direct_target_greedy_first_mismatch_token": (
-                        first_token_mismatch(
-                            vanilla["output_ids"],
-                            target_only_raw[(method, sample_id)],
-                        )
-                        if (method, sample_id) in target_only_raw
-                        else None
-                    ),
-                    "paired_latency_speedup": round(vanilla_ms / method_ms, 4)
-                    if method_ms > 0
-                    else None,
-                    "paired_throughput_speedup": round(
-                        float(record["throughput_tok_s"])
-                        / float(vanilla_record["throughput_tok_s"]),
-                        4,
-                    )
-                    if float(vanilla_record["throughput_tok_s"] or 0) > 0
-                    and float(record["throughput_tok_s"] or 0) > 0
-                    else None,
+                    "method": record.get("method"),
+                    "dataset": record.get("dataset"),
+                    "sample_id": record.get("sample_id"),
+                    "errors": schema_errors,
                 }
             )
-            record["extra_metrics"].update(
-                verifier_audit_raw.get((method, sample_id), {})
-            )
-            record["extra_metrics"]["output_token_ids_match_reference_vanilla"] = exact_match
 
-    successful = [row for row in records if row.get("status") == "success"]
-    summaries: dict[str, dict[str, Any]] = {}
-    for method in selected_methods:
-        method_rows = [row for row in successful if row.get("method") == method]
-        method_summaries = {
-            "successful_samples": len(method_rows),
-            "mean_e2e_ms": _safe_mean([float(row["e2e_ms"]) for row in method_rows]),
-            "mean_throughput_tok_s": _safe_mean(
-                [
-                    float(row["throughput_tok_s"])
-                    for row in method_rows
-                    if row.get("throughput_tok_s") is not None
-                ]
-            ),
-            "mean_output_tokens": _safe_mean(
-                [float(row["output_tokens"]) for row in method_rows]
-            ),
-            **aggregate_rouge(method_rows),
-            "quality_nonrepetitive_samples": sum(
-                bool(row.get("extra_metrics", {}).get("quality_nonrepetitive"))
-                for row in method_rows
-            ),
-            "mean_latency_speedup_vs_vanilla": _safe_mean(
-                [
-                    float(row["extra_metrics"]["paired_latency_speedup"])
-                    for row in method_rows
-                    if row.get("extra_metrics", {}).get("paired_latency_speedup") is not None
-                ]
-            ),
-            "mean_throughput_speedup_vs_vanilla": _safe_mean(
-                [
-                    float(row["extra_metrics"]["paired_throughput_speedup"])
-                    for row in method_rows
-                    if row.get("extra_metrics", {}).get("paired_throughput_speedup") is not None
-                ]
-            ),
-            "greedy_exact_match_samples": sum(
-                bool(row.get("extra_metrics", {}).get("paired_greedy_exact_match"))
-                for row in method_rows
-            ),
-        }
-        summaries[method] = method_summaries
-
-    all_quality_valid = len(successful) == len(selected_methods) * len(samples) and all(
-        row.get("extra_metrics", {}).get("quality_nonrepetitive")
-        for row in successful
-    )
-    speedup_all_over_one = all(
-        summaries[method]["mean_latency_speedup_vs_vanilla"] is not None
-        and summaries[method]["mean_latency_speedup_vs_vanilla"] > 1.0
-        for method in selected_methods
-        if method != "vanilla_hf"
-    ) and len(successful) == len(selected_methods) * len(samples)
     actual_runtime = dict(runtime)
     actual_runtime["methods"] = method_configs
     if len(method_configs) == len(selected_methods):
@@ -1767,245 +2205,415 @@ def run_flashattn_smoke(
             "methods": method_configs,
             "error": "one or more native baseline runtimes failed to load",
         }
-    exact_match_by_method = {
-        method: (
-            len([row for row in successful if row.get("method") == method])
-            == len(samples)
-            and all(
-                row.get("extra_metrics", {}).get("paired_greedy_exact_match") is True
-                for row in successful
-                if row.get("method") == method
-            )
-        )
-        for method in selected_methods
-        if method != "vanilla_hf"
-    }
-    exact_match_all = (
-        len(successful) == len(selected_methods) * len(samples)
-        and all(exact_match_by_method.values())
-    )
-    run_passed = (
-        all_quality_valid
-        and exact_match_all
-        and runtime_validation.get("passed") is True
-        and not failures
-    )
-    if not runtime_validation.get("passed") or failures:
+
+    if not runtime_validation.get("passed") or failure_count or not execution_complete:
         run_status = "runtime_failure"
-    elif not all_quality_valid:
+    elif not quality_pass:
         run_status = "quality_failure"
-    elif not speedup_all_over_one:
-        run_status = "speedup_not_above_one"
     elif not exact_match_all:
         run_status = "greedy_parity_failure"
+    elif not speedup_all_over_one:
+        run_status = "speedup_not_above_one"
+    elif schema_violations:
+        run_status = "schema_failure"
     else:
         run_status = "success"
-    run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    output_path = Path(f"/tmp/modal_flashattn_{run_id}.jsonl")
-    writer = JsonlWriter(output_path)
-    for record in records:
-        writer.add(record)
+
     try:
         summary_metadata = runtime_metadata()
     except Exception:
         summary_metadata = {}
     summary_runtime = {**summary_metadata, **runtime, "methods": method_configs}
     summary = {
+        "record_type": "summary",
         "scope": "summary",
         "run_id": run_id,
+        "started_at_utc": started_at_utc,
+        "finished_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "evaluation_runtime_seconds": round(time.perf_counter() - started_perf, 3),
         "method": "modal_native_fa4_all_baselines",
         "status": run_status,
+        "backend": "transformers_native",
+        "attention_backend": ATTENTION,
         "runtime_validation": runtime_validation,
-        "runtime": summary_runtime,
+        "runtime_environment": summary_runtime,
         "versions": actual_versions,
         "models": {method: MODEL_REPOS[method] for method in selected_methods},
         "gpu": runtime.get("gpu_name"),
-        "attention_backend": ATTENTION,
         "batch_size": 1,
-        "max_new_tokens": max_new_tokens,
+        "dtype": "bfloat16",
+        "seed": seed,
+        "temperature": 0.0,
+        "mode": mode,
+        "datasets": list(selected_datasets),
         "methods": list(selected_methods),
-        "dflash_block_size": DFLASH_BLOCK_SIZE if "dflash" in selected_methods else None,
+        "max_new_tokens": max_new_tokens,
         "max_input_tokens": max_input_tokens,
-        "selected_samples": runtime["selected_samples"],
+        "warmup_tokens": warmup_tokens,
+        "warmup_per_selected_sample": True,
+        "repetitions": repetitions,
+        "sample_retries": sample_retries,
+        "dflash_block_size": DFLASH_BLOCK_SIZE if "dflash" in selected_methods else None,
         "sample_count": len(samples),
-        "method_summaries": summaries,
+        "sample_count_by_dataset": {
+            dataset: sum(row["dataset"] == dataset for row in samples)
+            for dataset in selected_datasets
+        },
+        "expected_sample_method_repeats": expected_cells,
+        "selected_samples": runtime["selected_samples"],
+        "excluded_samples": excluded_samples,
+        "data_sha256": {
+            dataset: next(
+                (row.get("dataset_sha256") for row in samples if row["dataset"] == dataset),
+                None,
+            )
+            for dataset in selected_datasets
+        },
+        "method_metrics": metric_bundle["method_metrics"],
+        "metrics_by_dataset": metric_bundle["metrics_by_dataset"],
+        "parity": metric_bundle["parity"],
         "failures": failures,
-        "quality_all_nonrepetitive": all_quality_valid,
+        "failure_count": failure_count,
+        "schema_valid": not schema_violations,
+        "schema_violations": schema_violations,
+        "execution_complete": execution_complete,
+        "execution_pass": execution_pass,
+        "quality_pass": quality_pass,
+        "quality_all_nonrepetitive": quality_pass,
+        "correctness_pass": exact_match_all,
         "greedy_exact_match_all_speculative_methods": exact_match_all,
         "greedy_exact_match_by_method": exact_match_by_method,
-        "dflash_greedy_exact_match_all_samples": exact_match_by_method.get("dflash"),
         "latency_speedup_above_one_all_speculative": speedup_all_over_one,
-        "note": "Smoke trên 2 mẫu là kiểm tra pipeline, không phải số liệu paper.",
-    }
-    writer.finalize(summary)
-    return {
-        "run_id": run_id,
-        "records": records,
-        "summary": summary,
-        "jsonl": output_path.read_text(encoding="utf-8"),
+        "speedup_esr_by_method": speedup_by_method,
+        "run_passed": (
+            run_status == "success"
+            and execution_pass
+            and quality_pass
+            and exact_match_all
+            and speedup_all_over_one
+            and not schema_violations
+            and runtime_validation.get("passed") is True
+        ),
+        "metric_definitions": {
+            "e2e_ms": "CUDA-synchronized client wall time for the full generation call",
+            "prefill_ms": "native method time-to-first-token when exposed; otherwise CUDA-event duration of the first target forward",
+            "tpot_ms": "max(e2e_ms - prefill_ms, 0) / (output_tokens - 1)",
+            "throughput_tok_s": "output_tokens / e2e_ms",
+            "decode_throughput_tok_s": "(output_tokens - 1) / decode_ms",
+            "dsr": "mean paired Vanilla TPOT / mean method TPOT",
+            "esr": "(mean Vanilla prefill + Vanilla TPOT * mean paired minimum output length) / (mean Vanilla prefill + method TPOT * mean paired minimum output length)",
+            "token_lcs_overlap_with_vanilla": "token-ID LCS divided by Vanilla output token count, weighted by reference token count",
+            "acceptance_rate": "accepted speculative draft tokens / proposed speculative draft tokens",
+            "quality_valid": "non-empty output, at least 4 generated tokens, and no repetition collapse flag",
+        },
+        "measurement_limitations": [
+            "Native HF does not expose one common server-side request timeline; queue wait, batch wait and server-reported E2E are null.",
+            "Vanilla and DSpark use CUDA-event duration of the initial target forward as their prefill proxy; speculative methods use their native TTFT timer when available.",
+            "Timing is specific to the pinned checkpoint, prompt, Modal GPU allocation and package versions.",
+        ],
     }
 
+    partial_path.write_text(
+        "".join(
+            json.dumps(row, ensure_ascii=False, default=str) + "\n"
+            for row in records
+        ),
+        encoding="utf-8",
+    )
+    result_path = remote_run_dir / "results.jsonl"
+    result_path.write_text("", encoding="utf-8")
+    writer = JsonlWriter(result_path)
+    for record in records:
+        writer.add(record)
+    writer.finalize(summary)
+    write_json(remote_run_dir / "run_report.json", summary)
+    write_json(
+        remote_run_dir / "progress.json",
+        {
+            "run_id": run_id,
+            "status": run_status,
+            "records_written": len(records),
+            "expected_records": expected_cells,
+            "execution_complete": execution_complete,
+            "execution_pass": execution_pass,
+            "quality_pass": quality_pass,
+            "correctness_pass": exact_match_all,
+            "runtime_validation_pass": runtime_validation.get("passed"),
+        },
+    )
+    (remote_run_dir / "report_vi.md").write_text(
+        _render_report({"summary": summary, "records": records}),
+        encoding="utf-8",
+    )
+
+    csv_path = remote_run_dir / "metrics_summary.csv"
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        fieldnames = [
+            "dataset", "method", "samples", "successful_samples", "failed_samples",
+            "mean_rouge1", "mean_rouge2", "mean_rougeL", "mean_bleu4",
+            "mean_e2e_ms", "median_e2e_ms", "p90_e2e_ms", "mean_tpot_ms",
+            "mean_throughput_tok_s", "dsr", "esr", "mean_acceptance_rate_percent",
+            "greedy_exact_matches", "greedy_compared_samples",
+            "token_lcs_overlap_with_vanilla",
+        ]
+        csv_writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        csv_writer.writeheader()
+        csv_rows = []
+        for dataset in selected_datasets:
+            for method in selected_methods:
+                metric = metric_bundle["metrics_by_dataset"][dataset][method]
+                csv_rows.append((dataset, method, metric))
+        for method in selected_methods:
+            csv_rows.append(("all", method, metric_bundle["method_metrics"][method]))
+        for dataset, method, metric in csv_rows:
+            speed = metric.get("speed_statistics", {})
+            paired = metric.get("paired_speed_metrics", {})
+            semantic = metric.get("semantic_metrics", {})
+            e2e = speed.get("e2e_ms", {})
+            tpot = speed.get("tpot_ms", {})
+            throughput_stats = speed.get("throughput_tok_s", {})
+            csv_writer.writerow(
+                {
+                    "dataset": dataset,
+                    "method": method,
+                    "samples": metric["samples"],
+                    "successful_samples": metric["successful_samples"],
+                    "failed_samples": metric["failed_samples"],
+                    "mean_rouge1": metric.get("mean_rouge1"),
+                    "mean_rouge2": metric.get("mean_rouge2"),
+                    "mean_rougeL": metric.get("mean_rougeL"),
+                    "mean_bleu4": semantic.get("bleu4"),
+                    "mean_e2e_ms": e2e.get("mean"),
+                    "median_e2e_ms": e2e.get("median"),
+                    "p90_e2e_ms": e2e.get("p90"),
+                    "mean_tpot_ms": tpot.get("mean"),
+                    "mean_throughput_tok_s": throughput_stats.get("mean"),
+                    "dsr": paired.get("dsr"),
+                    "esr": paired.get("esr"),
+                    "mean_acceptance_rate_percent": metric.get("mean_acceptance_rate_percent"),
+                    "greedy_exact_matches": metric.get("greedy_exact_matches"),
+                    "greedy_compared_samples": metric.get("greedy_compared_samples"),
+                    "token_lcs_overlap_with_vanilla": metric.get("token_lcs_overlap_with_vanilla"),
+                }
+            )
+
+    append_jsonl(
+        events_path,
+        {
+            "event": "run_finished",
+            "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "run_id": run_id,
+            "status": run_status,
+            "execution_complete": execution_complete,
+            "failure_count": failure_count,
+            "runtime_validation_pass": runtime_validation.get("passed"),
+        },
+    )
+    persist_state()
+    OUTPUT_VOLUME.commit()
+    return {
+        "run_id": run_id,
+        "summary": summary,
+        "remote_run_dir": str(remote_run_dir),
+        "artifact_files": {
+            name: f"{run_id}/{name}"
+            for name in (
+                "results.jsonl", "run_report.json", "report_vi.md", "metrics_summary.csv",
+                "warmup.jsonl", "events.jsonl", "samples.jsonl", "excluded_samples.jsonl",
+                "progress.json", "state.json", "results.partial.jsonl",
+            )
+        },
+    }
 
 def _render_report(result: dict[str, Any]) -> str:
     summary = result["summary"]
+
+    def fmt(value: Any, digits: int = 3) -> str:
+        if value is None:
+            return "—"
+        try:
+            return f"{float(value):.{digits}f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def render_row(method: str, metric: dict[str, Any]) -> str:
+        speed = metric.get("speed_statistics", {})
+        semantic = metric.get("semantic_metrics", {})
+        paired = metric.get("paired_speed_metrics", {})
+        e2e = speed.get("e2e_ms", {})
+        prefill = speed.get("prefill_ms", {})
+        tpot = speed.get("tpot_ms", {})
+        throughput = speed.get("throughput_tok_s", {})
+        return (
+            f"| {method} | {metric.get('successful_samples', 0)}/{metric.get('samples', 0)} "
+            f"| {fmt(metric.get('mean_rougeL'))} | {fmt(semantic.get('bleu4'))} "
+            f"| {fmt(e2e.get('mean'))} | {fmt(e2e.get('p90'))} "
+            f"| {fmt(prefill.get('mean'))} | {fmt(tpot.get('mean'))} "
+            f"| {fmt(throughput.get('mean'))} | {fmt(paired.get('dsr'))} "
+            f"| {fmt(paired.get('esr'))} | {fmt(metric.get('mean_acceptance_rate_percent'), 2)} "
+            f"| {metric.get('greedy_exact_matches', 0)}/{metric.get('greedy_compared_samples', 0)} "
+            f"| {fmt(metric.get('token_lcs_overlap_with_vanilla'), 4)} "
+            f"| {metric.get('quality_valid_outputs', 0)}/{metric.get('successful_samples', 0)} |"
+        )
+
     lines = [
-        "# Smoke benchmark các baseline native FlashAttention-4 trên Modal",
+        "# Benchmark batch-1 native FlashAttention-4",
         "",
-        f"- Mã lượt chạy: `{summary['run_id']}`",
-        f"- GPU: {summary['gpu']}; attention: `{summary['attention_backend']}`; batch size: 1",
-        f"- Số mẫu dùng chung: {summary['sample_count']}; sinh tối đa {summary['max_new_tokens']} token/mẫu",
-        f"- Runtime pin khớp: `{summary['runtime_validation']['passed']}`; kiểm chứng mask FA4: `{summary['runtime'].get('fa4_tree_mask_gpu_probe', {}).get('passed')}`",
+        f"- Run ID: {summary.get('run_id')}; trạng thái: {summary.get('status')}",
+        f"- Chế độ: {summary.get('mode')}; GPU: {summary.get('gpu')}; attention: {summary.get('attention_backend')}; batch size: 1",
+        f"- Dataset: {', '.join(summary.get('datasets', []))}; số mẫu: {summary.get('sample_count')} ({summary.get('sample_count_by_dataset', {})})",
+        f"- Methods: {', '.join(summary.get('methods', []))}; tối đa {summary.get('max_new_tokens')} token đầu ra; giới hạn input {summary.get('max_input_tokens')} token",
+        f"- Runtime FA4/no-fallback: {summary.get('runtime_validation', {}).get('passed')}; greedy parity: {summary.get('correctness_pass')}; quality gate: {summary.get('quality_pass')}",
+        f"- Thời gian: {fmt(summary.get('evaluation_runtime_seconds'))} giây; repeats: {summary.get('repetitions')}; seed: {summary.get('seed')}",
+        "",
+        "| Method | Thành công | ROUGE-L | BLEU-4 | E2E TB (ms) | E2E p90 (ms) | Prefill TB (ms) | TPOT TB (ms/token) | Tok/s TB | DSR | ESR | Accept (%) | Greedy exact | LCS overlap | Output hợp lệ |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for method, dispatch in summary["runtime_validation"].get("methods", {}).items():
+    for method in summary.get("methods", []):
+        lines.append(render_row(method, summary.get("method_metrics", {}).get(method, {})))
+
+    for dataset in summary.get("datasets", []):
+        lines.extend(
+            [
+                "",
+                f"## Dataset: {dataset}",
+                "",
+                "| Method | Thành công | ROUGE-L | BLEU-4 | E2E TB (ms) | E2E p90 (ms) | Prefill TB (ms) | TPOT TB | Tok/s TB | DSR | ESR | Accept (%) | Greedy exact | LCS | Output hợp lệ |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for method in summary.get("methods", []):
+            metric = summary.get("metrics_by_dataset", {}).get(dataset, {}).get(method, {})
+            lines.append(render_row(method, metric))
+
+    lines.extend(["", "## Kiểm chứng runtime", ""])
+    for method, dispatch in summary.get("runtime_validation", {}).get("methods", {}).items():
         lines.append(
-            f"- `{method}`: target FA4={dispatch.get('target_attention_dispatch_calls')}, "
+            f"- {method}: target FA4={dispatch.get('target_attention_dispatch_calls')}, "
             f"target fallback={dispatch.get('target_fallback_attention_calls')}; "
             f"draft FA4={dispatch.get('draft_attention_dispatch_calls')}, "
-            f"draft fallback={dispatch.get('draft_fallback_attention_calls')}"
+            f"draft fallback={dispatch.get('draft_fallback_attention_calls')}."
         )
     lines.extend(
         [
             "",
-            "| Phương pháp | Mẫu thành công | E2E ms (TB) | E2E token/s (TB) | Speedup độ trễ | Throughput speedup | ROUGE-L | Không lặp | Khớp greedy |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "## Công thức và phạm vi đo",
+            "",
+            "- DSR/ESR ghép cùng sample và repeat; ESR chuẩn hóa theo độ dài output ngắn hơn. Speedup được báo theo phép đo, không ép phải lớn hơn 1.",
+            "- TPOT = (E2E - prefill) / (output_tokens - 1). Vanilla và DSpark dùng CUDA-event thời gian target forward đầu làm prefill proxy; speculative method dùng native TTFT nếu có.",
+            "- Throughput = output_tokens / E2E; decode throughput = (output_tokens - 1) / decode time. Queue wait, batch wait, server startup và server E2E là null do chạy native Transformers không có request server.",
+            "- Quality hợp lệ khi output không rỗng, có ít nhất 4 token và không có cờ repetition collapse. JSONL lưu ROUGE, ROUGE-Lsum, BLEU, length ratio, token IDs, acceptance counters và latency đầy đủ.",
+            "",
+            "Runtime gate yêu cầu tất cả target/draft attention dispatch qua FA4, không fallback. Runner dùng Transformers native, không nạp vLLM.",
         ]
     )
-    for method, metrics in summary["method_summaries"].items():
-        lines.append(
-            "| {method} | {count} | {latency} | {throughput} | {lat_speedup} | {tok_speedup} | {rouge} | {quality}/{count} | {exact}/{count} |".format(
-                method=method,
-                count=metrics["successful_samples"],
-                latency=metrics["mean_e2e_ms"],
-                throughput=metrics["mean_throughput_tok_s"],
-                lat_speedup=metrics["mean_latency_speedup_vs_vanilla"],
-                tok_speedup=metrics["mean_throughput_speedup_vs_vanilla"],
-                rouge=metrics.get("rougeL"),
-                quality=metrics["quality_nonrepetitive_samples"],
-                exact=metrics["greedy_exact_match_samples"],
-            )
-        )
-    lines.extend(
-        [
-            "",
-            "## Mẫu đã chọn",
-            "",
-        ]
-    )
-    for sample in summary["selected_samples"]:
-        lines.append(
-            f"- `{sample['dataset']}:{sample['sample_id']}` — {sample['input_tokens']} input token, SHA-256 `{sample['source_sha256']}`"
-        )
-    lines.extend(["", "## Kiểm tra chất lượng theo mẫu", ""])
-    for row in result["records"]:
-        if row.get("status") != "success":
-            lines.append(
-                f"- `{row['method']}` / `{row['sample_id']}`: lỗi `{row.get('reason')}`"
-            )
-            continue
-        extra = row.get("extra_metrics", {})
-        quality = extra.get("quality", {})
-        lines.append(
-            f"- `{row['method']}` / `{row['sample_id']}`: {row['output_tokens']} token, "
-            f"ROUGE-L={row.get('rougeL')}, trigram lặp={quality.get('repeated_trigram_ratio')}, "
-            f"cờ lặp={quality.get('repetition_flag')}, speedup độ trễ={extra.get('paired_latency_speedup')}, "
-            f"khớp greedy={extra.get('paired_greedy_exact_match')}, "
-            f"token lệch đầu={extra.get('paired_greedy_first_mismatch_token')}, "
-            f"target-only khớp={extra.get('direct_target_greedy_exact_match')}, "
-            f"target-only token lệch đầu={extra.get('direct_target_greedy_first_mismatch_token')}, "
-            f"vị trí argmax đã audit={extra.get('target_verifier_audit_position_count')}, "
-            f"argmax verifier lệch tại token đầu tiên={extra.get('target_verifier_argmax_at_first_output_mismatch')}, "
-            f"candidate khớp argmax verifier tại divergence={extra.get('candidate_matches_any_verifier_argmax_at_first_mismatch')}, "
-            f"candidate xuất hiện trong proposal verifier tại divergence={extra.get('candidate_matches_any_verifier_proposal_at_first_mismatch')}, "
-            f"bước verify phát token lệch={extra.get('emitting_verify_step_diagnostic')}, "
-            f"lỗi audit verifier={extra.get('target_verifier_audit_error')}"
-        )
-    audited_divergences = [
-        row
-        for row in result["records"]
-        if row.get("status") == "success"
-        and row.get("extra_metrics", {}).get("paired_greedy_exact_match") is False
-        and row.get("extra_metrics", {}).get("emitting_verify_step_diagnostic")
-    ]
-    if audited_divergences:
-        lines.extend(["", "## Audit sai khác greedy", ""])
-        all_emissions_match_verifier = True
-        for row in audited_divergences:
-            extra = row["extra_metrics"]
-            diagnostic = extra["emitting_verify_step_diagnostic"]
-            target_top1_margin = diagnostic.get("target_top1_margin")
-            if target_top1_margin is None:
-                target_top1_margin = next(
-                    (
-                        item.get("top1_margin")
-                        for item in extra.get(
-                            "target_verifier_argmax_at_first_output_mismatch", []
-                        )
-                        if item.get("verifier_argmax_token_id")
-                        == diagnostic.get("verifier_argmax_token_id")
-                        and item.get("verifier_proposal_token_id")
-                        == diagnostic.get("verifier_proposal_token_id")
-                    ),
-                    None,
-                )
-            all_emissions_match_verifier &= bool(
-                diagnostic.get("algorithm_token_matches_candidate")
-                and diagnostic.get("reported_accepted_draft_tokens")
-                == diagnostic.get("recomputed_accepted_draft_tokens")
-            )
-            lines.append(
-                f"- `{row['method']}` / `{row['sample_id']}` token "
-                f"{extra.get('paired_greedy_first_mismatch_token')}: Vanilla="
-                f"{diagnostic.get('vanilla_reference_token_id')}, verifier argmax="
-                f"{diagnostic.get('verifier_argmax_token_id')}, actual="
-                f"{diagnostic.get('actual_candidate_token_id')}, "
-                f"margin top1-top2={target_top1_margin}, "
-                f"nguồn={diagnostic.get('output_source')}, "
-                f"draft accepted báo cáo/tính lại="
-                f"{diagnostic.get('reported_accepted_draft_tokens')}/"
-                f"{diagnostic.get('recomputed_accepted_draft_tokens')}"
-            )
-        if all_emissions_match_verifier:
-            lines.append(
-                "Các token lệch trong audit khớp với quyết định argmax/correction "
-                "của chính bước verify FA4, và số draft được nhận báo cáo khớp phép "
-                "tính lại. Ở các điểm margin bằng 0, argmax của block verification "
-                "khác token của Vanilla autoregressive; vì vậy đây là sai khác "
-                "greedy ở tie số học giữa hai cách gọi target, không phải fallback "
-                "attention hay lỗi acceptance/correction trong bước đã audit."
-            )
-    lines.extend(
-        [
-            "",
-            f"Tất cả speculative baseline khớp greedy Vanilla: **{summary['greedy_exact_match_all_speculative_methods']}**.",
-            f"Các speculative baseline đều có speedup độ trễ > 1: **{summary['latency_speedup_above_one_all_speculative']}**.",
-            f"Mọi baseline dùng chung Qwen3-4B, prompt, BF16, greedy, batch size 1, FA4 và ngân sách token; DFlash dùng block_size={DFLASH_BLOCK_SIZE}. Smoke ít mẫu chỉ kiểm tra pipeline, chưa đủ làm kết luận paper.",
-        ]
-    )
-    if summary["failures"]:
-        lines.extend(["", "## Lỗi runtime", ""])
+    if summary.get("failures"):
+        lines.extend(["", "## Lỗi method", ""])
         for method, error in summary["failures"].items():
-            lines.append(f"- `{method}`: `{error}`")
+            lines.append(f"- {method}: {error}")
+    bad_rows = [row for row in result.get("records", []) if row.get("status") != "success"]
+    if bad_rows:
+        lines.extend(["", "## Mẫu lỗi", ""])
+        for row in bad_rows[:30]:
+            lines.append(
+                f"- {row.get('method')} / {row.get('sample_id')} repeat "
+                f"{row.get('repeat_index', 0)}: {row.get('reason')}"
+            )
+        if len(bad_rows) > 30:
+            lines.append(f"- Còn {len(bad_rows) - 30} lỗi; xem results.jsonl.")
     return "\n".join(lines) + "\n"
+
+
+def _download_volume_artifacts(
+    volume,
+    *,
+    run_id: str,
+    artifact_files: dict[str, str],
+    local_run_dir: Path,
+) -> None:
+    """Download committed Modal Volume files from the local entrypoint."""
+    local_run_dir.mkdir(parents=True, exist_ok=True)
+    for filename, volume_path in artifact_files.items():
+        local_path = local_run_dir / filename
+        try:
+            with local_path.open("wb") as handle:
+                for chunk in volume.read_file(volume_path):
+                    handle.write(chunk)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"Modal Volume artifact is missing: {run_id}/{filename}"
+            ) from exc
 
 
 @app.local_entrypoint()
 def main(
-    sample_count: int = 2,
+    mode: str = "smoke",
+    datasets: str = "all",
+    samples_per_dataset: int | None = None,
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     max_input_tokens: int = MAX_INPUT_TOKENS,
     methods: str = "all",
+    warmup_tokens: int = 8,
+    repetitions: int = 1,
+    seed: int = 42,
+    sample_retries: int = 1,
+    checkpoint_interval: int = 20,
+    run_id: str = "",
+    resume: bool = False,
+    direct_target_audit: bool = False,
+    verifier_audit: bool = False,
+    preflight_only: bool = False,
+    download_only: bool = False,
     debug_cuda_launch_blocking: bool = False,
+    output_dir: str = "outputs/modal_flashattn_benchmark",
 ) -> None:
-    result = run_flashattn_smoke.remote(
-        sample_count=sample_count,
-        max_new_tokens=max_new_tokens,
-        max_input_tokens=max_input_tokens,
-        methods=methods,
-        debug_cuda_launch_blocking=debug_cuda_launch_blocking,
+    if resume and not run_id:
+        raise SystemExit("--resume requires --run-id")
+    if download_only and preflight_only:
+        raise SystemExit("--download-only cannot be combined with --preflight-only")
+    if download_only:
+        if not run_id:
+            raise SystemExit("--download-only requires --run-id")
+        result = {
+            "run_id": run_id,
+            "artifact_files": {
+                name: f"{run_id}/{name}" for name in ARTIFACT_FILENAMES
+            },
+        }
+    else:
+        result = run_flashattn_benchmark.remote(
+            mode=mode,
+            datasets=datasets,
+            samples_per_dataset=samples_per_dataset,
+            max_new_tokens=max_new_tokens,
+            max_input_tokens=max_input_tokens,
+            methods=methods,
+            warmup_tokens=warmup_tokens,
+            repetitions=repetitions,
+            seed=seed,
+            sample_retries=sample_retries,
+            checkpoint_interval=checkpoint_interval,
+            run_id=run_id,
+            resume=resume,
+            direct_target_audit=direct_target_audit,
+            verifier_audit=verifier_audit,
+            preflight_only=preflight_only,
+            debug_cuda_launch_blocking=debug_cuda_launch_blocking,
+        )
+        if preflight_only:
+            print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
+            return
+
+    local_run_dir = (PROJECT_ROOT / output_dir / result["run_id"]).resolve()
+    _download_volume_artifacts(
+        OUTPUT_VOLUME,
+        run_id=result["run_id"],
+        artifact_files=result["artifact_files"],
+        local_run_dir=local_run_dir,
     )
-    run_dir = PROJECT_ROOT / "outputs" / "modal_flashattn_smoke" / result["run_id"]
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "results.jsonl").write_text(result["jsonl"], encoding="utf-8")
-    (run_dir / "report_vi.md").write_text(_render_report(result), encoding="utf-8")
-    print(_render_report(result))
-    print(f"\nĐã lưu artifact: {run_dir}")
+    print((local_run_dir / "report_vi.md").read_text(encoding="utf-8"))
+    print(f"Artifacts đã tải về: {local_run_dir}")
+    if not download_only and result["summary"].get("run_passed") is not True:
+        raise SystemExit(
+            f"benchmark gates failed; inspect {local_run_dir / 'report_vi.md'}"
+        )

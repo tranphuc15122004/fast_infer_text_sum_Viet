@@ -211,12 +211,14 @@ def validate_flashattn_runtime(
         str(value).strip().lower()
         for value in runtime.get("imported_modules", [])
     }
-    if "vllm" in installed or any(
-        value.startswith("vllm-") for value in installed
-    ):
-        raise ValueError("vLLM must not be installed in the native FA4 runtime")
-    if "vllm" in imported or any(value.startswith("vllm.") for value in imported):
-        raise ValueError("vLLM must not be imported in the native FA4 runtime")
+    if any("vllm" in value for value in installed):
+        raise ValueError(
+            "vLLM must not be installed in the native FA4 runtime, including adapter plugins"
+        )
+    if any("vllm" in value for value in imported):
+        raise ValueError(
+            "vLLM modules or plugins must not be imported in the native FA4 runtime"
+        )
     if "flash-attn-4" not in installed:
         raise ValueError("flash-attn-4 must be installed in the native FA4 runtime")
     if not any(value == "flash_attn" or value.startswith("flash_attn.") for value in imported):
