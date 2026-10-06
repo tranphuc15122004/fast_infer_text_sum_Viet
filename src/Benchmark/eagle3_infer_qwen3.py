@@ -120,6 +120,7 @@ def timed_generate(
     spec: bool,
     is_llama3: bool = True,
     include_phase_timings: bool = False,
+    stop_token_ids: list[int] | None = None,
 ) -> tuple:
     """Run EAGLE (spec=True) or naive (spec=False) decoding.
 
@@ -174,27 +175,29 @@ def timed_generate(
     if output_ids.shape[1] > max_output_len:
         output_ids = output_ids[:, :max_output_len]
 
-    stop_token_ids = getattr(model.tokenizer, "eos_token_id", None)
-    if isinstance(stop_token_ids, int) and not isinstance(stop_token_ids, bool):
-        stop_token_ids = [stop_token_ids]
-    elif not isinstance(stop_token_ids, (list, tuple, set)):
-        stop_token_ids = []
+    eagle_stop_token_ids = stop_token_ids
+    if eagle_stop_token_ids is None:
+        eagle_stop_token_ids = getattr(model.tokenizer, "eos_token_id", None)
+    if isinstance(eagle_stop_token_ids, int) and not isinstance(eagle_stop_token_ids, bool):
+        eagle_stop_token_ids = [eagle_stop_token_ids]
+    elif not isinstance(eagle_stop_token_ids, (list, tuple, set)):
+        eagle_stop_token_ids = []
     else:
-        stop_token_ids = list(stop_token_ids)
-    if is_llama3:
+        eagle_stop_token_ids = list(eagle_stop_token_ids)
+    if is_llama3 and stop_token_ids is None:
         try:
             llama_stop_id = model.tokenizer.convert_tokens_to_ids("<|eot_id|>")
         except (AttributeError, TypeError, ValueError):
             llama_stop_id = None
         if isinstance(llama_stop_id, int) and llama_stop_id >= 0:
-            stop_token_ids.append(llama_stop_id)
+            eagle_stop_token_ids.append(llama_stop_id)
 
     output_ids, acceptance_lengths, stop_tokens_trimmed = (
         truncate_eagle_generation_at_stop(
             output_ids,
             prompt_length=input_ids.shape[1],
             acceptance_lengths=acceptance_lengths,
-            stop_token_ids=stop_token_ids,
+            stop_token_ids=eagle_stop_token_ids,
         )
     )
     phase_timings = dict(phase_timings or {})
