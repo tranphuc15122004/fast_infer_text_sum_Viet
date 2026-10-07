@@ -97,6 +97,60 @@ cuối), `run_report.json`, `report_vi.md`, `metrics_summary.csv`, `warmup.jsonl
 `events.jsonl`, `samples.jsonl`, `excluded_samples.jsonl`, `progress.json`,
 `state.json` và `results.partial.jsonl`.
 
+## Chẩn đoán khi speedup full khác representative
+
+Với `--samples-per-dataset 2`, bộ chọn lấy mẫu ngắn nhất và dài nhất sau
+truncation. Đây là kiểm tra hai đầu dải độ dài, không phải ước lượng trung bình
+toàn bộ dataset. Tuy nhiên, full chứa lại chính các sample đó: cần đối chiếu
+latency của cùng sample/repeat giữa hai run trước khi kết luận khác biệt chỉ
+đến từ cách lấy mẫu. FA4 dispatch không fallback chứng minh đường attention;
+nó chưa xác nhận thuật toán hoặc adapter đã tối ưu.
+
+Chạy công cụ CPU trên server, dùng artifact đã có; không nạp model hoặc gọi GPU:
+
+```bash
+python3 scripts/analyze_fa4_benchmark.py \
+  --run-dir outputs/fa4_native_benchmark/fa4-b200-full-20261006 \
+  --compare-dir outputs/fa4_native_benchmark/20261006T141035Z-67788a
+```
+
+Nếu thư mục representative trên server có tên khác, thay `--compare-dir`.
+Có thể bỏ option đó để chỉ phân tích một run. Công cụ ghi
+`diagnostics/diagnostics.json`, `diagnostics/report_vi.md` và
+`diagnostics/common_samples.csv` trong thư mục run hiện tại. Artifact benchmark
+gốc được giữ nguyên.
+
+Báo cáo ghép đúng dataset/sample/repeat, gộp retry trùng và loại record lỗi hoặc
+cặp thiếu timing/input không khớp. Nó báo E2E speedup trực tiếp, số mẫu method
+nhanh hơn Vanilla, acceptance từ tổng counters, avg accept length, độ phủ
+draft/verification timing và các nhóm độ dài input. Phase timing không có được
+để `null`; không cộng timer khác phạm vi vào E2E. Bảng giữa hai run báo thay đổi
+config/version/checksum, độ dài output và tỷ số thời gian của cùng sample.
+Exact output IDs là chẩn đoán; kết luận chất lượng nội dung dùng metric trên
+reference và margin đã chọn trước.
+
+Nếu cần kiểm tra độ ổn định timing, bắt đầu bằng Vanilla–DFlash trên hai sample
+VietNews đã có. Tăng warmup để chạy toàn bộ generation trước khi đo, lặp ba
+lần và dùng run ID mới:
+
+```bash
+FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh \
+  --mode representative --datasets vietnews --samples-per-dataset 2 \
+  --methods vanilla_hf,dflash \
+  --max-input-tokens 8192 --max-new-tokens 512 \
+  --warmup-tokens 512 --repetitions 3 \
+  --run-id fa4-b200-dflash-diagnostic-20261007
+```
+
+Warmup dừng ở EOS nếu output ngắn hơn 512 token. Thử nghiệm này thay đổi warmup
+so với run cũ, nên phải ghi rõ khi diễn giải. Dùng GPU không có job khác tranh
+tài nguyên và giữ stack/model/prompt/greedy seed như run cũ. Cờ parity/speedup
+của runner có thể vẫn làm exit code là 1 sau khi đã ghi đủ artifact; đọc
+execution/runtime/quality/latency riêng để biết điều kiện nào chưa đạt. Khi
+timing ổn định nhưng vẫn chậm, profile phần draft, target verification và
+CPU/CUDA synchronization hoặc đối chiếu implementation native tác giả trên
+cùng token IDs, checkpoint và FA4 trước khi sửa inference.
+
 ## Chạy qua Modal
 
 Modal là đường chạy riêng, không sử dụng GPU server. Nếu cần gọi lại Modal, dùng
