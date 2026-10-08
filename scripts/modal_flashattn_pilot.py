@@ -105,7 +105,7 @@ PINNED_VERSIONS = {
     "tokenizers": "0.22.2",
     "accelerate": "1.15.0",
     "huggingface-hub": "1.31.0",
-    "flash-attn-4": "4.0.0b19",
+    "flash-attn-4": "4.0.0b32",
     "quack-kernels": "0.6.5",
     "triton": "3.7.1",
     "apache-tvm-ffi": "0.1.11",
@@ -142,7 +142,7 @@ if USE_MODAL:
             ),
         )
         .pip_install(
-            "flash-attn-4==4.0.0b19",
+            "flash-attn-4[cu13]==4.0.0b32",
             "nvidia-cutlass-dsl==4.7.1",
             "nvidia-cutlass-dsl-libs-base==4.7.1",
             "nvidia-cutlass-dsl-libs-core==4.7.1",
@@ -231,9 +231,8 @@ def _install_fa4_compat() -> None:
 
     _install_flash_attention_4_cutlass_compat()
 
-    # FA4 4.0.0b19 still imports this primitive from QuACK, while QuACK 0.6.5
-    # removed that export. The B200 server's FA4 b15 stack does not need this
-    # optional alias. Keep it process-local when the Modal package pair is used.
+    # Preserve the process-local compatibility alias for CuTe/QuACK combinations
+    # that still use the removed export; this does not select a CUDA backend.
     try:
         import cutlass.cute.arch as cute_arch
         import quack.activation as quack_activation
@@ -711,65 +710,14 @@ def _call_method(
     *,
     max_new_tokens: int,
     warmup: bool = False,
+    profiling: bool = False,
 ):
-    from transformers import set_seed
+    from Benchmark.native_flashattn import run_native_method
 
-    set_seed(int(context.get("seed", 42)))
-    model = context["target"]
-    stop_token_ids = context["stop_token_ids"]
-    if method == "vanilla_hf":
-        return model.generate(
-            input_ids,
-            attention_mask=torch.ones_like(input_ids),
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            eos_token_id=stop_token_ids or None,
-            pad_token_id=context["tokenizer"].pad_token_id,
-        )
-    if method == "dflash":
-        return context["dflash_generate"](
-            context["draft"],
-            target=model,
-            input_ids=input_ids,
-            max_new_tokens=max_new_tokens,
-            stop_token_ids=stop_token_ids or None,
-            temperature=0.0,
-            block_size=DFLASH_BLOCK_SIZE,
-            return_stats=True,
-        )
-    if method == "domino":
-        return context["draft"].spec_generate(
-            input_ids,
-            target=model,
-            max_new_tokens=max_new_tokens,
-            temperature=0.0,
-            stop_token_ids=stop_token_ids or None,
-            block_size=context["draft"].block_size,
-            use_bias=True,
-            return_dict=True,
-        )
-    if method == "dspark":
-        context["evaluator"].args.max_new_tokens = int(max_new_tokens)
-        return context["evaluator"].generate_one_sample(
-            input_ids=input_ids,
-            stop_token_ids=stop_token_ids or None,
-        )
-    if method == "eagle3":
-        from Benchmark.eagle3_infer_qwen3 import timed_generate
-
-        return timed_generate(
-            context["eagle_model"],
-            input_ids,
-            temperature=0.0,
-            max_new_tokens=max_new_tokens,
-            total_token=int(context["eagle_tree"]["total_token"]),
-            spec=True,
-            is_llama3=False,
-            include_phase_timings=True,
-            stop_token_ids=stop_token_ids or None,
-        )
-    raise ValueError(f"unknown method {method!r}")
+    return run_native_method(
+        torch, method, context, input_ids,
+        max_new_tokens=max_new_tokens, profiling=profiling,
+    )
 
 
 def _direct_target_greedy(
@@ -1019,8 +967,11 @@ def _audit_target_verifier_predictions(
     }
 
 
-def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
+def _load_method(torch, method: str, tokenizer, device, *, native_config=None) -> dict[str, Any]:
     from transformers import AutoConfig, AutoModelForCausalLM
+    from Benchmark.native_flashattn import NativeInferenceConfig, build_domino_graph_runner
+
+    native_config = native_config or NativeInferenceConfig()
 
     target_name = TARGET_MODEL
     context: dict[str, Any] = {
@@ -1034,6 +985,7 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
         "dflash_model_module": None,
         "model_name": target_name,
         "draft_name": None,
+        "native_config": native_config,
     }
     if method == "vanilla_hf":
         target = _target_model(target_name, dtype=torch.bfloat16, device=device)
@@ -1134,6 +1086,13 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
             target=target,
             draft=draft,
             stop_token_ids=_stop_ids(target, tokenizer),
+            domino_model_module=domino_module,
+            domino_graph_runner=(
+                build_domino_graph_runner(
+                    draft, target, device,
+                    source_path=REMOTE_ROOT / "externals/Domino/code/kernel/domino.py",
+                ) if native_config.domino_cuda_graph else None
+            ),
         )
         return context
 
@@ -1166,7 +1125,7 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
         evaluator.args = SimpleNamespace(
             max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
             temperature=0.0,
-            confidence_threshold=0.0,
+            confidence_threshold=native_config.dspark_confidence_threshold,
         )
         evaluator.device = device
         evaluator.target_model = target
@@ -1202,20 +1161,16 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
 
         install_eagle_fa4_attention(modeling_qwen3_kv)
         install_eagle_draft_fa4_attention(cnets)
-        from eagle.model.ea_model import EaModel
-        from eagle.model.kv_cache import initialize_past_key_values
+        from eagle.model import ea_model as eagle_model_module
 
-        # This vendored EAGLE tree builder can retain a child while pruning
-        # its parent when total_token truncates the candidate list.  Use the
-        # complete small tree (top_k + depth * top_k^2 = 18) so every parent
-        # remains addressable and FA4 verifies all tree branches correctly.
-        tree = resolve_eagle_tree_config(total_token=18, depth=4, top_k=2)
-        eagle_model = EaModel.from_pretrained(
+        # Match the project's native AR profile; keep the native decoding loop.
+        tree = resolve_eagle_tree_config(**native_config.eagle_tree())
+        eagle_model = eagle_model_module.EaModel.from_pretrained(
             base_model_path=target_name,
             ea_model_path=draft_name,
             total_token=int(tree["total_token"]),
-            depth=4,
-            top_k=2,
+            depth=native_config.eagle_depth,
+            top_k=native_config.eagle_top_k,
             threshold=1.0,
             torch_dtype=torch.bfloat16,
             **eagle_model_load_options(),
@@ -1252,6 +1207,7 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
             stop_token_ids=_stop_ids(eagle_model.base_model, tokenizer),
             target_load_audit=target_load_audit,
             eagle_tree=tree,
+            eagle_model_module=eagle_model_module,
         )
         return context
 
@@ -1350,7 +1306,15 @@ def run_flashattn_benchmark(
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     max_input_tokens: int = MAX_INPUT_TOKENS,
     methods: str = "all",
-    warmup_tokens: int = 8,
+    warmup_tokens: int = 512,
+    eagle_total_token: int = 17,
+    eagle_depth: int = 16,
+    eagle_top_k: int = 1,
+    domino_cuda_graph: bool = True,
+    dspark_confidence_threshold: float = 0.0,
+    phase_timing_mode: str = "separate",
+    strict_greedy_parity: bool = False,
+    require_speedup: bool = False,
     repetitions: int = 1,
     seed: int = 42,
     sample_retries: int = 1,
@@ -1370,6 +1334,17 @@ def run_flashattn_benchmark(
     started_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     sys.path.insert(0, str(REMOTE_SRC))
+    from Benchmark.native_flashattn import (
+        NativeInferenceConfig, collect_native_phase_profile, native_run_status, native_source_manifest,
+        initialize_eagle_request_cache, prepare_measured_payload, validate_fa4_version,
+    )
+
+    native_config = NativeInferenceConfig(
+        eagle_total_token=eagle_total_token, eagle_depth=eagle_depth, eagle_top_k=eagle_top_k,
+        domino_cuda_graph=domino_cuda_graph, dspark_confidence_threshold=dspark_confidence_threshold,
+        phase_timing_mode=phase_timing_mode, strict_greedy_parity=strict_greedy_parity,
+        require_speedup=require_speedup,
+    )
     os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     if debug_cuda_launch_blocking:
@@ -1426,6 +1401,7 @@ def run_flashattn_benchmark(
     if not run_id.replace("-", "").replace("_", "").isalnum():
         raise ValueError("run-id may contain only letters, numbers, hyphen and underscore")
     actual_versions = _version_snapshot()
+    validate_fa4_version(actual_versions)
     if USE_MODAL:
         _validate_pins(actual_versions)
     try:
@@ -1436,6 +1412,7 @@ def run_flashattn_benchmark(
     runtime = _runtime_base(
         torch, actual_versions, methods=selected_methods
     )
+    runtime["native_inference_config"] = native_config.manifest()
     baseline_config = validate_flashattn_runtime(
         runtime,
         methods=selected_methods,
@@ -1445,6 +1422,7 @@ def run_flashattn_benchmark(
     runtime["dataset_validation"] = validate_output_dir(
         REMOTE_ROOT / "datasets" / "eval_100", expected_count=100
     )
+    runtime["native_source_sha256"] = native_source_manifest(REMOTE_ROOT, selected_methods)
 
     if preflight_only:
         return {
@@ -1458,6 +1436,7 @@ def run_flashattn_benchmark(
                 "gpu": runtime.get("gpu_name"),
                 "attention_backend": ATTENTION,
                 "batch_size": 1,
+                "native_inference_config": native_config.manifest(),
                 "methods": list(selected_methods),
                 "datasets": list(selected_datasets),
             },
@@ -1498,7 +1477,9 @@ def run_flashattn_benchmark(
         for row in samples
     ]
     experiment_config = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "native_inference_config": native_config.manifest(),
+        "native_source_sha256": runtime["native_source_sha256"],
         "mode": mode,
         "datasets": list(selected_datasets),
         "methods": list(selected_methods),
@@ -1588,7 +1569,8 @@ def run_flashattn_benchmark(
         if saved_state.get("experiment_signature") != experiment_signature:
             raise ValueError(
                 "resume configuration does not match the original run; use its exact "
-                "dataset/model/token/repetition/audit settings or choose a new run-id"
+                "dataset/model/token/repetition/audit/native settings, package versions "
+                "and source revision or choose a new run-id"
             )
         records = read_jsonl(partial_path)
         if not records:
@@ -1662,7 +1644,7 @@ def run_flashattn_benchmark(
         dispatch_totals = _new_dispatch_totals()
         try:
             model_load_started = time.perf_counter()
-            context = _load_method(torch, method, tokenizer, device)
+            context = _load_method(torch, method, tokenizer, device, native_config=native_config)
             context["seed"] = seed
             method_model_load_ms = (time.perf_counter() - model_load_started) * 1000.0
             append_jsonl(
@@ -1676,6 +1658,9 @@ def run_flashattn_benchmark(
                 },
             )
             method_configs[method] = {
+                "native_inference_config": native_config.manifest(),
+                "domino_cuda_graph_active": context.get("domino_graph_runner") is not None,
+                "eagle_tree": context.get("eagle_tree"),
                 "target_attention": _assert_fa4(context["target"], method, "target"),
                 "draft_attention": (
                     None
@@ -1694,16 +1679,9 @@ def run_flashattn_benchmark(
             if method == "eagle3":
                 context["eagle_model"].ea_layer.config._attn_implementation = ATTENTION
                 max_prompt = max(int(row["input_tokens"]) for row in samples)
-                eagle_model = context["eagle_model"]
-                from eagle.model.kv_cache import initialize_past_key_values
-
-                past_kv, past_kv_data, current_length = initialize_past_key_values(
-                    eagle_model.base_model,
-                    max_length=max_prompt + max_new_tokens + 96,
+                initialize_eagle_request_cache(
+                    context["eagle_model"], max_prompt + max_new_tokens + 96,
                 )
-                eagle_model.past_key_values = past_kv
-                eagle_model.past_key_values_data = past_kv_data
-                eagle_model.current_length_data = current_length
 
             tracker = AttentionDispatchTracker(
                 context["target"], _dispatch_draft_model(method, context)
@@ -1824,6 +1802,32 @@ def run_flashattn_benchmark(
                                         f"sdpa={payload['dflash_sdpa_fallback_calls']}"
                                     )
 
+                            peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+                            skipped_syncs = context.get("last_skipped_profiling_synchronizations", 0)
+                            payload = prepare_measured_payload(
+                                payload, first_forward_ms=payload["first_target_forward_ms"],
+                                mode=native_config.phase_timing_mode,
+                            )
+                            del result
+
+                            def profile_call():
+                                # Run after the E2E timer and dispatch tracker have closed.
+                                profile_result, profile_elapsed_ms = _time_call(
+                                    torch, lambda: _call_method(
+                                        torch, method, context, input_ids,
+                                        max_new_tokens=max_new_tokens, profiling=True,
+                                    ),
+                                )
+                                return _output_payload(
+                                    method, profile_result, input_ids, profile_elapsed_ms, context,
+                                )
+
+                            phase_profile = collect_native_phase_profile(
+                                native_config, method, payload, profile_call,
+                            )
+                            # A nested callback must not retain the model context between methods.
+                            del profile_call
+
                             generated_ids = payload["output_ids"]
                             text = tokenizer.decode(
                                 generated_ids,
@@ -1831,7 +1835,6 @@ def run_flashattn_benchmark(
                                 clean_up_tokenization_spaces=False,
                             ).strip()
                             num_output_tokens = len(generated_ids)
-                            peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
                             prefill = payload["ttft_ms"]
                             if prefill is None:
                                 prefill = payload.get("first_target_forward_ms")
@@ -1904,11 +1907,15 @@ def run_flashattn_benchmark(
                                     "dflash_block_size": DFLASH_BLOCK_SIZE if method == "dflash" else None,
                                     "draft_sdpa_fallback_calls": payload.get("dflash_sdpa_fallback_calls"),
                                     "eagle_tree": context.get("eagle_tree"),
+                                    "native_inference_config": native_config.manifest(),
+                                    "domino_cuda_graph_active": context.get("domino_graph_runner") is not None,
+                                    "phase_profile": phase_profile,
+                                    "skipped_profiling_synchronizations": skipped_syncs,
                                     "eagle_target_weight_audit": context.get("target_load_audit"),
                                     "greedy": True,
                                     "repeat_index": repeat_index,
                                     "initial_target_forward_measurement": (
-                                        "native_method_ttft" if payload["ttft_ms"] is not None
+                                        "native_method_ttft" if native_config.phase_timing_mode == "inline" and payload["ttft_ms"] is not None
                                         else "cuda_event_first_target_forward"
                                     ),
                                     "tree_mask_probe_passed": runtime["fa4_tree_mask_gpu_probe"]["passed"],
@@ -2115,10 +2122,10 @@ def run_flashattn_benchmark(
             persist_state()
             OUTPUT_VOLUME.commit()
         finally:
+            tracker = None
             if context is not None:
-                for value in context.values():
-                    del value
-                del context
+                context.clear()
+                context = None
             gc.collect()
             try:
                 torch.cuda.empty_cache()
@@ -2258,18 +2265,12 @@ def run_flashattn_benchmark(
             "error": "one or more native baseline runtimes failed to load",
         }
 
-    if not runtime_validation.get("passed") or failure_count or not execution_complete:
-        run_status = "runtime_failure"
-    elif not quality_pass:
-        run_status = "quality_failure"
-    elif not exact_match_all:
-        run_status = "greedy_parity_failure"
-    elif not speedup_all_over_one:
-        run_status = "speedup_not_above_one"
-    elif schema_violations:
-        run_status = "schema_failure"
-    else:
-        run_status = "success"
+    run_status = native_run_status(
+        native_config, runtime_pass=runtime_validation.get("passed"),
+        execution_complete=execution_complete, failure_count=failure_count,
+        quality_pass=quality_pass, exact_match_all=exact_match_all,
+        speedup_all_over_one=speedup_all_over_one, schema_valid=not schema_violations,
+    )
 
     try:
         summary_metadata = runtime_metadata()
@@ -2303,6 +2304,8 @@ def run_flashattn_benchmark(
         "max_new_tokens": max_new_tokens,
         "max_input_tokens": max_input_tokens,
         "warmup_tokens": warmup_tokens,
+        "native_inference_config": native_config.manifest(),
+        "native_source_sha256": runtime["native_source_sha256"],
         "warmup_per_selected_sample": True,
         "repetitions": repetitions,
         "sample_retries": sample_retries,
@@ -2342,14 +2345,14 @@ def run_flashattn_benchmark(
             run_status == "success"
             and execution_pass
             and quality_pass
-            and exact_match_all
-            and speedup_all_over_one
             and not schema_violations
             and runtime_validation.get("passed") is True
         ),
         "metric_definitions": {
             "e2e_ms": "CUDA-synchronized client wall time for the full generation call",
-            "prefill_ms": "native method time-to-first-token when exposed; otherwise CUDA-event duration of the first target forward",
+            "prefill_ms": "CUDA-event first target forward proxy; inline mode retains native TTFT when available",
+            "draft_latency_ms": "native synchronized phase timer from a separate generation with matching output/acceptance; inline mode uses the timed generation",
+            "verification_latency_ms": "same profiling scope as draft_latency_ms; null if unsupported or profiling output/acceptance differs",
             "tpot_ms": "max(e2e_ms - prefill_ms, 0) / (output_tokens - 1)",
             "throughput_tok_s": "output_tokens / e2e_ms",
             "decode_throughput_tok_s": "(output_tokens - 1) / decode_ms",
@@ -2361,7 +2364,9 @@ def run_flashattn_benchmark(
         },
         "measurement_limitations": [
             "Native HF does not expose one common server-side request timeline; queue wait, batch wait and server-reported E2E are null.",
-            "Vanilla and DSpark use CUDA-event duration of the initial target forward as their prefill proxy; speculative methods use their native TTFT timer when available.",
+            "Separate/off modes use the first target forward CUDA-event duration as a common prefill proxy, not complete time-to-first-token. Inline mode keeps native TTFT when exposed.",
+            "Separate profiling phase times come from an additional generation; they are not additive components of measured E2E. Native Domino/DSpark phase times are unavailable and remain null.",
+            "Exact token parity and speedup above one are diagnostic by default; optional gates do not alter measured metrics. Output validity is not semantic equivalence.",
             "Timing is specific to the checkpoint, prompt, GPU allocation and installed package versions.",
         ],
     }
@@ -2517,6 +2522,7 @@ def _render_report(result: dict[str, Any]) -> str:
         f"- Dataset: {', '.join(summary.get('datasets', []))}; số mẫu: {summary.get('sample_count')} ({summary.get('sample_count_by_dataset', {})})",
         f"- Methods: {', '.join(summary.get('methods', []))}; tối đa {summary.get('max_new_tokens')} token đầu ra; giới hạn input {summary.get('max_input_tokens')} token",
         f"- Runtime FA4/no-fallback: {summary.get('runtime_validation', {}).get('passed')}; greedy parity: {summary.get('correctness_pass')}; quality gate: {summary.get('quality_pass')}",
+        f"- Cấu hình native: {summary.get('native_inference_config', {})}",
         f"- Thời gian: {fmt(summary.get('evaluation_runtime_seconds'))} giây; repeats: {summary.get('repetitions')}; seed: {summary.get('seed')}",
         "",
         "| Method | Thành công | ROUGE-L | BLEU-4 | E2E TB (ms) | E2E p90 (ms) | Prefill TB (ms) | TPOT TB (ms/token) | Tok/s TB | DSR | ESR | Accept (%) | Greedy exact | LCS overlap | Output hợp lệ |",
@@ -2553,9 +2559,11 @@ def _render_report(result: dict[str, Any]) -> str:
             "## Công thức và phạm vi đo",
             "",
             "- DSR/ESR ghép cùng sample và repeat; ESR chuẩn hóa theo độ dài output ngắn hơn. Speedup được báo theo phép đo, không ép phải lớn hơn 1.",
-            "- TPOT = (E2E - prefill) / (output_tokens - 1). Vanilla và DSpark dùng CUDA-event thời gian target forward đầu làm prefill proxy; speculative method dùng native TTFT nếu có.",
+            "- TPOT = (E2E - prefill) / (output_tokens - 1). Chế độ separate/off dùng CUDA-event của target forward đầu làm prefill proxy chung; inline giữ native TTFT nếu có. Proxy không bao gồm toàn bộ thời gian tới token đầu tiên.",
+            "- Chế độ separate thu thập draft/verify time ở lượt profiling riêng, chỉ ghép khi output và acceptance ledger khớp lượt đo. Các pha này không cộng thành E2E của lượt đo; pha không được native implementation hỗ trợ để null.",
             "- Throughput = output_tokens / E2E; decode throughput = (output_tokens - 1) / decode time. Queue wait, batch wait, server startup và server E2E là null do chạy native Transformers không có request server.",
             "- Quality hợp lệ khi output không rỗng, có ít nhất 4 token và không có cờ repetition collapse. JSONL lưu ROUGE, ROUGE-Lsum, BLEU, length ratio, token IDs, acceptance counters và latency đầy đủ.",
+            "- Exact greedy và speedup > 1 là chẩn đoán mặc định; chỉ chặn run khi bật strict_greedy_parity/require_speedup. Quality guard không chứng minh nội dung tương đương; cần đối chiếu ROUGE/BLEU và output.",
             "",
             "Runtime gate yêu cầu tất cả target/draft attention dispatch qua FA4, không fallback. Runner dùng Transformers native, không nạp vLLM.",
         ]
@@ -2606,7 +2614,15 @@ def main(
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     max_input_tokens: int = MAX_INPUT_TOKENS,
     methods: str = "all",
-    warmup_tokens: int = 8,
+    warmup_tokens: int = 512,
+    eagle_total_token: int = 17,
+    eagle_depth: int = 16,
+    eagle_top_k: int = 1,
+    domino_cuda_graph: bool = True,
+    dspark_confidence_threshold: float = 0.0,
+    phase_timing_mode: str = "separate",
+    strict_greedy_parity: bool = False,
+    require_speedup: bool = False,
     repetitions: int = 1,
     seed: int = 42,
     sample_retries: int = 1,
@@ -2642,6 +2658,14 @@ def main(
             max_input_tokens=max_input_tokens,
             methods=methods,
             warmup_tokens=warmup_tokens,
+            eagle_total_token=eagle_total_token,
+            eagle_depth=eagle_depth,
+            eagle_top_k=eagle_top_k,
+            domino_cuda_graph=domino_cuda_graph,
+            dspark_confidence_threshold=dspark_confidence_threshold,
+            phase_timing_mode=phase_timing_mode,
+            strict_greedy_parity=strict_greedy_parity,
+            require_speedup=require_speedup,
             repetitions=repetitions,
             seed=seed,
             sample_retries=sample_retries,

@@ -6,7 +6,36 @@ import subprocess
 import sys
 from pathlib import Path
 
-from Benchmark.fa4_server import build_parser, resolve_server_models
+from Benchmark.fa4_server import build_parser, resolve_server_models, runner_kwargs
+
+
+def test_server_cli_exposes_native_profiles_and_keeps_parity_diagnostic():
+    args = build_parser().parse_args([])
+    kwargs = runner_kwargs(args)
+    assert kwargs["eagle_total_token"] == 17
+    assert kwargs["eagle_depth"] == 16
+    assert kwargs["eagle_top_k"] == 1
+    assert kwargs["domino_cuda_graph"] is True
+    assert kwargs["phase_timing_mode"] == "separate"
+    assert kwargs["strict_greedy_parity"] is False
+    assert kwargs["warmup_tokens"] == 512
+    assert kwargs["require_speedup"] is False
+
+
+def test_server_cli_propagates_explicit_diagnostic_overrides():
+    args = build_parser().parse_args([
+        "--eagle-total-token", "18", "--eagle-depth", "4", "--eagle-top-k", "2",
+        "--no-domino-cuda-graph", "--phase-timing-mode", "inline",
+        "--strict-greedy-parity", "--require-speedup",
+    ])
+    kwargs = runner_kwargs(args)
+    assert kwargs["eagle_total_token"] == 18
+    assert kwargs["eagle_depth"] == 4
+    assert kwargs["eagle_top_k"] == 2
+    assert kwargs["domino_cuda_graph"] is False
+    assert kwargs["phase_timing_mode"] == "inline"
+    assert kwargs["strict_greedy_parity"] is True
+    assert kwargs["require_speedup"] is True
 
 
 def test_server_model_resolution_uses_master_config_paths():

@@ -48,7 +48,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--methods", default="all", help="all hoặc danh sách method phân tách bằng dấu phẩy"
     )
-    parser.add_argument("--warmup-tokens", type=int, default=8)
+    parser.add_argument("--warmup-tokens", type=int, default=512)
+    parser.add_argument("--eagle-total-token", type=int, default=17)
+    parser.add_argument("--eagle-depth", type=int, default=16)
+    parser.add_argument("--eagle-top-k", type=int, default=1)
+    parser.add_argument("--domino-cuda-graph", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dspark-confidence-threshold", type=float, default=0.0)
+    parser.add_argument("--phase-timing-mode", choices=("separate", "inline", "off"), default="separate",
+                        help="separate đo pha ở lượt riêng ngoài E2E; inline để đối chiếu phiên bản cũ")
+    parser.add_argument("--strict-greedy-parity", action="store_true")
+    parser.add_argument("--require-speedup", action="store_true")
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sample-retries", type=int, default=1)
@@ -72,6 +81,14 @@ def runner_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "max_input_tokens": args.max_input_tokens,
         "methods": args.methods,
         "warmup_tokens": args.warmup_tokens,
+        "eagle_total_token": args.eagle_total_token,
+        "eagle_depth": args.eagle_depth,
+        "eagle_top_k": args.eagle_top_k,
+        "domino_cuda_graph": args.domino_cuda_graph,
+        "dspark_confidence_threshold": args.dspark_confidence_threshold,
+        "phase_timing_mode": args.phase_timing_mode,
+        "strict_greedy_parity": args.strict_greedy_parity,
+        "require_speedup": args.require_speedup,
         "repetitions": args.repetitions,
         "seed": args.seed,
         "sample_retries": args.sample_retries,
