@@ -4,8 +4,10 @@ import pytest
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
+from Benchmark import fa4_server
 from Benchmark.fa4_server import build_parser, resolve_server_models, runner_kwargs
 
 
@@ -64,6 +66,78 @@ def test_server_model_resolution_fails_when_master_path_is_missing():
             "MODEL_DOMINO_DRAFT": "/models/domino",
             "MODEL_DSPARK_DRAFT": "/models/dspark",
         })
+
+
+def test_server_model_resolution_only_requires_selected_vanilla_dflash_pair():
+    env = {
+        "MODEL_TARGET": "/models/Qwen3-4B",
+        "MODEL_DFLASH_DRAFT": "/outputs/finetuned-dflash",
+    }
+
+    assert resolve_server_models(env, "vanilla_hf,dflash") == {
+        "vanilla_hf": "/models/Qwen3-4B",
+        "dflash": "/outputs/finetuned-dflash",
+    }
+
+
+def test_server_cli_accepts_vietbench_data_directory():
+    args = build_parser().parse_args([
+        "--data-dir", "datasets/eval_100",
+        "--datasets", "vietnews,vlsp",
+        "--methods", "vanilla_hf,dflash",
+    ])
+
+    kwargs = runner_kwargs(args)
+    assert kwargs["data_dir"] == "datasets/eval_100"
+    assert kwargs["datasets"] == "vietnews,vlsp"
+    assert kwargs["methods"] == "vanilla_hf,dflash"
+
+
+def test_server_cli_defaults_to_committed_vietbench_directory():
+    args = build_parser().parse_args([])
+
+    assert runner_kwargs(args)["data_dir"] == "datasets/eval_100"
+
+
+def test_native_fa4_runner_resolves_vietbench_jsonl_names(tmp_path):
+    from Benchmark.native_fa4_benchmark import resolve_dataset_file
+
+    dataset = tmp_path / "vietnews_100.jsonl"
+    dataset.touch()
+
+    assert resolve_dataset_file(tmp_path, "vietnews") == dataset
+
+
+def test_server_main_routes_selected_models_and_data_to_native_runner(monkeypatch, tmp_path):
+    captured = {}
+
+    def run_flashattn_benchmark(**kwargs):
+        captured.update(kwargs)
+        return {"summary": {"status": "preflight_passed"}}
+
+    native_runner = types.ModuleType("Benchmark.native_fa4_benchmark")
+    native_runner.run_flashattn_benchmark = run_flashattn_benchmark
+    monkeypatch.setitem(sys.modules, "Benchmark.native_fa4_benchmark", native_runner)
+    monkeypatch.setenv("MODEL_TARGET", "/models/Qwen3-4B")
+    monkeypatch.setenv("MODEL_DFLASH_DRAFT", "/outputs/finetuned-dflash")
+    monkeypatch.setenv("FI_OFFLINE", "1")
+
+    data_dir = tmp_path / "eval_100"
+    output_dir = tmp_path / "fa4-results"
+    result = fa4_server.main([
+        "--mode", "smoke",
+        "--datasets", "vietnews",
+        "--methods", "vanilla_hf,dflash",
+        "--data-dir", str(data_dir),
+        "--output-dir", str(output_dir),
+        "--preflight-only",
+    ])
+
+    assert result == 0
+    assert captured["data_dir"] == str(data_dir.resolve())
+    assert captured["output_dir"] == str(output_dir.resolve())
+    assert captured["methods"] == "vanilla_hf,dflash"
+    assert os.environ["MODEL_DFLASH_DRAFT"] == "/outputs/finetuned-dflash"
 
 
 def test_server_cli_exposes_smoke_and_representative_modes():

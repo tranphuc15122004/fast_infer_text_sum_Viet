@@ -15,6 +15,33 @@ override còn hai mẫu/dataset. Full chạy đủ 100 mẫu/dataset. Input dài
 hạn sẽ được truncate bằng helper dùng chung và ghi lại số token nguồn cùng cờ
 truncation.
 
+Checkpoint fine-tune trong `checkpoints/` là state dict của pipeline train, chưa
+phải thư mục model DFlash có thể nạp bằng `from_pretrained`. Export checkpoint
+step 6162 một lần sang thư mục riêng rồi trỏ `MODEL_DFLASH_DRAFT` tới đó. Lệnh
+export cần target model local từ master config:
+
+```bash
+cd /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum_Viet-main
+export FAST_INFER_MASTER_CONFIG=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master_Viet.env
+source scripts/common/config.sh
+fast_infer_load_master
+source scripts/common/runtime.sh
+
+FT_CHECKPOINT=/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_finetuned/checkpoints/qwen3-4b-finetuned-step6162
+FT_DRAFT_EXPORT=/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/qwen3_4b_dflash_finetuned/fa4_export_step6162
+"$FAST_INFER_PYTHON" scripts/export_trained_checkpoint.py \
+  --checkpoint "$FT_CHECKPOINT" \
+  --target-model "$MODEL_TARGET" \
+  --output-dir "$FT_DRAFT_EXPORT" \
+  --block-size 16 --num-draft-layers 5
+test -f "$FT_DRAFT_EXPORT/config.json"
+export MODEL_DFLASH_DRAFT="$FT_DRAFT_EXPORT"
+```
+
+Export này giữ checkpoint gốc nguyên vẹn. Khi chạy benchmark, chọn rõ cặp
+`vanilla_hf,dflash`; như vậy chỉ cần hai model path tương ứng trong master config
+và kết quả DFlash được ghép cặp trực tiếp với target Vanilla.
+
 ## Phiên bản attention và cơ chế native
 
 Ghim `flash-attn-4[cu13]==4.0.0b32` trong requirements và image Modal để đồng bộ
@@ -57,10 +84,10 @@ Graph có bảng projection và bộ đệm bổ sung, nên phải đo lại VRA
 `--no-domino-cuda-graph` để đo cấu hình không graph, được ghi rõ trong artifact.
 Runner không tự chuyển sang cấu hình này khi graph thất bại.
 
-Benchmark native DFlash dùng `dflash_generate(block_size=1)` làm reference và
-báo speedup từ decode TPOT. Reference của bảng hiện tại vẫn là Vanilla HF
-`model.generate()`. Vì khác reference và phạm vi đo, speedup 2–3x trước đây
-không so trực tiếp với ESR/E2E hiện tại.
+Benchmark này gọi DFlash với `block_size=16` như trong checkpoint đã export và
+ghép mọi mẫu với Vanilla HF `model.generate()` làm baseline. Khi so với kết quả
+từ benchmark DFlash dùng `block_size=1` hoặc phạm vi timing khác, không so trực
+tiếp các con số speedup; hãy dùng artifacts của cùng runner/cấu hình.
 
 ## Chạy trên server B200
 
@@ -78,24 +105,27 @@ B200 (SM100+), kernel tree-mask của EAGLE và tính toàn vẹn của `eval_10
 không nạp model checkpoint:
 
 ```bash
-FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh --preflight-only
+FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh \
+  --methods vanilla_hf,dflash --preflight-only
 ```
 
-Sau khi preflight pass, smoke nhanh một mẫu của riêng `vietnews` qua đủ năm
-baseline:
+Sau khi preflight pass, smoke nhanh cặp Vanilla + DFlash trên một mẫu
+`vietnews`:
 
 ```bash
 FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh \
-  --mode smoke --datasets vietnews --samples-per-dataset 1 \
+  --mode smoke --datasets vietnews --methods vanilla_hf,dflash \
+  --samples-per-dataset 1 \
   --max-new-tokens 64 --warmup-tokens 64
 ```
 
 Representative dưới đây chạy hai mẫu/dataset trên cả bốn dataset (tám prompt,
-đủ năm baseline):
+mỗi prompt chạy qua Vanilla và DFlash):
 
 ```bash
 FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh \
-  --mode representative --datasets all --samples-per-dataset 2 \
+  --mode representative --datasets all --methods vanilla_hf,dflash \
+  --samples-per-dataset 2 \
   --max-new-tokens 512 --warmup-tokens 512 --repetitions 3
 ```
 
@@ -103,7 +133,8 @@ Full dùng đủ 100 mẫu/dataset:
 
 ```bash
 FI_GPU_IDS=0 bash scripts/run_fa4_benchmark.sh \
-  --mode full --datasets all --max-new-tokens 512 --repetitions 1
+  --mode full --datasets all --methods vanilla_hf,dflash \
+  --max-new-tokens 512 --repetitions 1
 ```
 
 `FI_GPU_IDS=0` dùng GPU vật lý số 0. Có thể bỏ nếu master config đã chọn đúng

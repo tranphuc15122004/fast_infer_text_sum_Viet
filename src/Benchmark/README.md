@@ -37,22 +37,31 @@ FA4 đã cài trên server. Modal được tách riêng qua
 
 ```bash
 # Kiểm tra FA4/GPU/tree mask và eval_100; không nạp model checkpoint
-bash scripts/run_fa4_benchmark.sh --preflight-only
+bash scripts/run_fa4_benchmark.sh --methods vanilla_hf,dflash --preflight-only
 
-# Smoke đủ năm baseline trên một mẫu VietNews
+# Smoke cặp Vanilla + DFlash trên một mẫu VietNews
 bash scripts/run_fa4_benchmark.sh \
-  --mode smoke --datasets vietnews --samples-per-dataset 1 \
+  --mode smoke --datasets vietnews --methods vanilla_hf,dflash \
+  --samples-per-dataset 1 \
   --max-new-tokens 64
 
 # 2 mẫu/dataset, phủ đầu ngắn và đầu dài theo độ dài
 bash scripts/run_fa4_benchmark.sh \
-  --mode representative --datasets all --samples-per-dataset 2 \
+  --mode representative --datasets all --methods vanilla_hf,dflash \
+  --samples-per-dataset 2 \
   --max-new-tokens 512
 
 # 100 mẫu/dataset trên bốn dataset
 bash scripts/run_fa4_benchmark.sh \
-  --mode full --datasets all --max-new-tokens 512 --repetitions 1
+  --mode full --datasets all --methods vanilla_hf,dflash \
+  --max-new-tokens 512 --repetitions 1
 ```
+
+Để dùng checkpoint sau fine-tune, export state dict sang thư mục DFlash
+standalone rồi override `MODEL_DFLASH_DRAFT`; xem phần export trong
+[`docs/flashattn4_benchmark.md`](../../docs/flashattn4_benchmark.md). Bỏ
+`--methods vanilla_hf,dflash` hoặc dùng `--methods all` chỉ khi đã cấu hình path
+cho cả năm method.
 
 Launcher đọc `config/master.path`, source master config duy nhất cho repo này,
 và dùng `FI_GPU_IDS` để chọn GPU. Có thể truyền `FAST_INFER_MASTER_CONFIG` để
